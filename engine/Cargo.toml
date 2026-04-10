@@ -1,0 +1,20 @@
+[package]
+name = "memvis"
+version = "0.2.0"
+edition = "2021"
+license = "MIT"
+authors = ["Yousef Mahmoud <yosefkhalil610@gmail.com>"]
+
+[[bin]]
+name = "memvis-dump"
+path = "src/main.rs"
+
+[dependencies]
+libc = "0.2"
+gimli = "0.31"
+object = { version = "0.36", default-features = false, features = ["read", "elf"] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1

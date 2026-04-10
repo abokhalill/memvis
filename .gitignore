@@ -1,0 +1,16 @@
+engine/target/
+**/*.rs.bk
+build/
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+Makefile
+*.o
+*.so
+*.dylib
+.vscode/
+.idea/
+*.swp
+*~
+.DS_Store
+Thumbs.db

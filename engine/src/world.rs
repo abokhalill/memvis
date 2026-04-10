@@ -1,0 +1,224 @@
+// SPDX-License-Identifier: MIT
+// world state: variables, pointer edges, register file, cache miss tracking.
+// arc-wrapped inner for cow snapshotting - mutation clones only when shared.
+
+use std::collections::{BTreeMap, HashMap};
+use std::sync::Arc;
+
+use crate::dwarf::TypeInfo;
+use crate::index::NodeId;
+
+pub const REG_NAMES: &[&str] = &[
+    "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
+    "r8","r9","r10","r11","r12","r13","r14","r15",
+    "rip","rflags",
+];
+pub const REG_COUNT: usize = 18;
+
+#[derive(Debug, Clone)]
+pub struct LiveRegisterFile {
+    pub values: [u64; REG_COUNT],
+    pub prev: [u64; REG_COUNT],
+    pub insn: u64,
+}
+
+impl LiveRegisterFile {
+    pub fn new() -> Self {
+        Self { values: [0; REG_COUNT], prev: [0; REG_COUNT], insn: 0 }
+    }
+    pub fn update(&mut self, regs: [u64; REG_COUNT], insn: u64) {
+        self.prev = self.values;
+        self.values = regs;
+        self.insn = insn;
+    }
+}
+
+// per node miss counter with exponential decay
+const DECAY_FACTOR: f32 = 0.95;
+
+#[derive(Debug, Clone)]
+pub struct CacheMissEntry {
+    pub count: u32,
+    pub heat: f32,
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheHeatmap {
+    pub per_node: HashMap<NodeId, CacheMissEntry>,
+}
+
+impl CacheHeatmap {
+    pub fn new() -> Self {
+        Self { per_node: HashMap::new() }
+    }
+    pub fn record_miss(&mut self, nid: NodeId) {
+        let e = self.per_node.entry(nid).or_insert(CacheMissEntry { count: 0, heat: 0.0 });
+        e.count += 1;
+        e.heat = (e.heat + 1.0).min(1.0);
+    }
+    pub fn tick(&mut self) {
+        self.per_node.retain(|_, e| {
+            e.heat *= DECAY_FACTOR;
+            e.heat > 0.01
+        });
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct Node {
+    pub name: String,
+    pub type_info: TypeInfo,
+    pub addr: u64,
+    pub size: u64,
+    pub raw_value: u64,
+    pub last_write_insn: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PointerEdge {
+    pub source: NodeId,
+    pub target: NodeId,
+    pub ptr_value: u64,
+    pub is_dangling: bool,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorldInner {
+    pub nodes: BTreeMap<NodeId, Node>,
+    pub edges: BTreeMap<NodeId, PointerEdge>,
+    pub insn_counter: u64,
+}
+
+impl WorldInner {
+    pub fn new() -> Self {
+        Self { nodes: BTreeMap::new(), edges: BTreeMap::new(), insn_counter: 0 }
+    }
+}
+
+pub struct WorldState {
+    inner: Arc<WorldInner>,
+    pub reg_file: LiveRegisterFile,
+    pub cache_heat: CacheHeatmap,
+}
+
+impl WorldState {
+    pub fn new() -> Self {
+        Self {
+            inner: Arc::new(WorldInner::new()),
+            reg_file: LiveRegisterFile::new(),
+            cache_heat: CacheHeatmap::new(),
+        }
+    }
+
+    pub fn snapshot(&self) -> Arc<WorldInner> { Arc::clone(&self.inner) }
+
+    #[inline]
+    fn cow(&mut self) -> &mut WorldInner { Arc::make_mut(&mut self.inner) }
+
+    pub fn insn_counter(&self) -> u64 { self.inner.insn_counter }
+    pub fn inc_insn_counter(&mut self) { self.cow().insn_counter += 1; }
+
+    pub fn ensure_node(
+        &mut self, id: NodeId, name: &str, type_info: &TypeInfo,
+        addr: u64, size: u64,
+    ) -> bool {
+        let inner = self.cow();
+        if inner.nodes.contains_key(&id) { return false; }
+        inner.nodes.insert(id, Node {
+            name: name.to_string(), type_info: type_info.clone(),
+            addr, size, raw_value: 0, last_write_insn: 0,
+        });
+        true
+    }
+
+    #[inline]
+    pub fn update_value(&mut self, id: NodeId, value: u64, insn: u64) {
+        if let Some(node) = self.cow().nodes.get_mut(&id) {
+            node.raw_value = value;
+            node.last_write_insn = insn;
+        }
+    }
+
+    pub fn remove_frame_nodes(&mut self, frame_id: crate::index::FrameId) {
+        let inner = self.cow();
+        let dead: Vec<NodeId> = inner.nodes.keys()
+            .filter(|k| matches!(k, NodeId::Local(fid, _) if *fid == frame_id))
+            .copied().collect();
+        for id in &dead {
+            inner.nodes.remove(id);
+            inner.edges.remove(id);
+        }
+        inner.edges.retain(|_, e| !dead.contains(&e.target));
+    }
+
+    // null ptr: remove edge. nonzero unresolved: dangling sentinel.
+    pub fn update_edge(&mut self, source: NodeId, target: Option<NodeId>, ptr_value: u64) {
+        let inner = self.cow();
+        match target {
+            Some(tgt) => {
+                inner.edges.insert(source, PointerEdge {
+                    source, target: tgt, ptr_value, is_dangling: false,
+                });
+            }
+            None if ptr_value == 0 => { inner.edges.remove(&source); }
+            None => {
+                inner.edges.insert(source, PointerEdge {
+                    source, target: NodeId::Global(u32::MAX),
+                    ptr_value, is_dangling: true,
+                });
+            }
+        }
+    }
+
+    pub fn node_count(&self) -> usize { self.inner.nodes.len() }
+    pub fn edge_count(&self) -> usize { self.inner.edges.len() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dwarf::TypeInfo;
+
+    fn ti(name: &str, sz: u64, ptr: bool) -> TypeInfo {
+        TypeInfo { name: name.into(), byte_size: sz, is_pointer: ptr, fields: Vec::new() }
+    }
+
+    #[test]
+    fn test_cow_snapshot() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "x", &ti("int", 4, false), 0x1000, 4);
+        ws.update_value(NodeId::Global(0), 42, 1);
+        let snap = ws.snapshot();
+        assert_eq!(snap.nodes[&NodeId::Global(0)].raw_value, 42);
+        ws.update_value(NodeId::Global(0), 99, 2);
+        assert_eq!(ws.snapshot().nodes[&NodeId::Global(0)].raw_value, 99);
+        assert_eq!(snap.nodes[&NodeId::Global(0)].raw_value, 42);
+    }
+
+    #[test]
+    fn test_pointer_edge() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "p", &ti("*int", 8, true), 0x1000, 8);
+        ws.ensure_node(NodeId::Global(1), "x", &ti("int", 4, false), 0x2000, 4);
+        ws.update_edge(NodeId::Global(0), Some(NodeId::Global(1)), 0x2000);
+        assert_eq!(ws.edge_count(), 1);
+        assert!(!ws.snapshot().edges[&NodeId::Global(0)].is_dangling);
+        ws.update_edge(NodeId::Global(0), None, 0);
+        assert_eq!(ws.edge_count(), 0);
+        ws.update_edge(NodeId::Global(0), None, 0xdeadbeef);
+        assert!(ws.snapshot().edges[&NodeId::Global(0)].is_dangling);
+    }
+
+    #[test]
+    fn test_frame_cleanup() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "g", &ti("int", 4, false), 0x1000, 4);
+        ws.ensure_node(NodeId::Local(1, 0), "a", &ti("int", 4, false), 0x7000, 4);
+        ws.ensure_node(NodeId::Local(1, 1), "p", &ti("*int", 8, true), 0x7008, 8);
+        ws.update_edge(NodeId::Local(1, 1), Some(NodeId::Global(0)), 0x1000);
+        assert_eq!(ws.node_count(), 3);
+        ws.remove_frame_nodes(1);
+        assert_eq!(ws.node_count(), 1);
+        assert_eq!(ws.edge_count(), 0);
+    }
+}
