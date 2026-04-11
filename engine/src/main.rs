@@ -1,13 +1,14 @@
 // SPDX-License-Identifier: MIT
 
 use std::collections::VecDeque;
-use std::io::{self, Write};
+use std::io;
 use std::{env, thread, time};
 
 use memvis::dwarf::{self, DwarfInfo};
 use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::ring::{Event, RingOrchestrator};
-use memvis::world::{WorldState, WorldInner, ShadowStack, REG_NAMES, REG_COUNT};
+use memvis::tui::{self, JournalEntry, AppState};
+use memvis::world::{WorldState, ShadowStack, REG_COUNT};
 
 const EVENT_WRITE: u8    = 0;
 const EVENT_CALL: u8     = 2;
@@ -16,187 +17,6 @@ const EVENT_REG_SNAPSHOT: u8 = 5;
 const EVENT_CACHE_MISS: u8   = 6;
 const EVENT_MODULE_LOAD: u8  = 7;
 
-const RST: &str = "\x1b[0m";
-const BOLD: &str = "\x1b[1m";
-const DIM: &str = "\x1b[2m";
-const RED: &str = "\x1b[31m";
-const GRN: &str = "\x1b[32m";
-const YLW: &str = "\x1b[33m";
-const BLU: &str = "\x1b[34m";
-const MAG: &str = "\x1b[35m";
-const CYN: &str = "\x1b[36m";
-const WHT: &str = "\x1b[37m";
-const BGRED: &str = "\x1b[41m";
-const CLEAR_SCREEN: &str = "\x1b[2J\x1b[H";
-
-fn type_color(t: &str) -> &'static str {
-    let l = t.to_ascii_lowercase();
-    if l.starts_with('*') || l.contains("ptr") { return MAG; }
-    if l.contains("char") { return GRN; }
-    if l.contains("float") || l.contains("double") { return YLW; }
-    if l.contains("int") || l.contains("long") || l.contains("short") { return BLU; }
-    if l.contains("struct") || l.contains("vec") || l.contains("entity") { return CYN; }
-    WHT
-}
-
-#[derive(Clone)]
-struct JournalEntry { seq: u64, kind: u8, thread_id: u16, addr: u64, size: u32, value: u64 }
-
-fn render(
-    out: &mut impl Write,
-    world: &WorldInner,
-    journal: &VecDeque<JournalEntry>,
-    total: u64,
-    orch: &RingOrchestrator,
-) {
-    let _ = write!(out, "{}", CLEAR_SCREEN);
-
-    let (used, pct) = orch.total_fill();
-    let ring_color = if pct > 85 { RED } else if pct > 50 { YLW } else { GRN };
-    let _ = writeln!(out,
-        "{}MEMVIS{} │ insn {}{}{} │ events {}{}{} │ nodes {}{}{} │ edges {}{}{} │ rings {}{}{} │ fill {}{}%{} ({})",
-        DIM, RST,
-        WHT, world.insn_counter, RST,
-        WHT, total, RST,
-        CYN, world.nodes.len(), RST,
-        MAG, world.edges.len(), RST,
-        CYN, orch.ring_count(), RST,
-        ring_color, pct, RST, used,
-    );
-    let _ = writeln!(out, "{}{}{}", DIM, "─".repeat(100), RST);
-    let _ = writeln!(out, "{}MEMORY MAP{}", BOLD, RST);
-
-    let mut sorted: Vec<_> = world.nodes.iter().filter(|(_, n)| n.size > 0).collect();
-    sorted.sort_by_key(|(_, n)| (n.addr, std::cmp::Reverse(n.last_write_insn)));
-    // dedup: for locals at the same addr, keep only the most recently written
-    sorted.dedup_by(|a, b| {
-        matches!(a.0, NodeId::Local(..)) && matches!(b.0, NodeId::Local(..))
-            && a.1.addr == b.1.addr && a.1.name == b.1.name
-    });
-
-    let mut last_cl: u64 = u64::MAX;
-
-    for (nid, node) in &sorted {
-        if matches!(nid, NodeId::Field(..)) { continue; }
-        let cl = node.addr / 64;
-
-        if cl != last_cl {
-            let fs = world.cl_tracker.contention_score(node.addr);
-            let fs_tag = if fs > 1 { format!(" {}FALSE_SHARE T={}{}", BGRED, fs, RST) } else { String::new() };
-            let _ = writeln!(out, "  {}── cacheline 0x{:x} ──{}{}", DIM, cl * 64, RST, fs_tag);
-            last_cl = cl;
-        }
-
-        let crosses_cl = (node.addr % 64) + node.size > 64;
-        let alert = if crosses_cl { format!("{}!CL{}", RED, RST) } else { "    ".into() };
-
-        let ptr_info = if node.type_info.is_pointer && node.raw_value != 0 {
-            let target = world.nodes.values()
-                .find(|t| node.raw_value >= t.addr && node.raw_value < t.addr + t.size.max(1));
-            match target {
-                Some(t) => format!(" {}→ {}{}", MAG, t.name, RST),
-                None => format!(" {}→ 0x{:x}{}", MAG, node.raw_value, RST),
-            }
-        } else { String::new() };
-
-        let miss_str = world.cache_heat.per_node.get(nid)
-            .map(|e| format!(" {}[{} misses]{}", RED, e.count, RST))
-            .unwrap_or_default();
-
-        let _ = writeln!(out,
-            "  {}{:>12x}{}  {:>4}B  {}{:<20}{} {}{:<14}{}  val={}{:>18x}{}{}{}{}",
-            WHT, node.addr, RST,
-            node.size,
-            BOLD, node.name, RST,
-            type_color(&node.type_info.name), node.type_info.name, RST,
-            WHT, node.raw_value, RST,
-            alert, ptr_info, miss_str,
-        );
-
-        if let NodeId::Global(gi) = nid {
-            for (fi, f) in node.type_info.fields.iter().enumerate() {
-                if f.byte_size == 0 { continue; }
-                let fa = node.addr + f.byte_offset;
-                let fid = NodeId::Field(*gi, fi as u16);
-                let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
-                let fcross = (fa % 64) + f.byte_size > 64;
-                let falert = if fcross { format!("{}!CL{}", RED, RST) } else { "    ".into() };
-                let _ = writeln!(out,
-                    "    {}{:>12x}{}  {:>4}B  {}{:<20}{} {}{:<14}{}  val={}{:>18x}{}{}",
-                    DIM, fa, RST,
-                    f.byte_size,
-                    DIM, f.name, RST,
-                    type_color(&f.type_info.name), f.type_info.name, RST,
-                    WHT, fval, RST,
-                    falert,
-                );
-            }
-        }
-    }
-
-    let _ = writeln!(out);
-
-    if !world.edges.is_empty() {
-        let _ = writeln!(out, "{}POINTER EDGES{}", BOLD, RST);
-        let mut seen_edges: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
-        for (src, edge) in &world.edges {
-            let src_name = world.nodes.get(src).map(|n| n.name.clone()).unwrap_or_default();
-            let key = (src_name.clone(), edge.ptr_value);
-            if !seen_edges.insert(key) { continue; }
-            let tgt_name = world.nodes.get(&edge.target).map(|n| n.name.as_str()).unwrap_or("?");
-            let dng = if edge.is_dangling { format!(" {}DANGLING{}", BGRED, RST) } else { String::new() };
-            let _ = writeln!(out,
-                "  {}{}{} {}──>{} {}{}{} (0x{:x}){}",
-                CYN, src_name, RST, MAG, RST, CYN, tgt_name, RST, edge.ptr_value, dng,
-            );
-        }
-        let _ = writeln!(out);
-    }
-
-    let reg_file = &world.reg_file;
-    let _ = writeln!(out, "{}REGISTERS{} (insn {})", BOLD, RST, reg_file.insn);
-    let _ = write!(out, "  ");
-    for (i, name) in REG_NAMES.iter().enumerate() {
-        let val = reg_file.values[i];
-        let changed = reg_file.values[i] != reg_file.prev[i];
-
-        let matches_addr = val != 0 && world.nodes.values().any(|n| val >= n.addr && val < n.addr + n.size.max(1));
-
-        let vclr = if matches_addr { YLW } else if changed { WHT } else { DIM };
-        let nclr = if matches_addr { YLW } else { CYN };
-
-        let _ = write!(out, "{}{:>4}{}={}{:>16x}{}", nclr, name, RST, vclr, val, RST);
-
-        if (i + 1) % 6 == 0 {
-            let _ = writeln!(out);
-            if i + 1 < REG_NAMES.len() { let _ = write!(out, "  "); }
-        } else {
-            let _ = write!(out, "  ");
-        }
-    }
-    let _ = writeln!(out);
-
-    let tail_n = 12;
-    let start = if journal.len() > tail_n { journal.len() - tail_n } else { 0 };
-    let _ = writeln!(out, "{}EVENTS{} (last {})", BOLD, RST, tail_n);
-    for i in start..journal.len() {
-        let e = &journal[i];
-        let (kind_str, kclr) = match e.kind {
-            0 => ("W   ", WHT),
-            1 => ("R   ", DIM),
-            2 => ("CALL", BLU),
-            3 => ("RET ", BLU),
-            4 => ("OVF ", RED),
-            5 => ("REG ", CYN),
-            6 => ("CMIS", MAG),
-            _ => ("?   ", DIM),
-        };
-        let _ = writeln!(out,
-            "  {}{:>8}{} {}{}{} T{:<3} {:>12x}  {:>4}  {:>16x}",
-            DIM, e.seq, RST, kclr, kind_str, RST, e.thread_id, e.addr, e.size, e.value,
-        );
-    }
-}
 
 #[inline]
 fn process_event(
@@ -343,6 +163,102 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         populate_globals(info, 0, &mut addr_index, &mut world);
     }
 
+    // --once mode: headless render to stdout (for E2E tests and scripting)
+    if once {
+        run_headless(
+            &mut orch, &dwarf_info, min_events,
+            &mut addr_index, &mut world, &mut stacks, &mut next_frame_id,
+            &mut total, &mut journal, &mut relocation_delta, &mut returned_frames,
+        );
+        return;
+    }
+
+    // interactive ratatui mode
+    let mut terminal = match tui::init_terminal() {
+        Ok(t) => t,
+        Err(e) => { eprintln!("memvis: failed to init terminal: {}", e); return; }
+    };
+    let mut app = AppState::new();
+    let refresh = time::Duration::from_millis(50);
+    let mut last_render = time::Instant::now();
+    let mut last_discovery = time::Instant::now();
+
+    loop {
+        tui::handle_input(&mut app);
+        if app.quit { break; }
+
+        let now_disc = time::Instant::now();
+        if now_disc.duration_since(last_discovery) >= time::Duration::from_millis(200) {
+            orch.poll_new_rings();
+            last_discovery = now_disc;
+        }
+
+        if !app.paused {
+            let mut drained = 0u64;
+            while drained < 10_000 {
+                match orch.merge_pop() {
+                    Some((ri, ev)) => {
+                        total += 1;
+                        drained += 1;
+                        world.inc_insn_counter();
+
+                        let ev_kind = ev.kind();
+                        journal.push_back(JournalEntry {
+                            seq: total, kind: ev_kind, thread_id: ev.thread_id,
+                            addr: ev.addr, size: ev.size, value: ev.value,
+                        });
+                        if journal.len() > 1000 { journal.pop_front(); }
+
+                        process_event(
+                            &ev, ri, &orch, &mut world, &mut addr_index,
+                            &dwarf_info, &mut stacks, &mut next_frame_id,
+                            &mut relocation_delta, &mut returned_frames,
+                        );
+                    }
+                    None => break,
+                }
+            }
+
+            if total & 0xFFF == 0 {
+                world.cache_heat_tick();
+            }
+        }
+
+        let now = time::Instant::now();
+        if now.duration_since(last_render) >= refresh {
+            let snap = world.snapshot();
+            let (fill_used, fill_pct) = orch.total_fill();
+            tui::draw(
+                &mut terminal, &snap, &journal, total,
+                orch.ring_count(), fill_used, fill_pct, &mut app,
+            );
+            last_render = now;
+        }
+
+        if !app.paused {
+            thread::sleep(time::Duration::from_millis(5));
+        } else {
+            thread::sleep(time::Duration::from_millis(20));
+        }
+    }
+
+    tui::restore_terminal(&mut terminal);
+}
+
+fn run_headless(
+    orch: &mut RingOrchestrator,
+    dwarf_info: &Option<DwarfInfo>,
+    min_events: u64,
+    addr_index: &mut AddressIndex,
+    world: &mut WorldState,
+    stacks: &mut Vec<ShadowStack>,
+    next_frame_id: &mut FrameId,
+    total: &mut u64,
+    journal: &mut VecDeque<JournalEntry>,
+    relocation_delta: &mut Option<u64>,
+    returned_frames: &mut VecDeque<FrameId>,
+) {
+    use std::io::Write;
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let refresh = time::Duration::from_millis(100);
@@ -361,21 +277,21 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         while drained < 10_000 {
             match orch.merge_pop() {
                 Some((ri, ev)) => {
-                    total += 1;
+                    *total += 1;
                     drained += 1;
                     world.inc_insn_counter();
 
                     let ev_kind = ev.kind();
                     journal.push_back(JournalEntry {
-                        seq: total, kind: ev_kind, thread_id: ev.thread_id,
+                        seq: *total, kind: ev_kind, thread_id: ev.thread_id,
                         addr: ev.addr, size: ev.size, value: ev.value,
                     });
                     if journal.len() > 1000 { journal.pop_front(); }
 
                     process_event(
-                        &ev, ri, &orch, &mut world, &mut addr_index,
-                        &dwarf_info, &mut stacks, &mut next_frame_id,
-                        &mut relocation_delta, &mut returned_frames,
+                        &ev, ri, orch, world, addr_index,
+                        dwarf_info, stacks, next_frame_id,
+                        relocation_delta, returned_frames,
                     );
                 }
                 None => break,
@@ -383,14 +299,14 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         }
 
         let now = time::Instant::now();
-        if now.duration_since(last_render) >= refresh || (!rendered_once && total > 0) {
+        if now.duration_since(last_render) >= refresh || (!rendered_once && *total > 0) {
             let snap = world.snapshot();
-            render(&mut out, &snap, &journal, total, &orch);
+            headless_render(&mut out, &snap, journal, *total, orch);
             let _ = out.flush();
             last_render = now;
             rendered_once = true;
 
-            if once && total >= min_events {
+            if *total >= min_events {
                 return;
             }
         }
@@ -399,9 +315,86 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             thread::sleep(time::Duration::from_millis(10));
         }
 
-        if total & 0xFFF == 0 {
+        if *total & 0xFFF == 0 {
             world.cache_heat_tick();
         }
+    }
+}
+
+fn headless_render(
+    out: &mut impl std::io::Write,
+    world: &memvis::world::WorldInner,
+    journal: &VecDeque<JournalEntry>,
+    total: u64,
+    orch: &RingOrchestrator,
+) {
+    let (used, pct) = orch.total_fill();
+    let _ = writeln!(out,
+        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ fill {}% ({})",
+        world.insn_counter, total, world.nodes.len(), world.edges.len(),
+        orch.ring_count(), pct, used);
+    let _ = writeln!(out, "{}", "─".repeat(100));
+    let _ = writeln!(out, "MEMORY MAP");
+
+    let mut sorted: Vec<_> = world.nodes.iter().filter(|(_, n)| n.size > 0).collect();
+    sorted.sort_by_key(|(_, n)| (n.addr, std::cmp::Reverse(n.last_write_insn)));
+    sorted.dedup_by(|a, b| {
+        matches!(a.0, NodeId::Local(..)) && matches!(b.0, NodeId::Local(..))
+            && a.1.addr == b.1.addr && a.1.name == b.1.name
+    });
+
+    let mut last_cl: u64 = u64::MAX;
+    for (nid, node) in &sorted {
+        if matches!(nid, NodeId::Field(..)) { continue; }
+        let cl = node.addr / 64;
+        if cl != last_cl {
+            let fs = world.cl_tracker.contention_score(node.addr);
+            let fs_tag = if fs > 1 { format!(" FALSE_SHARE T={}", fs) } else { String::new() };
+            let _ = writeln!(out, "  ── cacheline 0x{:x} ──{}", cl * 64, fs_tag);
+            last_cl = cl;
+        }
+        let ptr_info = if node.type_info.is_pointer && node.raw_value != 0 {
+            let target = world.nodes.values()
+                .find(|t| node.raw_value >= t.addr && node.raw_value < t.addr + t.size.max(1));
+            match target {
+                Some(t) => format!("  → {}", t.name),
+                None => format!("  → 0x{:x}", node.raw_value),
+            }
+        } else { String::new() };
+        let _ = writeln!(out, "  {:>12x}  {:>4}B  {:<20} {:<14}  val={:>18x}{}",
+            node.addr, node.size, node.name, node.type_info.name, node.raw_value, ptr_info);
+        if let NodeId::Global(gi) = nid {
+            for (fi, f) in node.type_info.fields.iter().enumerate() {
+                if f.byte_size == 0 { continue; }
+                let fa = node.addr + f.byte_offset;
+                let fid = NodeId::Field(*gi, fi as u16);
+                let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
+                let _ = writeln!(out, "    {:>12x}  {:>4}B  {:<20} {:<14}  val={:>18x}",
+                    fa, f.byte_size, f.name, f.type_info.name, fval);
+            }
+        }
+    }
+
+    if !world.edges.is_empty() {
+        let _ = writeln!(out, "\nPOINTER EDGES");
+        let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
+        for (src, edge) in &world.edges {
+            let src_name = world.nodes.get(src).map(|n| n.name.clone()).unwrap_or_default();
+            let key = (src_name.clone(), edge.ptr_value);
+            if !seen.insert(key) { continue; }
+            let tgt_name = world.nodes.get(&edge.target).map(|n| n.name.as_str()).unwrap_or("?");
+            let _ = writeln!(out, "  {} ──> {} (0x{:x})", src_name, tgt_name, edge.ptr_value);
+        }
+    }
+
+    let tail_n = 12usize;
+    let start = if journal.len() > tail_n { journal.len() - tail_n } else { 0 };
+    let _ = writeln!(out, "\nEVENTS (last {})", tail_n);
+    for i in start..journal.len() {
+        let e = &journal[i];
+        let kind_str = match e.kind { 0=>"W", 1=>"R", 2=>"CALL", 3=>"RET", 4=>"OVF", 5=>"REG", 6=>"CMIS", 7=>"MLOAD", _=>"?" };
+        let _ = writeln!(out, "  {:>8} {:<5} T{:<3} {:>12x}  {:>4}  {:>16x}",
+            e.seq, kind_str, e.thread_id, e.addr, e.size, e.value);
     }
 }
 

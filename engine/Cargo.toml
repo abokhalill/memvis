@@ -13,6 +13,8 @@ path = "src/main.rs"
 libc = "0.2"
 gimli = "0.31"
 object = { version = "0.36", default-features = false, features = ["read", "elf"] }
+ratatui = "0.29"
+crossterm = "0.28"
 
 [profile.release]
 opt-level = 3
