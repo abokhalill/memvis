@@ -15,109 +15,150 @@
 
 #include "memvis_bridge.h"
 
-static memvis_ring_header_t *g_ring   = NULL;
-static int                   g_shm_fd = -1;
-static size_t                g_shm_sz = 0;
+static memvis_ctl_header_t *g_ctl     = NULL;
+static int                  g_ctl_fd  = -1;
 
-static volatile int g_overflow_emitted = 0;
+static _Atomic uint64_t g_insn_counter  = 0;
 
-static volatile uint64_t g_insn_counter  = 0;
+static _Atomic uint64_t g_stat_writes       = 0;
+static _Atomic uint64_t g_stat_reads        = 0;
+static _Atomic uint64_t g_stat_calls        = 0;
+static _Atomic uint64_t g_stat_returns      = 0;
+static _Atomic uint64_t g_stat_shed         = 0;
+static _Atomic uint64_t g_stat_dropped      = 0;
+static _Atomic uint64_t g_stat_reg_snaps    = 0;
 
-static volatile uint64_t g_stat_writes       = 0;
-static volatile uint64_t g_stat_reads        = 0;
-static volatile uint64_t g_stat_calls        = 0;
-static volatile uint64_t g_stat_returns      = 0;
-static volatile uint64_t g_stat_shed         = 0;
-static volatile uint64_t g_stat_dropped      = 0;
-static volatile uint64_t g_stat_reg_snaps    = 0;
+static _Atomic uint16_t g_next_thread_id    = 0;
+
+#define TLS_SLOT_GUARD     0
+#define TLS_SLOT_THREAD_ID 1
+#define TLS_SLOT_SEQ       2
+#define TLS_SLOT_RING      3
+#define TLS_SLOT_CTL_IDX   4
+#define TLS_SLOT_COUNT     5
 
 static void
-map_shared_memory(void)
+map_ctl_ring(void)
 {
-    uint32_t capacity = MEMVIS_DEFAULT_CAPACITY;
-    g_shm_sz = memvis_shm_size(capacity);
-
-    g_shm_fd = shm_open(MEMVIS_SHM_NAME, O_CREAT | O_RDWR, 0600);
-    DR_ASSERT(g_shm_fd >= 0);
-
-    if (ftruncate(g_shm_fd, (off_t)g_shm_sz) != 0)
+    size_t sz = memvis_ctl_shm_size();
+    g_ctl_fd = shm_open(MEMVIS_CTL_SHM_NAME, O_CREAT | O_RDWR, 0600);
+    DR_ASSERT(g_ctl_fd >= 0);
+    if (ftruncate(g_ctl_fd, (off_t)sz) != 0)
         DR_ASSERT(false);
+    g_ctl = (memvis_ctl_header_t *)mmap(
+        NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, g_ctl_fd, 0);
+    DR_ASSERT(g_ctl != MAP_FAILED);
+    if (g_ctl->magic != MEMVIS_CTL_MAGIC)
+        memvis_ctl_init(g_ctl);
+}
 
-    g_ring = (memvis_ring_header_t *)mmap(
-        NULL, g_shm_sz,
-        PROT_READ | PROT_WRITE,
-        MAP_SHARED, g_shm_fd, 0);
-    DR_ASSERT(g_ring != MAP_FAILED);
-
-    if (g_ring->magic != MEMVIS_MAGIC)
-        memvis_ring_init(g_ring, capacity, MEMVIS_FLAG_DROP_ON_FULL);
+static memvis_ring_header_t *
+alloc_thread_ring(const char *shm_name)
+{
+    uint32_t capacity = MEMVIS_THREAD_RING_CAPACITY;
+    size_t sz = memvis_shm_size(capacity);
+    int fd = shm_open(shm_name, O_CREAT | O_RDWR, 0600);
+    if (fd < 0) return NULL;
+    if (ftruncate(fd, (off_t)sz) != 0) { close(fd); return NULL; }
+    memvis_ring_header_t *ring = (memvis_ring_header_t *)mmap(
+        NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    close(fd);
+    if (ring == MAP_FAILED) return NULL;
+    memvis_ring_init(ring, capacity, MEMVIS_FLAG_DROP_ON_FULL);
+    return ring;
 }
 
 static void
-unmap_shared_memory(void)
+unmap_ctl_ring(void)
 {
-    if (g_ring && g_ring != MAP_FAILED) {
-        munmap(g_ring, g_shm_sz);
-        g_ring = NULL;
+    if (g_ctl && g_ctl != (void *)MAP_FAILED) {
+        munmap(g_ctl, memvis_ctl_shm_size());
+        g_ctl = NULL;
     }
-    if (g_shm_fd >= 0) {
-        close(g_shm_fd);
-        g_shm_fd = -1;
+    if (g_ctl_fd >= 0) {
+        close(g_ctl_fd);
+        g_ctl_fd = -1;
     }
-    shm_unlink(MEMVIS_SHM_NAME);
+    shm_unlink(MEMVIS_CTL_SHM_NAME);
+}
+
+static inline uint16_t tls_thread_id(void *drcontext) {
+    return (uint16_t)(uintptr_t)drmgr_get_tls_field(drcontext, TLS_SLOT_THREAD_ID);
+}
+
+static inline uint16_t tls_next_seq(void *drcontext) {
+    uint16_t s = (uint16_t)(uintptr_t)drmgr_get_tls_field(drcontext, TLS_SLOT_SEQ);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_SEQ, (void *)(uintptr_t)(uint16_t)(s + 1));
+    return s;
+}
+
+static inline memvis_ring_header_t *tls_ring(void *drcontext) {
+    return (memvis_ring_header_t *)drmgr_get_tls_field(drcontext, TLS_SLOT_RING);
 }
 
 static void
 at_mem_write(uint64_t addr, uint64_t size)
 {
     void *drcontext = dr_get_current_drcontext();
-    void *guard = drmgr_get_tls_field(drcontext, 0);
+    void *guard = drmgr_get_tls_field(drcontext, TLS_SLOT_GUARD);
     if (guard != NULL) return;
-    drmgr_set_tls_field(drcontext, 0, (void *)(uintptr_t)1);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, (void *)(uintptr_t)1);
 
-    int rc = memvis_push_sampled(g_ring, addr, size, 0, MEMVIS_EVENT_WRITE);
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) { drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL); return; }
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    int rc = memvis_push_sampled(ring, addr, (uint32_t)size, 0,
+                                  MEMVIS_EVENT_WRITE, tid, seq);
     if (rc == 0) {
-        g_stat_writes++;
-        g_overflow_emitted = 0;
+        atomic_fetch_add_explicit(&g_stat_writes, 1, memory_order_relaxed);
     } else if (rc < 0) {
-        g_stat_dropped++;
-        if (!g_overflow_emitted) {
-            g_overflow_emitted = 1;
-            memvis_push_overflow(g_ring, g_stat_writes + g_stat_reads);
-        }
+        atomic_fetch_add_explicit(&g_stat_dropped, 1, memory_order_relaxed);
+        memvis_push_overflow(ring,
+            atomic_load_explicit(&g_stat_writes, memory_order_relaxed),
+            tid, seq);
     }
 
-    drmgr_set_tls_field(drcontext, 0, NULL);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL);
 }
 
 static void
 at_mem_read(uint64_t addr, uint64_t size)
 {
     void *drcontext = dr_get_current_drcontext();
-    void *guard = drmgr_get_tls_field(drcontext, 0);
+    void *guard = drmgr_get_tls_field(drcontext, TLS_SLOT_GUARD);
     if (guard != NULL) return;
-    drmgr_set_tls_field(drcontext, 0, (void *)(uintptr_t)1);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, (void *)(uintptr_t)1);
 
-    int rc = memvis_push_sampled(g_ring, addr, size, 0, MEMVIS_EVENT_READ);
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) { drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL); return; }
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    int rc = memvis_push_sampled(ring, addr, (uint32_t)size, 0,
+                                  MEMVIS_EVENT_READ, tid, seq);
     if (rc == 0)
-        g_stat_reads++;
+        atomic_fetch_add_explicit(&g_stat_reads, 1, memory_order_relaxed);
     else if (rc == 1)
-        g_stat_shed++;
+        atomic_fetch_add_explicit(&g_stat_shed, 1, memory_order_relaxed);
 
-    drmgr_set_tls_field(drcontext, 0, NULL);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL);
 }
 
 static void
 at_call(uint64_t callee_pc, uint64_t frame_base)
 {
     void *drcontext = dr_get_current_drcontext();
-    void *guard = drmgr_get_tls_field(drcontext, 0);
+    void *guard = drmgr_get_tls_field(drcontext, TLS_SLOT_GUARD);
     if (guard != NULL) return;
-    drmgr_set_tls_field(drcontext, 0, (void *)(uintptr_t)1);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, (void *)(uintptr_t)1);
 
-    memvis_push_ex(g_ring, callee_pc, 0, frame_base, MEMVIS_EVENT_CALL);
-    g_stat_calls++;
-    g_insn_counter += 8;
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) { drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL); return; }
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    memvis_push_ex(ring, callee_pc, 0, frame_base, MEMVIS_EVENT_CALL, tid, seq);
+    atomic_fetch_add_explicit(&g_stat_calls, 1, memory_order_relaxed);
+    uint64_t ic = atomic_fetch_add_explicit(&g_insn_counter, 8, memory_order_relaxed);
 
     // reg snapshot on every call
     dr_mcontext_t mc;
@@ -143,25 +184,30 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
         regs[MEMVIS_REG_R15]    = (uint64_t)mc.r15;
         regs[MEMVIS_REG_RIP]    = (uint64_t)mc.pc;
         regs[MEMVIS_REG_RFLAGS] = (uint64_t)mc.xflags;
-        memvis_push_reg_snapshot(g_ring, g_insn_counter, regs);
-        g_stat_reg_snaps++;
+        uint16_t rseq = tls_next_seq(drcontext);
+        memvis_push_reg_snapshot(ring, ic + 8, regs, tid, rseq);
+        atomic_fetch_add_explicit(&g_stat_reg_snaps, 1, memory_order_relaxed);
     }
 
-    drmgr_set_tls_field(drcontext, 0, NULL);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL);
 }
 
 static void
 at_return(uint64_t retaddr)
 {
     void *drcontext = dr_get_current_drcontext();
-    void *guard = drmgr_get_tls_field(drcontext, 0);
+    void *guard = drmgr_get_tls_field(drcontext, TLS_SLOT_GUARD);
     if (guard != NULL) return;
-    drmgr_set_tls_field(drcontext, 0, (void *)(uintptr_t)1);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, (void *)(uintptr_t)1);
 
-    memvis_push_ex(g_ring, retaddr, 0, 0, MEMVIS_EVENT_RETURN);
-    g_stat_returns++;
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) { drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL); return; }
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    memvis_push_ex(ring, retaddr, 0, 0, MEMVIS_EVENT_RETURN, tid, seq);
+    atomic_fetch_add_explicit(&g_stat_returns, 1, memory_order_relaxed);
 
-    drmgr_set_tls_field(drcontext, 0, NULL);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL);
 }
 
 static dr_emit_flags_t
@@ -230,30 +276,56 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
 static void
 event_thread_init(void *drcontext)
 {
-    drmgr_set_tls_field(drcontext, 0, NULL);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_GUARD, NULL);
+    uint16_t tid = atomic_fetch_add_explicit(&g_next_thread_id, 1, memory_order_relaxed);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_THREAD_ID, (void *)(uintptr_t)tid);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_SEQ, (void *)(uintptr_t)0);
+
+    char name[MEMVIS_RING_NAME_LEN];
+    dr_snprintf(name, sizeof(name), "/memvis_ring_%u", (unsigned)tid);
+    memvis_ring_header_t *ring = alloc_thread_ring(name);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_RING, (void *)ring);
+
+    int ctl_idx = -1;
+    if (ring && g_ctl)
+        ctl_idx = memvis_ctl_register_thread(g_ctl, tid, name);
+    drmgr_set_tls_field(drcontext, TLS_SLOT_CTL_IDX, (void *)(uintptr_t)(ctl_idx + 1));
+
+    dr_printf("memvis: thread %u ring @ %p (%s)\n", (unsigned)tid, (void *)ring, name);
 }
 
 static void
 event_thread_exit(void *drcontext)
 {
-    (void)drcontext;
+    int ctl_idx = (int)(uintptr_t)drmgr_get_tls_field(drcontext, TLS_SLOT_CTL_IDX) - 1;
+    if (ctl_idx >= 0 && g_ctl)
+        memvis_ctl_mark_dead(g_ctl, (uint32_t)ctl_idx);
+
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (ring) {
+        size_t sz = memvis_shm_size(ring->capacity);
+        munmap(ring, sz);
+    }
+    drmgr_set_tls_field(drcontext, TLS_SLOT_RING, NULL);
 }
 
 static void
 event_exit(void)
 {
     dr_printf("memvis: --- producer stats ---\n");
-    dr_printf("memvis:   writes:  %llu\n", (unsigned long long)g_stat_writes);
-    dr_printf("memvis:   reads:   %llu\n", (unsigned long long)g_stat_reads);
-    dr_printf("memvis:   calls:   %llu\n", (unsigned long long)g_stat_calls);
-    dr_printf("memvis:   returns: %llu\n", (unsigned long long)g_stat_returns);
-    dr_printf("memvis:   shed:    %llu\n", (unsigned long long)g_stat_shed);
-    dr_printf("memvis:   dropped: %llu\n", (unsigned long long)g_stat_dropped);
-    dr_printf("memvis:   regsnap: %llu\n", (unsigned long long)g_stat_reg_snaps);
+    dr_printf("memvis:   writes:  %llu\n", (unsigned long long)atomic_load(&g_stat_writes));
+    dr_printf("memvis:   reads:   %llu\n", (unsigned long long)atomic_load(&g_stat_reads));
+    dr_printf("memvis:   calls:   %llu\n", (unsigned long long)atomic_load(&g_stat_calls));
+    dr_printf("memvis:   returns: %llu\n", (unsigned long long)atomic_load(&g_stat_returns));
+    dr_printf("memvis:   shed:    %llu\n", (unsigned long long)atomic_load(&g_stat_shed));
+    dr_printf("memvis:   dropped: %llu\n", (unsigned long long)atomic_load(&g_stat_dropped));
+    dr_printf("memvis:   regsnap: %llu\n", (unsigned long long)atomic_load(&g_stat_reg_snaps));
+    dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
 
-    unmap_shared_memory();
+    unmap_ctl_ring();
     drmgr_unregister_bb_insertion_event(event_bb_insert);
-    drmgr_unregister_tls_field(0);
+    for (int i = 0; i < TLS_SLOT_COUNT; i++)
+        drmgr_unregister_tls_field(i);
     drutil_exit();
     drmgr_exit();
 }
@@ -268,10 +340,12 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     drmgr_init();
     drutil_init();
 
-    int tls_idx = drmgr_register_tls_field();
-    DR_ASSERT(tls_idx != -1);
+    for (int i = 0; i < TLS_SLOT_COUNT; i++) {
+        int tls_idx = drmgr_register_tls_field();
+        DR_ASSERT(tls_idx != -1);
+    }
 
-    map_shared_memory();
+    map_ctl_ring();
 
     dr_register_exit_event(event_exit);
     drmgr_register_thread_init_event(event_thread_init);
@@ -280,7 +354,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     drmgr_register_bb_instrumentation_event(event_bb_analysis,
                                             event_bb_insert, NULL);
 
-    dr_printf("memvis: tracer attached (phase 3), ring @ %p, cap %u\n",
-              (void *)g_ring, g_ring->capacity);
+    dr_printf("memvis: tracer attached (phase 4), per-thread rings, ctl @ %p\n",
+              (void *)g_ctl);
     dr_printf("memvis: instrumentation: W+R+CALL+RET, adaptive sampling\n");
 }
