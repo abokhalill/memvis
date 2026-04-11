@@ -185,6 +185,102 @@ impl WorldState {
     pub fn edge_count(&self) -> usize { self.inner.edges.len() }
 }
 
+// circular snapshot buffer with triple-index for time-travel
+pub struct SnapshotRing {
+    buf: Vec<SnapEntry>,
+    cap: usize,
+    write_pos: usize,
+    len: usize,
+}
+
+struct SnapEntry {
+    snap: Arc<WorldInner>,
+    insn: u64,
+    tick: u64,
+    event_seq: u64,
+}
+
+pub struct SnapRef<'a> {
+    pub snap: &'a Arc<WorldInner>,
+    pub insn: u64,
+    pub tick: u64,
+    pub event_seq: u64,
+}
+
+impl SnapshotRing {
+    pub fn new(cap: usize) -> Self {
+        Self { buf: Vec::with_capacity(cap), cap, write_pos: 0, len: 0 }
+    }
+
+    pub fn push(&mut self, snap: Arc<WorldInner>, tick: u64, event_seq: u64) {
+        let insn = snap.insn_counter;
+        let entry = SnapEntry { snap, insn, tick, event_seq };
+        if self.buf.len() < self.cap {
+            self.buf.push(entry);
+        } else {
+            self.buf[self.write_pos] = entry;
+        }
+        self.write_pos = (self.write_pos + 1) % self.cap;
+        self.len = (self.len + 1).min(self.cap);
+    }
+
+    pub fn len(&self) -> usize { self.len }
+    pub fn is_empty(&self) -> bool { self.len == 0 }
+
+    // index 0 = oldest, len-1 = newest
+    fn slot(&self, idx: usize) -> Option<&SnapEntry> {
+        if idx >= self.len { return None; }
+        let start = if self.len < self.cap { 0 } else { self.write_pos };
+        let real = (start + idx) % self.cap;
+        Some(&self.buf[real])
+    }
+
+    pub fn get(&self, idx: usize) -> Option<SnapRef<'_>> {
+        self.slot(idx).map(|e| SnapRef {
+            snap: &e.snap, insn: e.insn, tick: e.tick, event_seq: e.event_seq,
+        })
+    }
+
+    pub fn latest(&self) -> Option<SnapRef<'_>> {
+        if self.len == 0 { return None; }
+        self.get(self.len - 1)
+    }
+
+    // binary search by insn counter, returns nearest <= target
+    pub fn find_by_insn(&self, target_insn: u64) -> Option<usize> {
+        if self.len == 0 { return None; }
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.slot(mid).unwrap().insn <= target_insn { lo = mid + 1; } else { hi = mid; }
+        }
+        if lo > 0 { Some(lo - 1) } else { None }
+    }
+
+    pub fn find_by_tick(&self, target_tick: u64) -> Option<usize> {
+        if self.len == 0 { return None; }
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.slot(mid).unwrap().tick <= target_tick { lo = mid + 1; } else { hi = mid; }
+        }
+        if lo > 0 { Some(lo - 1) } else { None }
+    }
+
+    pub fn find_by_seq(&self, target_seq: u64) -> Option<usize> {
+        if self.len == 0 { return None; }
+        let mut lo = 0usize;
+        let mut hi = self.len;
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            if self.slot(mid).unwrap().event_seq <= target_seq { lo = mid + 1; } else { hi = mid; }
+        }
+        if lo > 0 { Some(lo - 1) } else { None }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -231,5 +327,32 @@ mod tests {
         ws.remove_frame_nodes(1);
         assert_eq!(ws.node_count(), 1);
         assert_eq!(ws.edge_count(), 0);
+    }
+
+    #[test]
+    fn test_snapshot_ring() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "x", &ti("int", 4, false), 0x1000, 4);
+
+        let mut ring = SnapshotRing::new(4);
+        for i in 0..6u64 {
+            ws.update_value(NodeId::Global(0), i * 10, i);
+            ws.inc_insn_counter();
+            ring.push(ws.snapshot(), i, i);
+        }
+
+        // cap=4, pushed 6, oldest 2 evicted
+        assert_eq!(ring.len(), 4);
+        assert_eq!(ring.get(0).unwrap().event_seq, 2);
+        assert_eq!(ring.get(3).unwrap().event_seq, 5);
+        assert_eq!(ring.latest().unwrap().event_seq, 5);
+
+        // binary search by insn (insn = seq+1 because inc happens before snapshot)
+        let idx = ring.find_by_insn(4).unwrap();
+        let sr = ring.get(idx).unwrap();
+        assert!(sr.insn <= 4);
+
+        // out of range
+        assert!(ring.find_by_insn(0).is_none());
     }
 }
