@@ -4,13 +4,49 @@
 
 use gimli::{
     AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, LittleEndian,
-    Operation, Unit, UnitOffset,
+    Operation, Range, Unit, UnitOffset,
 };
 use object::{Object, ObjectSection};
 use std::collections::BTreeMap;
 use std::fs;
 
 type R<'a> = EndianSlice<'a, LittleEndian>;
+
+#[derive(Debug, Clone)]
+pub enum LocationPiece {
+    Address(u64),          // DW_OP_addr
+    FrameBaseOffset(i64),  // DW_OP_fbreg
+    Register(u16),         // DW_OP_reg*
+    RegisterOffset(u16, i64), // DW_OP_breg*
+    ImplicitValue(u64),    // const + DW_OP_stack_value
+}
+
+#[derive(Debug, Clone)]
+pub struct LocationTable {
+    pub entries: Vec<(Range, LocationPiece)>,
+}
+
+impl LocationTable {
+    pub fn single(piece: LocationPiece) -> Self {
+        Self {
+            entries: vec![(Range { begin: 0, end: u64::MAX }, piece)],
+        }
+    }
+
+    pub fn empty() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn lookup(&self, pc: u64) -> Option<&LocationPiece> {
+        self.entries.iter()
+            .find(|(r, _)| pc >= r.begin && pc < r.end)
+            .map(|(_, p)| p)
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
@@ -34,6 +70,7 @@ pub struct GlobalVar {
     pub addr: u64,
     pub size: u64,
     pub type_info: TypeInfo,
+    pub location: LocationTable,
 }
 
 #[derive(Debug, Clone)]
@@ -42,6 +79,7 @@ pub struct LocalVar {
     pub name: String,
     pub size: u64,
     pub type_info: TypeInfo,
+    pub location: LocationTable,
 }
 
 #[derive(Debug, Clone)]
@@ -116,6 +154,69 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
     Ok(DwarfInfo { globals, functions })
 }
 
+// single expression --> piece. returns None for unsupported ops.
+fn decode_expression(unit: &Unit<R<'_>>, expr: &gimli::Expression<R<'_>>) -> Option<LocationPiece> {
+    let mut ops = expr.operations(unit.encoding());
+    let first = match ops.next() {
+        Ok(Some(op)) => op,
+        _ => return None,
+    };
+
+    match first {
+        Operation::Address { address } => Some(LocationPiece::Address(address)),
+        Operation::FrameOffset { offset } => Some(LocationPiece::FrameBaseOffset(offset)),
+        Operation::Register { register } => Some(LocationPiece::Register(register.0)),
+        Operation::RegisterOffset { register, offset, .. } => {
+            Some(LocationPiece::RegisterOffset(register.0, offset))
+        }
+        Operation::UnsignedConstant { value } => {
+            match ops.next() {
+                Ok(Some(Operation::StackValue)) => Some(LocationPiece::ImplicitValue(value)),
+                _ => None,
+            }
+        }
+        Operation::SignedConstant { value } => {
+            match ops.next() {
+                Ok(Some(Operation::StackValue)) => Some(LocationPiece::ImplicitValue(value as u64)),
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+// exprloc --> single-entry table, loclist --> multi-entry table
+fn decode_location<'a>(
+    dwarf: &Dwarf<R<'a>>,
+    unit: &Unit<R<'a>>,
+    attr: &AttributeValue<R<'a>>,
+) -> LocationTable {
+    match attr {
+        AttributeValue::Exprloc(expr) => {
+            match decode_expression(unit, expr) {
+                Some(piece) => LocationTable::single(piece),
+                None => LocationTable::empty(),
+            }
+        }
+        _ => {
+            if let Ok(Some(offset)) = dwarf.attr_locations_offset(unit, attr.clone()) {
+                if let Ok(mut iter) = dwarf.locations(unit, offset) {
+                    let mut entries = Vec::new();
+                    while let Ok(Some(entry)) = iter.next() {
+                        if let Some(piece) = decode_expression(unit, &entry.data) {
+                            entries.push((entry.range, piece));
+                        }
+                    }
+                    if !entries.is_empty() {
+                        return LocationTable { entries };
+                    }
+                }
+            }
+            LocationTable::empty()
+        }
+    }
+}
+
 fn try_extract_global<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
@@ -124,7 +225,13 @@ fn try_extract_global<'a>(
     let name = attr_name(dwarf, unit, entry)?;
 
     let loc_attr = entry.attr_value(gimli::DW_AT_location).ok().flatten()?;
-    let addr = eval_addr_location(unit, &loc_attr)?;
+    let location = decode_location(dwarf, unit, &loc_attr);
+    if location.is_empty() { return None; }
+
+    let addr = match &location.entries[0].1 {
+        LocationPiece::Address(a) => *a,
+        _ => 0,
+    };
 
     let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo {
         name: "<unknown>".into(),
@@ -138,20 +245,7 @@ fn try_extract_global<'a>(
         return None;
     }
 
-    Some(GlobalVar { name, addr, size, type_info })
-}
-
-fn eval_addr_location(unit: &Unit<R<'_>>, attr: &AttributeValue<R<'_>>) -> Option<u64> {
-    match attr {
-        AttributeValue::Exprloc(expr) => {
-            let mut ops = expr.operations(unit.encoding());
-            match ops.next() {
-                Ok(Some(Operation::Address { address })) => Some(address),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
+    Some(GlobalVar { name, addr, size, type_info, location })
 }
 
 fn try_extract_function<'a>(
@@ -241,7 +335,14 @@ fn try_extract_local<'a>(
     let name = attr_name(dwarf, unit, entry)?;
 
     let loc_attr = entry.attr_value(gimli::DW_AT_location).ok().flatten()?;
-    let frame_offset = eval_fbreg_offset(unit, &loc_attr)?;
+    let location = decode_location(dwarf, unit, &loc_attr);
+    if location.is_empty() { return None; }
+
+    let frame_offset = match &location.entries[0].1 {
+        LocationPiece::FrameBaseOffset(off) => *off,
+        LocationPiece::RegisterOffset(_, off) => *off,
+        _ => 0,
+    };
 
     let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo {
         name: "<unknown>".into(),
@@ -255,20 +356,8 @@ fn try_extract_local<'a>(
         name,
         size: type_info.byte_size,
         type_info,
+        location,
     })
-}
-
-fn eval_fbreg_offset(unit: &Unit<R<'_>>, attr: &AttributeValue<R<'_>>) -> Option<i64> {
-    match attr {
-        AttributeValue::Exprloc(expr) => {
-            let mut ops = expr.operations(unit.encoding());
-            match ops.next() {
-                Ok(Some(Operation::FrameOffset { offset })) => Some(offset),
-                _ => None,
-            }
-        }
-        _ => None,
-    }
 }
 
 fn extract_struct_fields<'a>(
