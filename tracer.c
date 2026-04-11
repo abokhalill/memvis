@@ -39,7 +39,15 @@ static _Atomic int g_module_load_emitted = 0;
 #define TLS_SLOT_SEQ       2
 #define TLS_SLOT_RING      3
 #define TLS_SLOT_CTL_IDX   4
-#define TLS_SLOT_COUNT     5
+#define TLS_SLOT_RDBUF     5
+#define TLS_SLOT_COUNT     6
+
+#define RDBUF_CAP 16
+typedef struct {
+    uint32_t count;
+    uint32_t _pad;
+    struct { uint64_t addr; uint32_t size; uint32_t _p; } entries[RDBUF_CAP];
+} read_buf_t;
 
 // actual drmgr TLS field indices, filled at init
 static int g_tls_idx[TLS_SLOT_COUNT];
@@ -154,24 +162,48 @@ at_mem_write(uint64_t addr, uint32_t size)
 }
 
 static void
-at_mem_read(uint64_t addr, uint32_t size)
+at_mem_read_buf(uint64_t addr, uint32_t size)
+{
+    void *drcontext = dr_get_current_drcontext();
+    read_buf_t *buf = (read_buf_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF]);
+    if (!buf || buf->count >= RDBUF_CAP) return;
+    uint32_t idx = buf->count++;
+    buf->entries[idx].addr = addr;
+    buf->entries[idx].size = size;
+}
+
+static void
+flush_read_buf(void)
 {
     void *drcontext = dr_get_current_drcontext();
     void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
     if (guard != NULL) return;
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], (void *)(uintptr_t)1);
 
+    read_buf_t *buf = (read_buf_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF]);
+    if (!buf || buf->count == 0) {
+        drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
+        return;
+    }
     memvis_ring_header_t *ring = tls_ring(drcontext);
-    if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
+    if (!ring) {
+        buf->count = 0;
+        drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
+        return;
+    }
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
-    int rc = memvis_push_sampled(ring, addr, size, 0,
-                                  MEMVIS_EVENT_READ, tid, seq);
-    if (rc == 0)
-        atomic_fetch_add_explicit(&g_stat_reads, 1, memory_order_relaxed);
-    else if (rc == 1)
-        atomic_fetch_add_explicit(&g_stat_shed, 1, memory_order_relaxed);
-
+    uint32_t n = buf->count;
+    for (uint32_t i = 0; i < n; i++) {
+        uint16_t seq = tls_next_seq(drcontext);
+        int rc = memvis_push_sampled(ring, buf->entries[i].addr,
+                                      buf->entries[i].size, 0,
+                                      MEMVIS_EVENT_READ, tid, seq);
+        if (rc == 0)
+            atomic_fetch_add_explicit(&g_stat_reads, 1, memory_order_relaxed);
+        else if (rc == 1)
+            atomic_fetch_add_explicit(&g_stat_shed, 1, memory_order_relaxed);
+    }
+    buf->count = 0;
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
 }
 
@@ -245,8 +277,14 @@ static dr_emit_flags_t
 event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb,
                   bool for_trace, bool translating, void **user_data)
 {
-    (void)drcontext; (void)tag; (void)bb;
-    (void)for_trace; (void)translating; (void)user_data;
+    (void)drcontext; (void)tag;
+    (void)for_trace; (void)translating;
+    // scan BB for any memory reads to decide whether to insert a flush
+    bool has_reads = false;
+    for (instr_t *i = instrlist_first_app(bb); i != NULL; i = instr_get_next_app(i)) {
+        if (instr_reads_memory(i)) { has_reads = true; break; }
+    }
+    *user_data = (void *)(uintptr_t)has_reads;
     return DR_EMIT_DEFAULT;
 }
 
@@ -254,7 +292,7 @@ static dr_emit_flags_t
 event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                 bool for_trace, bool translating, void *user_data)
 {
-    (void)tag; (void)for_trace; (void)translating; (void)user_data;
+    (void)tag; (void)for_trace; (void)translating;
 
     if (instr_is_call_direct(instr)) {
         app_pc target = instr_get_branch_target_pc(instr);
@@ -301,6 +339,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
         }
     }
 
+    // buffer reads into TLS
     if (instr_reads_memory(instr)) {
         for (int i = 0; i < instr_num_srcs(instr); i++) {
             opnd_t src = instr_get_src(instr, i);
@@ -317,13 +356,20 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
             uint32_t sz = opnd_size_in_bytes(opnd_get_size(src));
             if (ok) {
                 dr_insert_clean_call(drcontext, bb, instr,
-                                     (void *)at_mem_read, false, 2,
+                                     (void *)at_mem_read_buf, false, 2,
                                      opnd_create_reg(reg1),
                                      OPND_CREATE_INT32((int)sz));
             }
             drreg_unreserve_register(drcontext, bb, instr, reg2);
             drreg_unreserve_register(drcontext, bb, instr, reg1);
         }
+    }
+
+    // flush read buffer once at the last instruction of BB
+    bool bb_has_reads = (bool)(uintptr_t)user_data;
+    if (bb_has_reads && instr_get_next(instr) == NULL) {
+        dr_insert_clean_call(drcontext, bb, instr,
+                             (void *)flush_read_buf, false, 0);
     }
 
     return DR_EMIT_DEFAULT;
@@ -365,6 +411,10 @@ event_thread_init(void *drcontext)
     memvis_ring_header_t *ring = alloc_thread_ring(name);
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], (void *)ring);
 
+    read_buf_t *rdbuf = (read_buf_t *)dr_thread_alloc(drcontext, sizeof(read_buf_t));
+    memset(rdbuf, 0, sizeof(read_buf_t));
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF], (void *)rdbuf);
+
     int ctl_idx = -1;
     if (ring && g_ctl)
         ctl_idx = memvis_ctl_register_thread(g_ctl, tid, name);
@@ -390,6 +440,12 @@ event_thread_exit(void *drcontext)
         shm_unlink(name);
     }
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], NULL);
+
+    read_buf_t *rdbuf = (read_buf_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF]);
+    if (rdbuf) {
+        dr_thread_free(drcontext, rdbuf, sizeof(read_buf_t));
+        drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF], NULL);
+    }
 }
 
 static void
