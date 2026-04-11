@@ -26,14 +26,34 @@ pub struct JournalEntry {
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub enum Panel { Memory, Events, Registers }
 
+pub struct EventFilter {
+    pub thread_id: Option<u16>,    // None = all threads
+    pub hide_reads: bool,
+    pub writes_only: bool,
+}
+
+impl EventFilter {
+    pub fn new() -> Self { Self { thread_id: None, hide_reads: false, writes_only: false } }
+    pub fn is_active(&self) -> bool { self.thread_id.is_some() || self.hide_reads || self.writes_only }
+    pub fn matches(&self, entry: &JournalEntry) -> bool {
+        if let Some(tid) = self.thread_id {
+            if entry.thread_id != tid { return false; }
+        }
+        if self.writes_only && entry.kind != 0 { return false; }
+        if self.hide_reads && entry.kind == 1 { return false; }
+        true
+    }
+}
+
 pub struct AppState {
     pub mem_scroll: usize,
     pub evt_scroll: usize,
     pub focus: Panel,
     pub quit: bool,
     pub paused: bool,
-    pub time_travel_idx: Option<usize>,  // None = live, Some(idx) = historical
-    pub snap_count: usize,               // total snapshots available
+    pub time_travel_idx: Option<usize>,
+    pub snap_count: usize,
+    pub filter: EventFilter,
 }
 
 impl AppState {
@@ -42,6 +62,7 @@ impl AppState {
             mem_scroll: 0, evt_scroll: 0, focus: Panel::Memory,
             quit: false, paused: false,
             time_travel_idx: None, snap_count: 0,
+            filter: EventFilter::new(),
         }
     }
 }
@@ -137,6 +158,22 @@ pub fn handle_input(state: &mut AppState) {
                         Panel::Events => state.evt_scroll = 0,
                         _ => {}
                     }
+                }
+                // event filters (only when events panel focused)
+                KeyCode::Char('w') if state.focus == Panel::Events => {
+                    state.filter.writes_only = !state.filter.writes_only;
+                    if state.filter.writes_only { state.filter.hide_reads = false; }
+                }
+                KeyCode::Char('r') if state.focus == Panel::Events => {
+                    state.filter.hide_reads = !state.filter.hide_reads;
+                    if state.filter.hide_reads { state.filter.writes_only = false; }
+                }
+                KeyCode::Char(c @ '0'..='9') if state.focus == Panel::Events => {
+                    let tid = (c as u16) - ('0' as u16);
+                    state.filter.thread_id = if state.filter.thread_id == Some(tid) { None } else { Some(tid) };
+                }
+                KeyCode::Char('x') if state.focus == Panel::Events => {
+                    state.filter = EventFilter::new();
                 }
                 _ => {}
             }
@@ -247,8 +284,8 @@ fn build_mem_lines(world: &WorldInner) -> Vec<MemLine> {
     lines
 }
 
-fn build_event_lines(journal: &VecDeque<JournalEntry>) -> Vec<Line<'static>> {
-    journal.iter().map(|e| {
+fn build_event_lines(journal: &VecDeque<JournalEntry>, filter: &EventFilter) -> Vec<Line<'static>> {
+    journal.iter().filter(|e| filter.matches(e)).map(|e| {
         let (kind_str, kclr) = match e.kind {
             0 => ("W   ", Color::White),
             1 => ("R   ", Color::DarkGray),
@@ -285,7 +322,7 @@ pub fn draw(
 ) {
     state.snap_count = snap_total;
     let mem_lines = build_mem_lines(world);
-    let evt_lines = build_event_lines(journal);
+    let evt_lines = build_event_lines(journal, &state.filter);
 
     // clamp scrolls
     state.mem_scroll = state.mem_scroll.min(mem_lines.len().saturating_sub(1));
@@ -368,10 +405,19 @@ pub fn draw(
         if state.focus != Panel::Events && evt_lines.len() > evt_area_h {
             state.evt_scroll = evt_lines.len().saturating_sub(evt_area_h);
         }
+        let mut filter_parts: Vec<String> = Vec::new();
+        if state.filter.writes_only { filter_parts.push("W only".into()); }
+        if state.filter.hide_reads { filter_parts.push("no R".into()); }
+        if let Some(tid) = state.filter.thread_id { filter_parts.push(format!("T{}", tid)); }
+        let evt_title = if filter_parts.is_empty() {
+            " Events ".to_string()
+        } else {
+            format!(" Events [{}] ", filter_parts.join(", "))
+        };
         let evt_widget = Paragraph::new(evt_lines.clone())
             .block(Block::default()
-                .title(" Events ")
-                .title_style(Style::default().fg(Color::White).bold())
+                .title(evt_title)
+                .title_style(Style::default().fg(if state.filter.is_active() { Color::Yellow } else { Color::White }).bold())
                 .borders(Borders::ALL)
                 .border_style(evt_border_style))
             .scroll((state.evt_scroll as u16, 0));
