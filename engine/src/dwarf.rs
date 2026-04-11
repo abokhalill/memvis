@@ -69,7 +69,7 @@ const DWARF_TO_REGFILE: [Option<usize>; 17] = [
     Some(14), 
     Some(15), 
     Some(16), 
-]
+];
 
 fn dwarf_reg_to_index(dwarf_reg: u16) -> Option<usize> {
     DWARF_TO_REGFILE.get(dwarf_reg as usize).copied().flatten()

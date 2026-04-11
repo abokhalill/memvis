@@ -244,6 +244,44 @@ impl WorldState {
     pub fn edge_count(&self) -> usize { self.inner.edges.len() }
 }
 
+// per-thread shadow stack. validates CALL/RETURN pairing.
+#[derive(Debug, Clone)]
+pub struct ShadowFrame {
+    pub frame_id: crate::index::FrameId,
+    pub callee_pc: u64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone)]
+pub struct ShadowStack {
+    pub frames: Vec<ShadowFrame>,
+    pub mismatches: u64,
+    pub max_depth: usize,
+}
+
+impl ShadowStack {
+    pub fn new() -> Self {
+        Self { frames: Vec::with_capacity(64), mismatches: 0, max_depth: 0 }
+    }
+
+    pub fn push_call(&mut self, frame_id: crate::index::FrameId, callee_pc: u64, name: String) {
+        self.frames.push(ShadowFrame { frame_id, callee_pc, name });
+        if self.frames.len() > self.max_depth {
+            self.max_depth = self.frames.len();
+        }
+    }
+
+    // returns frame if matched, None + increments mismatch if stack empty
+    pub fn pop_return(&mut self) -> Option<ShadowFrame> {
+        match self.frames.pop() {
+            Some(f) => Some(f),
+            None => { self.mismatches += 1; None }
+        }
+    }
+
+    pub fn depth(&self) -> usize { self.frames.len() }
+}
+
 // circular snapshot buffer with triple-index for time-travel
 pub struct SnapshotRing {
     buf: Vec<SnapEntry>,

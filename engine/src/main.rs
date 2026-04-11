@@ -7,7 +7,7 @@ use std::{env, thread, time};
 use memvis::dwarf::{self, DwarfInfo};
 use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::ring::{Event, RingOrchestrator};
-use memvis::world::{WorldState, WorldInner, REG_NAMES, REG_COUNT};
+use memvis::world::{WorldState, WorldInner, ShadowStack, REG_NAMES, REG_COUNT};
 
 const EVENT_WRITE: u8    = 0;
 const EVENT_CALL: u8     = 2;
@@ -191,7 +191,7 @@ fn process_event(
     world: &mut WorldState,
     addr_index: &mut AddressIndex,
     dwarf_info: &Option<DwarfInfo>,
-    stacks: &mut Vec<Vec<(FrameId, String)>>,
+    stacks: &mut Vec<ShadowStack>,
     next_frame_id: &mut FrameId,
 ) {
     let ev_kind = ev.kind();
@@ -215,9 +215,9 @@ fn process_event(
                     let fid = *next_frame_id;
                     *next_frame_id += 1;
                     while stacks.len() <= ring_idx {
-                        stacks.push(Vec::with_capacity(64));
+                        stacks.push(ShadowStack::new());
                     }
-                    stacks[ring_idx].push((fid, func.name.clone()));
+                    stacks[ring_idx].push_call(fid, ev.addr, func.name.clone());
                     for (li, l) in func.locals.iter().enumerate() {
                         let addr = (ev.value as i64 + l.frame_offset) as u64;
                         let nid = NodeId::Local(fid, li as u16);
@@ -235,9 +235,9 @@ fn process_event(
         }
         EVENT_RETURN => {
             if ring_idx < stacks.len() {
-                if let Some((fid, _)) = stacks[ring_idx].pop() {
-                    addr_index.remove_frame(fid);
-                    world.remove_frame_nodes(fid);
+                if let Some(frame) = stacks[ring_idx].pop_return() {
+                    addr_index.remove_frame(frame.frame_id);
+                    world.remove_frame_nodes(frame.frame_id);
                 }
             }
         }
@@ -265,7 +265,7 @@ fn process_event(
 fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
-    let mut stacks: Vec<Vec<(FrameId, String)>> = Vec::new();
+    let mut stacks: Vec<ShadowStack> = Vec::new();
     let mut next_frame_id: FrameId = 1;
     let mut total: u64 = 0;
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
