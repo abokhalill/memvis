@@ -213,7 +213,11 @@ fn process_event(
         }
         EVENT_CALL => {
             if let Some(ref info) = dwarf_info {
-                if let Some(func) = info.functions.get(&ev.addr) {
+                let elf_pc = match *relocation_delta {
+                    Some(d) => ev.addr.wrapping_sub(d),
+                    None => ev.addr,
+                };
+                if let Some(func) = info.functions.get(&elf_pc) {
                     let fid = *next_frame_id;
                     *next_frame_id += 1;
                     while stacks.len() <= ring_idx {

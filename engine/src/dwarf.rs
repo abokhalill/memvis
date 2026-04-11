@@ -290,7 +290,7 @@ fn try_extract_global<'a>(
 
     let addr = match &location.entries[0].1 {
         LocationPiece::Address(a) => *a,
-        _ => 0,
+        _ => return None, // not a global (fbreg/reg/etc are locals)
     };
 
     let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo {
