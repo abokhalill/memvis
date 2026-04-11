@@ -181,6 +181,12 @@ impl WorldState {
         true
     }
 
+    pub fn remove_node(&mut self, id: NodeId) {
+        let inner = self.cow();
+        inner.nodes.remove(&id);
+        inner.edges.remove(&id);
+    }
+
     #[inline]
     pub fn update_value(&mut self, id: NodeId, value: u64, insn: u64) {
         if let Some(node) = self.cow().nodes.get_mut(&id) {

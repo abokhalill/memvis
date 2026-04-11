@@ -6,7 +6,7 @@ use gimli::{
     AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, LittleEndian,
     Operation, Range, Unit, UnitOffset,
 };
-use object::{Object, ObjectSection};
+use object::{Object, ObjectSection, ObjectSegment};
 use std::collections::BTreeMap;
 use std::fs;
 
@@ -144,6 +144,7 @@ pub struct FunctionMeta {
 pub struct DwarfInfo {
     pub globals: Vec<GlobalVar>,
     pub functions: BTreeMap<u64, FunctionMeta>,
+    pub elf_base_vaddr: u64, // lowest PT_LOAD vaddr (0 for PIE)
 }
 
 fn attr_name<'a>(
@@ -167,6 +168,15 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
             .unwrap_or(&[]);
         Ok(EndianSlice::new(data, LittleEndian))
     };
+
+    // lowest PT_LOAD vaddr = ELF base (typically 0 for PIE)
+    let elf_base_vaddr = obj.segments()
+        .filter_map(|s| {
+            let addr = s.address();
+            if addr < u64::MAX { Some(addr) } else { None }
+        })
+        .min()
+        .unwrap_or(0);
 
     let dw = Dwarf::load(&load_section)?;
 
@@ -201,7 +211,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         functions.len()
     );
 
-    Ok(DwarfInfo { globals, functions })
+    Ok(DwarfInfo { globals, functions, elf_base_vaddr })
 }
 
 // single expression --> piece. returns None for unsupported ops.

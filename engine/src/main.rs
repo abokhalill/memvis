@@ -14,6 +14,7 @@ const EVENT_CALL: u8     = 2;
 const EVENT_RETURN: u8   = 3;
 const EVENT_REG_SNAPSHOT: u8 = 5;
 const EVENT_CACHE_MISS: u8   = 6;
+const EVENT_MODULE_LOAD: u8  = 7;
 
 const RST: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -193,6 +194,7 @@ fn process_event(
     dwarf_info: &Option<DwarfInfo>,
     stacks: &mut Vec<ShadowStack>,
     next_frame_id: &mut FrameId,
+    relocation_delta: &mut Option<u64>,
 ) {
     let ev_kind = ev.kind();
     match ev_kind {
@@ -258,18 +260,46 @@ fn process_event(
                 world.record_cache_miss(h.node_id);
             }
         }
+        EVENT_MODULE_LOAD => {
+            if relocation_delta.is_none() {
+                if let Some(ref info) = dwarf_info {
+                    let runtime_base = ev.addr;
+                    let delta = runtime_base.wrapping_sub(info.elf_base_vaddr);
+                    eprintln!("memvis: relocation delta=0x{:x} (runtime=0x{:x} elf=0x{:x})",
+                              delta, runtime_base, info.elf_base_vaddr);
+                    *relocation_delta = Some(delta);
+
+                    // rebuild address index and world nodes with relocated addresses
+                    *addr_index = AddressIndex::new();
+                    for (i, g) in info.globals.iter().enumerate() {
+                        let relocated_addr = g.addr.wrapping_add(delta);
+                        let nid = NodeId::Global(i as u32);
+                        addr_index.insert_global(
+                            relocated_addr, g.size, g.name.clone(),
+                            g.type_info.clone(), i as u32,
+                        );
+                        // force-update: remove old node at ELF addr, insert at runtime addr
+                        world.remove_node(nid);
+                        world.ensure_node(nid, &g.name, &g.type_info, relocated_addr, g.size);
+                    }
+                    addr_index.finalize();
+                }
+            }
+        }
         _ => {}
     }
 }
 
-fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool) {
+fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
     let mut stacks: Vec<ShadowStack> = Vec::new();
     let mut next_frame_id: FrameId = 1;
     let mut total: u64 = 0;
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
+    let mut relocation_delta: Option<u64> = None;
 
+    // insert globals with ELF vaddrs initially; they'll be relocated on MODULE_LOAD
     if let Some(ref info) = dwarf_info {
         for (i, g) in info.globals.iter().enumerate() {
             let nid = NodeId::Global(i as u32);
@@ -311,6 +341,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool) {
                     process_event(
                         &ev, ri, &orch, &mut world, &mut addr_index,
                         &dwarf_info, &mut stacks, &mut next_frame_id,
+                        &mut relocation_delta,
                     );
                 }
                 None => break,
@@ -325,7 +356,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool) {
             last_render = now;
             rendered_once = true;
 
-            if once && total > 0 {
+            if once && total >= min_events {
                 return;
             }
         }
@@ -344,7 +375,11 @@ fn main() {
     let args: Vec<String> = env::args().collect();
 
     let once = args.iter().any(|a| a == "--once");
-    let elf_path = args.iter().find(|a| !a.starts_with('-') && *a != &args[0]).map(|s| s.as_str());
+    let min_events: u64 = args.windows(2)
+        .find(|w| w[0] == "--min-events")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(1);
+    let elf_path = args.iter().find(|a| !a.starts_with('-') && *a != &args[0] && !a.parse::<u64>().is_ok()).map(|s| s.as_str());
 
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
         eprintln!("memvis-dump: parsing DWARF from {}", path);
@@ -364,7 +399,7 @@ fn main() {
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
                 eprintln!("memvis-dump: attached, {} thread ring(s)", orch.ring_count());
-                run(orch, dwarf_info, once);
+                run(orch, dwarf_info, once, min_events);
                 return;
             }
         }

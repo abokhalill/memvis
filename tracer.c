@@ -29,6 +29,11 @@ static _Atomic uint64_t g_stat_reg_snaps    = 0;
 
 static _Atomic uint16_t g_next_thread_id    = 0;
 
+// main executable runtime base, captured at module load
+static uint64_t g_module_base = 0;
+static bool     g_module_base_set = false;
+static _Atomic int g_module_load_emitted = 0;
+
 #define TLS_SLOT_GUARD     0
 #define TLS_SLOT_THREAD_ID 1
 #define TLS_SLOT_SEQ       2
@@ -98,6 +103,29 @@ static inline memvis_ring_header_t *tls_ring(void *drcontext) {
     return (memvis_ring_header_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING]);
 }
 
+static inline void maybe_emit_module_load(void *drcontext, memvis_ring_header_t *ring) {
+    if (!g_module_base_set) return;
+    int expected = 0;
+    if (!atomic_compare_exchange_strong_explicit(&g_module_load_emitted, &expected, 1,
+                                                  memory_order_acq_rel, memory_order_relaxed))
+        return;
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    memvis_push_ex(ring, g_module_base, 0, 0, MEMVIS_EVENT_MODULE_LOAD, tid, seq);
+    dr_printf("memvis: emitted MODULE_LOAD base=0x%llx (tid=%u seq=%u)\n",
+              (unsigned long long)g_module_base, (unsigned)tid, (unsigned)seq);
+}
+
+static inline uint64_t safe_read_value(uint64_t addr, uint32_t size) {
+    uint64_t val = 0;
+    if (size <= 8) {
+        DR_TRY_EXCEPT(dr_get_current_drcontext(), {
+            memcpy(&val, (void *)(uintptr_t)addr, size);
+        }, { /* fault: leave val=0 */ });
+    }
+    return val;
+}
+
 static void
 at_mem_write(uint64_t addr, uint32_t size)
 {
@@ -110,7 +138,8 @@ at_mem_write(uint64_t addr, uint32_t size)
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
     uint16_t tid = tls_thread_id(drcontext);
     uint16_t seq = tls_next_seq(drcontext);
-    int rc = memvis_push_sampled(ring, addr, size, 0,
+    uint64_t val = safe_read_value(addr, size);
+    int rc = memvis_push_sampled(ring, addr, size, val,
                                   MEMVIS_EVENT_WRITE, tid, seq);
     if (rc == 0) {
         atomic_fetch_add_explicit(&g_stat_writes, 1, memory_order_relaxed);
@@ -156,6 +185,7 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
 
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
+    maybe_emit_module_load(drcontext, ring);
     uint16_t tid = tls_thread_id(drcontext);
     uint16_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, callee_pc, 0, frame_base, MEMVIS_EVENT_CALL, tid, seq);
@@ -295,6 +325,29 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
 }
 
 static void
+event_module_load(void *drcontext, const module_data_t *info, bool loaded)
+{
+    (void)drcontext; (void)loaded;
+    // capture the main executable's runtime load base (first non-vdso module)
+    if (!g_module_base_set && info->full_path[0] != '\0') {
+        const char *name = dr_module_preferred_name(info);
+        // skip system modules: vdso, ld-linux, libc, libpthread, DR itself
+        if (name && strstr(name, "vdso") == NULL &&
+            strstr(name, "ld-linux") == NULL &&
+            strstr(name, "libc") == NULL &&
+            strstr(name, "libpthread") == NULL &&
+            strstr(name, "libmemvis") == NULL &&
+            strstr(name, "libdynamorio") == NULL &&
+            strstr(name, "libdr") == NULL) {
+            g_module_base = (uint64_t)(uintptr_t)info->start;
+            g_module_base_set = true;
+            dr_printf("memvis: main module '%s' base=0x%llx\n",
+                      name, (unsigned long long)g_module_base);
+        }
+    }
+}
+
+static void
 event_thread_init(void *drcontext)
 {
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
@@ -322,10 +375,14 @@ event_thread_exit(void *drcontext)
     if (ctl_idx >= 0 && g_ctl)
         memvis_ctl_mark_dead(g_ctl, (uint32_t)ctl_idx);
 
+    uint16_t tid = tls_thread_id(drcontext);
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (ring) {
         size_t sz = memvis_shm_size(ring->capacity);
         munmap(ring, sz);
+        char name[MEMVIS_RING_NAME_LEN];
+        dr_snprintf(name, sizeof(name), "/memvis_ring_%u", (unsigned)tid);
+        shm_unlink(name);
     }
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], NULL);
 }
@@ -371,6 +428,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     map_ctl_ring();
 
+    drmgr_register_module_load_event(event_module_load);
     drmgr_register_exit_event(event_exit);
     drmgr_register_thread_init_event(event_thread_init);
     drmgr_register_thread_exit_event(event_thread_exit);

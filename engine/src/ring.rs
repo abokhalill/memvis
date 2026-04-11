@@ -178,11 +178,12 @@ pub struct RingOrchestrator {
     ctl: Option<MappedShm>,
     pub rings: Vec<ThreadRing>,
     known_count: u32,
+    rr_idx: usize, // round-robin index for merge_pop
 }
 
 impl RingOrchestrator {
     pub fn new() -> Self {
-        Self { ctl: None, rings: Vec::new(), known_count: 0 }
+        Self { ctl: None, rings: Vec::new(), known_count: 0, rr_idx: 0 }
     }
 
     pub fn try_attach_ctl(&mut self) -> bool {
@@ -265,24 +266,17 @@ impl RingOrchestrator {
     pub fn ring_count(&self) -> usize { self.rings.len() }
     pub fn active_count(&self) -> usize { self.rings.iter().filter(|r| r.alive).count() }
 
-    // N-way merge: consume lowest (thread_id, seq) across all rings
-    pub fn merge_pop(&self) -> Option<(usize, Event)> {
-        let mut best_idx: Option<usize> = None;
-        let mut best_key: (u16, u16) = (u16::MAX, u16::MAX);
-
-        for (i, ring) in self.rings.iter().enumerate() {
-            if let Some(ev) = ring.peek() {
-                let key = (ev.thread_id, ev.seq);
-                if best_idx.is_none() || key < best_key {
-                    best_idx = Some(i);
-                    best_key = key;
-                }
+    // round-robin drain across all rings. each ring is FIFO per-thread.
+    pub fn merge_pop(&mut self) -> Option<(usize, Event)> {
+        let n = self.rings.len();
+        if n == 0 { return None; }
+        for _ in 0..n {
+            let i = self.rr_idx % n;
+            self.rr_idx = (self.rr_idx + 1) % n;
+            if let Some(ev) = self.rings[i].pop() {
+                return Some((i, ev));
             }
         }
-
-        match best_idx {
-            Some(i) => self.rings[i].pop().map(|ev| (i, ev)),
-            None => None,
-        }
+        None
     }
 }
