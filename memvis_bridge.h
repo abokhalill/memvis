@@ -18,6 +18,7 @@
 
 #define MEMVIS_CACHE_LINE    64
 #define MEMVIS_MAGIC         0x4D454D56495342ULL  /* "MEMVISB\0" */
+#define MEMVIS_PROTO_VERSION 2
 #define MEMVIS_SHM_NAME      "/memvis_ring"
 #define MEMVIS_SHM_ENV       "MEMVIS_SHM_PATH"
 
@@ -57,12 +58,24 @@
 
 typedef struct __attribute__((packed, aligned(32))) {
     uint64_t addr;
-    uint64_t size;
+    uint32_t size;
+    uint16_t thread_id;
+    uint16_t seq;
     uint64_t value;
-    uint64_t kind;
+    uint64_t kind_flags;  /* kind:8 | flags:8 | reserved:48 */
 } memvis_event_t;
 
 _Static_assert(sizeof(memvis_event_t) == 32, "event must be 32 bytes");
+
+static inline uint8_t memvis_event_kind(const memvis_event_t *e) {
+    return (uint8_t)(e->kind_flags & 0xFF);
+}
+static inline uint8_t memvis_event_flags(const memvis_event_t *e) {
+    return (uint8_t)((e->kind_flags >> 8) & 0xFF);
+}
+static inline uint64_t memvis_make_kind_flags(uint8_t kind, uint8_t flags) {
+    return (uint64_t)kind | ((uint64_t)flags << 8);
+}
 
 #define MEMVIS_FLAG_DROP_ON_FULL  0x0
 #define MEMVIS_FLAG_SPIN_ON_FULL  0x1
@@ -93,8 +106,9 @@ static inline size_t memvis_shm_size(uint32_t capacity) {
 }
 
 static inline int memvis_push_ex(memvis_ring_header_t *ring,
-                                  uint64_t addr, uint64_t size,
-                                  uint64_t value, uint64_t kind)
+                                  uint64_t addr, uint32_t size,
+                                  uint64_t value, uint8_t kind,
+                                  uint16_t thread_id, uint16_t seq)
 {
     const uint32_t mask = ring->capacity - 1;
     memvis_event_t *data = memvis_ring_data(ring);
@@ -109,24 +123,28 @@ static inline int memvis_push_ex(memvis_ring_header_t *ring,
     }
 
     uint64_t idx = h & mask;
-    data[idx].addr  = addr;
-    data[idx].size  = size;
-    data[idx].value = value;
-    data[idx].kind  = kind;
+    data[idx].addr       = addr;
+    data[idx].size       = size;
+    data[idx].thread_id  = thread_id;
+    data[idx].seq        = seq;
+    data[idx].value      = value;
+    data[idx].kind_flags = memvis_make_kind_flags(kind, 0);
 
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
     return 0;
 }
 
 static inline int memvis_push(memvis_ring_header_t *ring,
-                               uint64_t addr, uint64_t size, uint64_t value)
+                               uint64_t addr, uint32_t size, uint64_t value,
+                               uint16_t thread_id, uint16_t seq)
 {
-    return memvis_push_ex(ring, addr, size, value, MEMVIS_EVENT_WRITE);
+    return memvis_push_ex(ring, addr, size, value, MEMVIS_EVENT_WRITE, thread_id, seq);
 }
 
 static inline int memvis_push_reg_snapshot(memvis_ring_header_t *ring,
                                             uint64_t insn_counter,
-                                            const uint64_t regs[MEMVIS_REG_COUNT])
+                                            const uint64_t regs[MEMVIS_REG_COUNT],
+                                            uint16_t thread_id, uint16_t seq)
 {
     const uint32_t mask = ring->capacity - 1;
     memvis_event_t *data = memvis_ring_data(ring);
@@ -137,10 +155,13 @@ static inline int memvis_push_reg_snapshot(memvis_ring_header_t *ring,
         return -1;
 
     uint64_t idx = h & mask;
-    data[idx] = (memvis_event_t){ insn_counter, 0, 0, MEMVIS_EVENT_REG_SNAPSHOT };
+    data[idx] = (memvis_event_t){ insn_counter, 0, thread_id, seq, 0,
+                                   memvis_make_kind_flags(MEMVIS_EVENT_REG_SNAPSHOT, 0) };
     for (int s = 0; s < 6; s++) {
         idx = (h + 1 + s) & mask;
-        data[idx] = (memvis_event_t){ regs[s*3], regs[s*3+1], regs[s*3+2], MEMVIS_EVENT_REG_SNAPSHOT };
+        data[idx] = (memvis_event_t){ regs[s*3], (uint32_t)regs[s*3+1], thread_id, 0,
+                                       regs[s*3+2],
+                                       memvis_make_kind_flags(MEMVIS_EVENT_REG_SNAPSHOT, 0) };
     }
 
     atomic_store_explicit(&ring->head, h + MEMVIS_REG_SNAPSHOT_SLOTS, memory_order_release);
@@ -149,10 +170,12 @@ static inline int memvis_push_reg_snapshot(memvis_ring_header_t *ring,
 
 static inline int memvis_push_cache_miss(memvis_ring_header_t *ring,
                                           uint64_t miss_addr,
-                                          uint64_t cache_level,
-                                          uint64_t sample_ip)
+                                          uint32_t cache_level,
+                                          uint64_t sample_ip,
+                                          uint16_t thread_id, uint16_t seq)
 {
-    return memvis_push_ex(ring, miss_addr, cache_level, sample_ip, MEMVIS_EVENT_CACHE_MISS);
+    return memvis_push_ex(ring, miss_addr, cache_level, sample_ip,
+                          MEMVIS_EVENT_CACHE_MISS, thread_id, seq);
 }
 
 static inline int memvis_pop(memvis_ring_header_t *ring,
@@ -188,19 +211,86 @@ static inline uint32_t memvis_ring_fill_eighths(memvis_ring_header_t *ring)
 }
 
 static inline int memvis_push_sampled(memvis_ring_header_t *ring,
-                                       uint64_t addr, uint64_t size,
-                                       uint64_t value, uint64_t kind)
+                                       uint64_t addr, uint32_t size,
+                                       uint64_t value, uint8_t kind,
+                                       uint16_t thread_id, uint16_t seq)
 {
     if (kind == MEMVIS_EVENT_READ &&
         atomic_load_explicit(&ring->backpressure, memory_order_relaxed))
         return 1;
-    return memvis_push_ex(ring, addr, size, value, kind);
+    return memvis_push_ex(ring, addr, size, value, kind, thread_id, seq);
 }
 
 static inline void memvis_push_overflow(memvis_ring_header_t *ring,
-                                         uint64_t insn_counter)
+                                         uint64_t insn_counter,
+                                         uint16_t thread_id, uint16_t seq)
 {
-    memvis_push_ex(ring, insn_counter, 0, 0, MEMVIS_EVENT_OVERFLOW);
+    memvis_push_ex(ring, insn_counter, 0, 0, MEMVIS_EVENT_OVERFLOW, thread_id, seq);
+}
+
+/* Control ring: thread ring discovery protocol  */
+
+#define MEMVIS_CTL_SHM_NAME     "/memvis_ctl"
+#define MEMVIS_CTL_MAGIC        0x4D56435430303032ULL  /* "MVCTL002" */
+#define MEMVIS_MAX_THREADS      256
+#define MEMVIS_RING_NAME_LEN    48
+
+#define MEMVIS_THREAD_RING_CAPACITY  (1u << 17)  
+
+#define MEMVIS_THREAD_STATE_EMPTY    0
+#define MEMVIS_THREAD_STATE_ACTIVE   1
+#define MEMVIS_THREAD_STATE_DEAD     2
+
+typedef struct {
+    _Atomic uint32_t state;
+    uint16_t thread_id;
+    uint16_t _reserved;
+    char     shm_name[MEMVIS_RING_NAME_LEN];
+} memvis_thread_entry_t;
+
+_Static_assert(sizeof(memvis_thread_entry_t) == 56, "thread entry sizing");
+
+typedef struct {
+    uint64_t magic;
+    uint32_t proto_version;
+    _Atomic uint32_t thread_count;
+    uint32_t max_threads;
+    uint32_t _pad0;
+    memvis_thread_entry_t threads[MEMVIS_MAX_THREADS];
+} memvis_ctl_header_t;
+
+static inline size_t memvis_ctl_shm_size(void) {
+    return sizeof(memvis_ctl_header_t);
+}
+
+static inline void memvis_ctl_init(memvis_ctl_header_t *ctl) {
+    memset(ctl, 0, sizeof(memvis_ctl_header_t));
+    ctl->magic = MEMVIS_CTL_MAGIC;
+    ctl->proto_version = MEMVIS_PROTO_VERSION;
+    ctl->max_threads = MEMVIS_MAX_THREADS;
+    atomic_store_explicit(&ctl->thread_count, 0, memory_order_relaxed);
+}
+
+static inline int memvis_ctl_register_thread(memvis_ctl_header_t *ctl,
+                                               uint16_t thread_id,
+                                               const char *ring_shm_name)
+{
+    uint32_t idx = atomic_fetch_add_explicit(&ctl->thread_count, 1, memory_order_acq_rel);
+    if (idx >= ctl->max_threads) {
+        atomic_fetch_sub_explicit(&ctl->thread_count, 1, memory_order_relaxed);
+        return -1;
+    }
+    memvis_thread_entry_t *entry = &ctl->threads[idx];
+    entry->thread_id = thread_id;
+    strncpy(entry->shm_name, ring_shm_name, MEMVIS_RING_NAME_LEN - 1);
+    entry->shm_name[MEMVIS_RING_NAME_LEN - 1] = '\0';
+    atomic_store_explicit(&entry->state, MEMVIS_THREAD_STATE_ACTIVE, memory_order_release);
+    return (int)idx;
+}
+
+static inline void memvis_ctl_mark_dead(memvis_ctl_header_t *ctl, uint32_t idx) {
+    if (idx < ctl->max_threads)
+        atomic_store_explicit(&ctl->threads[idx].state, MEMVIS_THREAD_STATE_DEAD, memory_order_release);
 }
 
 #endif /* MEMVIS_BRIDGE_H */
