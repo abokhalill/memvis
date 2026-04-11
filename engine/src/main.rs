@@ -67,7 +67,12 @@ fn render(
     let _ = writeln!(out, "{}MEMORY MAP{}", BOLD, RST);
 
     let mut sorted: Vec<_> = world.nodes.iter().filter(|(_, n)| n.size > 0).collect();
-    sorted.sort_by_key(|(_, n)| n.addr);
+    sorted.sort_by_key(|(_, n)| (n.addr, std::cmp::Reverse(n.last_write_insn)));
+    // dedup: for locals at the same addr, keep only the most recently written
+    sorted.dedup_by(|a, b| {
+        matches!(a.0, NodeId::Local(..)) && matches!(b.0, NodeId::Local(..))
+            && a.1.addr == b.1.addr && a.1.name == b.1.name
+    });
 
     let mut last_cl: u64 = u64::MAX;
 
@@ -133,8 +138,11 @@ fn render(
 
     if !world.edges.is_empty() {
         let _ = writeln!(out, "{}POINTER EDGES{}", BOLD, RST);
+        let mut seen_edges: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();
         for (src, edge) in &world.edges {
-            let src_name = world.nodes.get(src).map(|n| n.name.as_str()).unwrap_or("?");
+            let src_name = world.nodes.get(src).map(|n| n.name.clone()).unwrap_or_default();
+            let key = (src_name.clone(), edge.ptr_value);
+            if !seen_edges.insert(key) { continue; }
             let tgt_name = world.nodes.get(&edge.target).map(|n| n.name.as_str()).unwrap_or("?");
             let dng = if edge.is_dangling { format!(" {}DANGLING{}", BGRED, RST) } else { String::new() };
             let _ = writeln!(out,
@@ -201,6 +209,7 @@ fn process_event(
     stacks: &mut Vec<ShadowStack>,
     next_frame_id: &mut FrameId,
     relocation_delta: &mut Option<u64>,
+    returned_frames: &mut VecDeque<FrameId>,
 ) {
     let ev_kind = ev.kind();
     match ev_kind {
@@ -249,7 +258,13 @@ fn process_event(
             if ring_idx < stacks.len() {
                 if let Some(frame) = stacks[ring_idx].pop_return() {
                     addr_index.remove_frame(frame.frame_id);
-                    world.remove_frame_nodes(frame.frame_id);
+                    returned_frames.push_back(frame.frame_id);
+                    // evict oldest retained frames to bound memory
+                    while returned_frames.len() > 32 {
+                        if let Some(old_fid) = returned_frames.pop_front() {
+                            world.remove_frame_nodes(old_fid);
+                        }
+                    }
                 }
             }
         }
@@ -322,6 +337,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let mut total: u64 = 0;
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
     let mut relocation_delta: Option<u64> = None;
+    let mut returned_frames: VecDeque<FrameId> = VecDeque::with_capacity(64);
 
     if let Some(ref info) = dwarf_info {
         populate_globals(info, 0, &mut addr_index, &mut world);
@@ -359,7 +375,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                     process_event(
                         &ev, ri, &orch, &mut world, &mut addr_index,
                         &dwarf_info, &mut stacks, &mut next_frame_id,
-                        &mut relocation_delta,
+                        &mut relocation_delta, &mut returned_frames,
                     );
                 }
                 None => break,
