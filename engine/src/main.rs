@@ -300,36 +300,28 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool) {
             last_discovery = now_disc;
         }
 
-        // drain all rings round-robin, bounded per cycle
+        // deterministic N-way merge: always consume lowest (thread_id, seq)
         let mut drained = 0u64;
-        let ring_count = orch.rings.len();
-        if ring_count > 0 {
-            let budget_per_ring = 10_000u64 / ring_count.max(1) as u64;
-            for ri in 0..ring_count {
-                let mut ring_drained = 0u64;
-                while ring_drained < budget_per_ring.max(100) {
-                    match orch.rings[ri].pop() {
-                        Some(ev) => {
-                            total += 1;
-                            drained += 1;
-                            ring_drained += 1;
-                            world.inc_insn_counter();
+        while drained < 10_000 {
+            match orch.merge_pop() {
+                Some((ri, ev)) => {
+                    total += 1;
+                    drained += 1;
+                    world.inc_insn_counter();
 
-                            let ev_kind = ev.kind();
-                            journal.push_back(JournalEntry {
-                                seq: total, kind: ev_kind, thread_id: ev.thread_id,
-                                addr: ev.addr, size: ev.size, value: ev.value,
-                            });
-                            if journal.len() > 1000 { journal.pop_front(); }
+                    let ev_kind = ev.kind();
+                    journal.push_back(JournalEntry {
+                        seq: total, kind: ev_kind, thread_id: ev.thread_id,
+                        addr: ev.addr, size: ev.size, value: ev.value,
+                    });
+                    if journal.len() > 1000 { journal.pop_front(); }
 
-                            process_event(
-                                &ev, ri, &orch, &mut world, &mut addr_index,
-                                &dwarf_info, &mut stacks, &mut next_frame_id,
-                            );
-                        }
-                        None => break,
-                    }
+                    process_event(
+                        &ev, ri, &orch, &mut world, &mut addr_index,
+                        &dwarf_info, &mut stacks, &mut next_frame_id,
+                    );
                 }
+                None => break,
             }
         }
 

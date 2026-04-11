@@ -126,6 +126,17 @@ impl ThreadRing {
     }
 
     #[inline(always)]
+    pub fn peek(&self) -> Option<Event> {
+        let hdr = self.header();
+        let mask = (hdr.capacity - 1) as u64;
+        let data = unsafe { hdr.data() };
+        let t = hdr.tail.load(Ordering::Relaxed);
+        let h = hdr.head.load(Ordering::Acquire);
+        if t == h { return None; }
+        Some(unsafe { ptr::read_volatile(data.add((t & mask) as usize)) })
+    }
+
+    #[inline(always)]
     pub fn pop(&self) -> Option<Event> {
         let hdr = self.header();
         let mask = (hdr.capacity - 1) as u64;
@@ -253,4 +264,26 @@ impl RingOrchestrator {
 
     pub fn ring_count(&self) -> usize { self.rings.len() }
     pub fn active_count(&self) -> usize { self.rings.iter().filter(|r| r.alive).count() }
+
+    /// N-way deterministic merge: peek all ring heads, consume the one with
+    /// lowest (thread_id, seq). Returns (ring_index, event) or None if all empty.
+    pub fn merge_pop(&self) -> Option<(usize, Event)> {
+        let mut best_idx: Option<usize> = None;
+        let mut best_key: (u16, u16) = (u16::MAX, u16::MAX);
+
+        for (i, ring) in self.rings.iter().enumerate() {
+            if let Some(ev) = ring.peek() {
+                let key = (ev.thread_id, ev.seq);
+                if best_idx.is_none() || key < best_key {
+                    best_idx = Some(i);
+                    best_key = key;
+                }
+            }
+        }
+
+        match best_idx {
+            Some(i) => self.rings[i].pop().map(|ev| (i, ev)),
+            None => None,
+        }
+    }
 }
