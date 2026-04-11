@@ -1,6 +1,4 @@
 // SPDX-License-Identifier: MIT
-// memvis-dump: terminal memory visualizer. multi-ring consumer.
-// usage: memvis-dump [--once] <elf_path>
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
@@ -75,17 +73,14 @@ fn render(
     for (nid, node) in &sorted {
         let cl = node.addr / 64;
 
-        // cache line boundary
         if cl != last_cl {
             let _ = writeln!(out, "  {}── cacheline 0x{:x} ──{}", DIM, cl * 64, RST);
             last_cl = cl;
         }
 
-        // cache line crossing alert
         let crosses_cl = (node.addr % 64) + node.size > 64;
         let alert = if crosses_cl { format!("{}!CL{}", RED, RST) } else { "    ".into() };
 
-        // pointer resolution
         let ptr_info = if node.type_info.is_pointer && node.raw_value != 0 {
             let target = world.nodes.values()
                 .find(|t| node.raw_value >= t.addr && node.raw_value < t.addr + t.size.max(1));
@@ -95,7 +90,6 @@ fn render(
             }
         } else { String::new() };
 
-        // miss count
         let miss_str = world.cache_heat.per_node.get(nid)
             .map(|e| format!(" {}[{} misses]{}", RED, e.count, RST))
             .unwrap_or_default();
@@ -110,7 +104,6 @@ fn render(
             alert, ptr_info, miss_str,
         );
 
-        // struct fields
         for f in &node.type_info.fields {
             if f.byte_size == 0 { continue; }
             let fa = node.addr + f.byte_offset;
@@ -143,7 +136,6 @@ fn render(
         let _ = writeln!(out);
     }
 
-    // ── registers ───────────────────────────────────────────────────
     let reg_file = &world.reg_file;
     let _ = writeln!(out, "{}REGISTERS{} (insn {})", BOLD, RST, reg_file.insn);
     let _ = write!(out, "  ");
@@ -219,7 +211,6 @@ fn process_event(
                 if let Some(func) = info.functions.get(&ev.addr) {
                     let fid = *next_frame_id;
                     *next_frame_id += 1;
-                    // per-thread stack
                     while stacks.len() <= ring_idx {
                         stacks.push(Vec::with_capacity(64));
                     }
@@ -293,14 +284,12 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool) {
     let mut last_discovery = time::Instant::now();
 
     loop {
-        // discover new thread rings periodically
         let now_disc = time::Instant::now();
         if now_disc.duration_since(last_discovery) >= time::Duration::from_millis(200) {
             orch.poll_new_rings();
             last_discovery = now_disc;
         }
 
-        // deterministic N-way merge: always consume lowest (thread_id, seq)
         let mut drained = 0u64;
         while drained < 10_000 {
             match orch.merge_pop() {

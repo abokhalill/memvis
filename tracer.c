@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-// tracer.c: dynamorio client. spsc producer.
-// instruments W/R/CALL/RET and incorporates adaptive backpressure.
+// dynamorio client. per-thread spsc producer.
 
 #include "dr_api.h"
 #include "drmgr.h"
@@ -160,7 +159,6 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
     atomic_fetch_add_explicit(&g_stat_calls, 1, memory_order_relaxed);
     uint64_t ic = atomic_fetch_add_explicit(&g_insn_counter, 8, memory_order_relaxed);
 
-    // reg snapshot on every call
     dr_mcontext_t mc;
     mc.size = sizeof(mc);
     mc.flags = DR_MC_INTEGER | DR_MC_CONTROL;

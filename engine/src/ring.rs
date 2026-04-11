@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: MIT
-// multi-ring orchestrator. discovers per-thread rings via control shm.
-// polls N SPSC rings concurrently. merges into global timeline.
+// multi-ring orchestrator. control shm discovery, N-way merge.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{mem, ptr};
@@ -265,8 +264,7 @@ impl RingOrchestrator {
     pub fn ring_count(&self) -> usize { self.rings.len() }
     pub fn active_count(&self) -> usize { self.rings.iter().filter(|r| r.alive).count() }
 
-    /// N-way deterministic merge: peek all ring heads, consume the one with
-    /// lowest (thread_id, seq). Returns (ring_index, event) or None if all empty.
+    // N-way merge: consume lowest (thread_id, seq) across all rings
     pub fn merge_pop(&self) -> Option<(usize, Event)> {
         let mut best_idx: Option<usize> = None;
         let mut best_key: (u16, u16) = (u16::MAX, u16::MAX);
