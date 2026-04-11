@@ -87,27 +87,26 @@ pub struct WorldInner {
     pub nodes: BTreeMap<NodeId, Node>,
     pub edges: BTreeMap<NodeId, PointerEdge>,
     pub insn_counter: u64,
+    pub reg_file: LiveRegisterFile,
+    pub cache_heat: CacheHeatmap,
 }
 
 impl WorldInner {
     pub fn new() -> Self {
-        Self { nodes: BTreeMap::new(), edges: BTreeMap::new(), insn_counter: 0 }
+        Self {
+            nodes: BTreeMap::new(), edges: BTreeMap::new(), insn_counter: 0,
+            reg_file: LiveRegisterFile::new(), cache_heat: CacheHeatmap::new(),
+        }
     }
 }
 
 pub struct WorldState {
     inner: Arc<WorldInner>,
-    pub reg_file: LiveRegisterFile,
-    pub cache_heat: CacheHeatmap,
 }
 
 impl WorldState {
     pub fn new() -> Self {
-        Self {
-            inner: Arc::new(WorldInner::new()),
-            reg_file: LiveRegisterFile::new(),
-            cache_heat: CacheHeatmap::new(),
-        }
+        Self { inner: Arc::new(WorldInner::new()) }
     }
 
     pub fn snapshot(&self) -> Arc<WorldInner> { Arc::clone(&self.inner) }
@@ -168,6 +167,18 @@ impl WorldState {
                 });
             }
         }
+    }
+
+    pub fn update_regs(&mut self, regs: [u64; REG_COUNT], insn: u64) {
+        self.cow().reg_file.update(regs, insn);
+    }
+
+    pub fn record_cache_miss(&mut self, nid: NodeId) {
+        self.cow().cache_heat.record_miss(nid);
+    }
+
+    pub fn cache_heat_tick(&mut self) {
+        self.cow().cache_heat.tick();
     }
 
     pub fn node_count(&self) -> usize { self.inner.nodes.len() }
