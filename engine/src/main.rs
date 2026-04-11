@@ -1,105 +1,21 @@
 // SPDX-License-Identifier: MIT
-// memvis-dump: terminal memory visualizer. reads spsc ring from shm.
+// memvis-dump: terminal memory visualizer. multi-ring consumer.
 // usage: memvis-dump [--once] <elf_path>
 
 use std::collections::VecDeque;
 use std::io::{self, Write};
-use std::sync::atomic::{AtomicU64, AtomicU32, Ordering};
-use std::{env, mem, ptr, thread, time};
+use std::{env, thread, time};
 
 use memvis::dwarf::{self, DwarfInfo};
 use memvis::index::{AddressIndex, FrameId, NodeId};
-use memvis::world::{WorldState, WorldInner, REG_NAMES, REG_COUNT, LiveRegisterFile, CacheHeatmap};
+use memvis::ring::{Event, RingOrchestrator};
+use memvis::world::{WorldState, WorldInner, REG_NAMES, REG_COUNT};
 
-const MEMVIS_MAGIC: u64 = 0x4D454D56495342;
-const SHM_NAME: &[u8] = b"/memvis_ring\0";
-const CACHE_LINE: usize = 64;
-
-const EVENT_WRITE: u64    = 0;
-const EVENT_CALL: u64     = 2;
-const EVENT_RETURN: u64   = 3;
-const EVENT_REG_SNAPSHOT: u64 = 5;
-const EVENT_CACHE_MISS: u64   = 6;
-
-#[derive(Clone, Copy)]
-#[repr(C, align(32))]
-struct Event { addr: u64, size: u64, value: u64, kind: u64 }
-const _: () = assert!(mem::size_of::<Event>() == 32);
-
-#[repr(C)]
-struct RingHeader {
-    magic: u64, capacity: u32, entry_size: u32, flags: u64,
-    backpressure: AtomicU32,
-    _pad0: [u8; CACHE_LINE - 24 - mem::size_of::<AtomicU32>()],
-    head: AtomicU64,
-    _pad1: [u8; CACHE_LINE - mem::size_of::<AtomicU64>()],
-    tail: AtomicU64,
-    _pad2: [u8; CACHE_LINE - mem::size_of::<AtomicU64>()],
-}
-const _: () = assert!(mem::size_of::<RingHeader>() == 3 * CACHE_LINE);
-
-impl RingHeader {
-    unsafe fn data(&self) -> *const Event {
-        (self as *const Self as *const u8).add(mem::size_of::<Self>()) as *const Event
-    }
-}
-
-struct MappedRing { ptr: *mut u8, len: usize }
-unsafe impl Send for MappedRing {}
-unsafe impl Sync for MappedRing {}
-
-impl MappedRing {
-    fn open() -> Option<Self> {
-        unsafe {
-            let fd = libc::shm_open(SHM_NAME.as_ptr() as *const libc::c_char, libc::O_RDWR, 0o600);
-            if fd < 0 { return None; }
-            let mut st: libc::stat = mem::zeroed();
-            if libc::fstat(fd, &mut st) != 0 { libc::close(fd); return None; }
-            let len = st.st_size as usize;
-            let p = libc::mmap(ptr::null_mut(), len, libc::PROT_READ | libc::PROT_WRITE, libc::MAP_SHARED, fd, 0);
-            libc::close(fd);
-            if p == libc::MAP_FAILED { return None; }
-            Some(Self { ptr: p as *mut u8, len })
-        }
-    }
-    fn header(&self) -> &RingHeader { unsafe { &*(self.ptr as *const RingHeader) } }
-}
-impl Drop for MappedRing {
-    fn drop(&mut self) { unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len); } }
-}
-
-#[inline(always)]
-unsafe fn pop(hdr: &RingHeader) -> Option<Event> {
-    let mask = (hdr.capacity - 1) as u64;
-    let data = hdr.data();
-    let t = hdr.tail.load(Ordering::Relaxed);
-    let h = hdr.head.load(Ordering::Acquire);
-    if t == h { return None; }
-    let idx = (t & mask) as usize;
-    let ev = ptr::read_volatile(data.add(idx));
-    hdr.tail.store(t + 1, Ordering::Release);
-    Some(ev)
-}
-
-#[inline]
-unsafe fn pop_n(hdr: &RingHeader, n: u64, out: &mut [Event]) -> bool {
-    let mask = (hdr.capacity - 1) as u64;
-    let data = hdr.data();
-    let t = hdr.tail.load(Ordering::Relaxed);
-    let h = hdr.head.load(Ordering::Acquire);
-    if h - t < n { return false; }
-    for i in 0..n { out[i as usize] = ptr::read_volatile(data.add(((t + i) & mask) as usize)); }
-    hdr.tail.store(t + n, Ordering::Release);
-    true
-}
-
-fn ring_fill(hdr: &RingHeader) -> (u64, u32) {
-    let h = hdr.head.load(Ordering::Relaxed);
-    let t = hdr.tail.load(Ordering::Relaxed);
-    let used = h.wrapping_sub(t);
-    let pct = ((used * 100) / hdr.capacity as u64) as u32;
-    (used, pct)
-}
+const EVENT_WRITE: u8    = 0;
+const EVENT_CALL: u8     = 2;
+const EVENT_RETURN: u8   = 3;
+const EVENT_REG_SNAPSHOT: u8 = 5;
+const EVENT_CACHE_MISS: u8   = 6;
 
 const RST: &str = "\x1b[0m";
 const BOLD: &str = "\x1b[1m";
@@ -125,29 +41,28 @@ fn type_color(t: &str) -> &'static str {
 }
 
 #[derive(Clone)]
-struct JournalEntry { seq: u64, kind: u64, addr: u64, size: u64, value: u64 }
+struct JournalEntry { seq: u64, kind: u8, thread_id: u16, addr: u64, size: u32, value: u64 }
 
 fn render(
     out: &mut impl Write,
     world: &WorldInner,
-    reg_file: &LiveRegisterFile,
-    cache_heat: &CacheHeatmap,
     journal: &VecDeque<JournalEntry>,
     total: u64,
-    hdr: &RingHeader,
+    orch: &RingOrchestrator,
 ) {
     let _ = write!(out, "{}", CLEAR_SCREEN);
 
-    let (used, pct) = ring_fill(hdr);
+    let (used, pct) = orch.total_fill();
     let ring_color = if pct > 85 { RED } else if pct > 50 { YLW } else { GRN };
     let _ = writeln!(out,
-        "{}MEMVIS{} │ insn {}{}{} │ events {}{}{} │ nodes {}{}{} │ edges {}{}{} │ ring {}{}%{} ({}/{})",
+        "{}MEMVIS{} │ insn {}{}{} │ events {}{}{} │ nodes {}{}{} │ edges {}{}{} │ rings {}{}{} │ fill {}{}%{} ({})",
         DIM, RST,
         WHT, world.insn_counter, RST,
         WHT, total, RST,
         CYN, world.nodes.len(), RST,
         MAG, world.edges.len(), RST,
-        ring_color, pct, RST, used, hdr.capacity,
+        CYN, orch.ring_count(), RST,
+        ring_color, pct, RST, used,
     );
     let _ = writeln!(out, "{}{}{}", DIM, "─".repeat(100), RST);
     let _ = writeln!(out, "{}MEMORY MAP{}", BOLD, RST);
@@ -181,7 +96,7 @@ fn render(
         } else { String::new() };
 
         // miss count
-        let miss_str = cache_heat.per_node.get(nid)
+        let miss_str = world.cache_heat.per_node.get(nid)
             .map(|e| format!(" {}[{} misses]{}", RED, e.count, RST))
             .unwrap_or_default();
 
@@ -229,6 +144,7 @@ fn render(
     }
 
     // ── registers ───────────────────────────────────────────────────
+    let reg_file = &world.reg_file;
     let _ = writeln!(out, "{}REGISTERS{} (insn {})", BOLD, RST, reg_file.insn);
     let _ = write!(out, "  ");
     for (i, name) in REG_NAMES.iter().enumerate() {
@@ -267,17 +183,95 @@ fn render(
             _ => ("?   ", DIM),
         };
         let _ = writeln!(out,
-            "  {}{:>8}{} {}{}{} {:>12x}  {:>4}  {:>16x}",
-            DIM, e.seq, RST, kclr, kind_str, RST, e.addr, e.size, e.value,
+            "  {}{:>8}{} {}{}{} T{:<3} {:>12x}  {:>4}  {:>16x}",
+            DIM, e.seq, RST, kclr, kind_str, RST, e.thread_id, e.addr, e.size, e.value,
         );
     }
 }
 
-fn run(ring: MappedRing, dwarf_info: Option<DwarfInfo>, once: bool) {
-    let hdr = ring.header();
+#[inline]
+fn process_event(
+    ev: &Event,
+    ring_idx: usize,
+    orch: &RingOrchestrator,
+    world: &mut WorldState,
+    addr_index: &mut AddressIndex,
+    dwarf_info: &Option<DwarfInfo>,
+    stacks: &mut Vec<Vec<(FrameId, String)>>,
+    next_frame_id: &mut FrameId,
+) {
+    let ev_kind = ev.kind();
+    match ev_kind {
+        EVENT_WRITE => {
+            if let Some(h) = addr_index.lookup(ev.addr) {
+                let nid = h.node_id;
+                world.ensure_node(nid, h.name, h.type_info, ev.addr, ev.size as u64);
+                world.update_value(nid, ev.value, world.insn_counter());
+                if h.type_info.is_pointer && ev.size == 8 {
+                    let target = if ev.value == 0 { None }
+                        else { addr_index.lookup(ev.value).map(|t| t.node_id) };
+                    world.update_edge(nid, target, ev.value);
+                }
+            }
+        }
+        EVENT_CALL => {
+            if let Some(ref info) = dwarf_info {
+                if let Some(func) = info.functions.get(&ev.addr) {
+                    let fid = *next_frame_id;
+                    *next_frame_id += 1;
+                    // per-thread stack
+                    while stacks.len() <= ring_idx {
+                        stacks.push(Vec::with_capacity(64));
+                    }
+                    stacks[ring_idx].push((fid, func.name.clone()));
+                    for (li, l) in func.locals.iter().enumerate() {
+                        let addr = (ev.value as i64 + l.frame_offset) as u64;
+                        let nid = NodeId::Local(fid, li as u16);
+                        world.ensure_node(nid, &l.name, &l.type_info, addr, l.size);
+                    }
+                    let locals: Vec<_> = func.locals.iter().map(|l|
+                        (l.frame_offset, l.size, l.name.clone(), l.type_info.clone())
+                    ).collect();
+                    if !locals.is_empty() {
+                        addr_index.insert_frame_locals(fid, ev.value, &locals);
+                        addr_index.finalize();
+                    }
+                }
+            }
+        }
+        EVENT_RETURN => {
+            if ring_idx < stacks.len() {
+                if let Some((fid, _)) = stacks[ring_idx].pop() {
+                    addr_index.remove_frame(fid);
+                    world.remove_frame_nodes(fid);
+                }
+            }
+        }
+        EVENT_REG_SNAPSHOT => {
+            let mut cont = [Event::zero(); 6];
+            if orch.rings[ring_idx].pop_n(6, &mut cont) {
+                let mut regs = [0u64; REG_COUNT];
+                for s in 0..6usize {
+                    regs[s * 3]     = cont[s].addr;
+                    regs[s * 3 + 1] = cont[s].size as u64;
+                    regs[s * 3 + 2] = cont[s].value;
+                }
+                world.update_regs(regs, ev.addr);
+            }
+        }
+        EVENT_CACHE_MISS => {
+            if let Some(h) = addr_index.lookup(ev.addr) {
+                world.record_cache_miss(h.node_id);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
-    let mut stack: Vec<(FrameId, String)> = Vec::with_capacity(256);
+    let mut stacks: Vec<Vec<(FrameId, String)>> = Vec::new();
     let mut next_frame_id: FrameId = 1;
     let mut total: u64 = 0;
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
@@ -296,91 +290,53 @@ fn run(ring: MappedRing, dwarf_info: Option<DwarfInfo>, once: bool) {
     let refresh = time::Duration::from_millis(100);
     let mut last_render = time::Instant::now();
     let mut rendered_once = false;
+    let mut last_discovery = time::Instant::now();
 
     loop {
+        // discover new thread rings periodically
+        let now_disc = time::Instant::now();
+        if now_disc.duration_since(last_discovery) >= time::Duration::from_millis(200) {
+            orch.poll_new_rings();
+            last_discovery = now_disc;
+        }
+
+        // drain all rings round-robin, bounded per cycle
         let mut drained = 0u64;
-        loop {
-            match unsafe { pop(hdr) } {
-                Some(ev) => {
-                    total += 1;
-                    drained += 1;
-                    world.inc_insn_counter();
+        let ring_count = orch.rings.len();
+        if ring_count > 0 {
+            let budget_per_ring = 10_000u64 / ring_count.max(1) as u64;
+            for ri in 0..ring_count {
+                let mut ring_drained = 0u64;
+                while ring_drained < budget_per_ring.max(100) {
+                    match orch.rings[ri].pop() {
+                        Some(ev) => {
+                            total += 1;
+                            drained += 1;
+                            ring_drained += 1;
+                            world.inc_insn_counter();
 
-                    journal.push_back(JournalEntry {
-                        seq: total, kind: ev.kind, addr: ev.addr, size: ev.size, value: ev.value,
-                    });
-                    if journal.len() > 1000 { journal.pop_front(); }
+                            let ev_kind = ev.kind();
+                            journal.push_back(JournalEntry {
+                                seq: total, kind: ev_kind, thread_id: ev.thread_id,
+                                addr: ev.addr, size: ev.size, value: ev.value,
+                            });
+                            if journal.len() > 1000 { journal.pop_front(); }
 
-                    match ev.kind {
-                        EVENT_WRITE => {
-                            if let Some(h) = addr_index.lookup(ev.addr) {
-                                let nid = h.node_id;
-                                world.ensure_node(nid, h.name, h.type_info, ev.addr, ev.size);
-                                world.update_value(nid, ev.value, world.insn_counter());
-                                if h.type_info.is_pointer && ev.size == 8 {
-                                    let target = if ev.value == 0 { None }
-                                        else { addr_index.lookup(ev.value).map(|t| t.node_id) };
-                                    world.update_edge(nid, target, ev.value);
-                                }
-                            }
+                            process_event(
+                                &ev, ri, &orch, &mut world, &mut addr_index,
+                                &dwarf_info, &mut stacks, &mut next_frame_id,
+                            );
                         }
-                        EVENT_CALL => {
-                            if let Some(ref info) = dwarf_info {
-                                if let Some(func) = info.functions.get(&ev.addr) {
-                                    let fid = next_frame_id;
-                                    next_frame_id += 1;
-                                    stack.push((fid, func.name.clone()));
-                                    for (li, l) in func.locals.iter().enumerate() {
-                                        let addr = (ev.value as i64 + l.frame_offset) as u64;
-                                        let nid = NodeId::Local(fid, li as u16);
-                                        world.ensure_node(nid, &l.name, &l.type_info, addr, l.size);
-                                    }
-                                    let locals: Vec<_> = func.locals.iter().map(|l|
-                                        (l.frame_offset, l.size, l.name.clone(), l.type_info.clone())
-                                    ).collect();
-                                    if !locals.is_empty() {
-                                        addr_index.insert_frame_locals(fid, ev.value, &locals);
-                                        addr_index.finalize();
-                                    }
-                                }
-                            }
-                        }
-                        EVENT_RETURN => {
-                            if let Some((fid, _)) = stack.pop() {
-                                addr_index.remove_frame(fid);
-                                world.remove_frame_nodes(fid);
-                            }
-                        }
-                        EVENT_REG_SNAPSHOT => {
-                            let mut cont = [Event { addr: 0, size: 0, value: 0, kind: 0 }; 6];
-                            if unsafe { pop_n(hdr, 6, &mut cont) } {
-                                let mut regs = [0u64; REG_COUNT];
-                                for s in 0..6usize {
-                                    regs[s * 3]     = cont[s].addr;
-                                    regs[s * 3 + 1] = cont[s].size;
-                                    regs[s * 3 + 2] = cont[s].value;
-                                }
-                                world.reg_file.update(regs, ev.addr);
-                            }
-                        }
-                        EVENT_CACHE_MISS => {
-                            if let Some(h) = addr_index.lookup(ev.addr) {
-                                world.cache_heat.record_miss(h.node_id);
-                            }
-                        }
-                        _ => {}
+                        None => break,
                     }
-
-                    if drained > 10_000 { break; }
                 }
-                None => break,
             }
         }
 
         let now = time::Instant::now();
         if now.duration_since(last_render) >= refresh || (!rendered_once && total > 0) {
             let snap = world.snapshot();
-            render(&mut out, &snap, &world.reg_file, &world.cache_heat, &journal, total, hdr);
+            render(&mut out, &snap, &journal, total, &orch);
             let _ = out.flush();
             last_render = now;
             rendered_once = true;
@@ -395,7 +351,7 @@ fn run(ring: MappedRing, dwarf_info: Option<DwarfInfo>, once: bool) {
         }
 
         if total & 0xFFF == 0 {
-            world.cache_heat.tick();
+            world.cache_heat_tick();
         }
     }
 }
@@ -417,16 +373,17 @@ fn main() {
         }
     });
 
-    eprintln!("memvis-dump: waiting for shm ring...");
+    let mut orch = RingOrchestrator::new();
+    eprintln!("memvis-dump: waiting for control ring...");
     loop {
-        if let Some(ring) = MappedRing::open() {
-            let hdr = ring.header();
-            if hdr.magic == MEMVIS_MAGIC {
-                eprintln!("memvis-dump: attached, capacity={}", hdr.capacity);
-                run(ring, dwarf_info, once);
+        if orch.try_attach_ctl() {
+            orch.poll_new_rings();
+            if orch.ring_count() > 0 {
+                eprintln!("memvis-dump: attached, {} thread ring(s)", orch.ring_count());
+                run(orch, dwarf_info, once);
                 return;
             }
         }
-        thread::sleep(time::Duration::from_millis(500));
+        thread::sleep(time::Duration::from_millis(250));
     }
 }
