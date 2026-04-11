@@ -10,6 +10,7 @@ pub type FrameId = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
     Global(u32),
+    Field(u32, u16),   // (global_idx, field_idx) — struct field decomposition
     Local(FrameId, u16),
 }
 
@@ -58,6 +59,22 @@ impl AddressIndex {
         self.needs_sort = true;
     }
 
+    pub fn insert_field(
+        &mut self, addr: u64, size: u64, name: String,
+        type_info: TypeInfo, global_idx: u32, field_idx: u16,
+    ) {
+        if size == 0 { return; }
+        self.intervals.push(Interval {
+            lo: addr, hi: addr + size,
+            meta: VarMeta {
+                name, type_info,
+                node_id: NodeId::Field(global_idx, field_idx),
+                frame_id: None,
+            },
+        });
+        self.needs_sort = true;
+    }
+
     pub fn insert_frame_locals(
         &mut self, frame_id: FrameId, frame_base: u64,
         locals: &[(i64, u64, String, TypeInfo)],
@@ -101,13 +118,25 @@ impl AddressIndex {
             let iv = &self.intervals[i];
             if iv.lo > addr { break; }
             if addr < iv.hi {
-                match best {
-                    None => best = Some(iv),
-                    Some(prev) if iv.meta.frame_id.is_some() && prev.meta.frame_id.is_none() => {
-                        best = Some(iv);
+                let dominated = match best {
+                    None => true,
+                    Some(prev) => {
+                        // prefer: locals > fields > globals; narrower > wider on tie
+                        let iv_rank = match iv.meta.node_id {
+                            NodeId::Local(..) => 2,
+                            NodeId::Field(..) => 1,
+                            NodeId::Global(..) => 0,
+                        };
+                        let prev_rank = match prev.meta.node_id {
+                            NodeId::Local(..) => 2,
+                            NodeId::Field(..) => 1,
+                            NodeId::Global(..) => 0,
+                        };
+                        iv_rank > prev_rank ||
+                            (iv_rank == prev_rank && (iv.hi - iv.lo) < (prev.hi - prev.lo))
                     }
-                    _ => {}
-                }
+                };
+                if dominated { best = Some(iv); }
             }
             if i == 0 || self.intervals[i - 1].lo < iv.lo { break; }
             i -= 1;

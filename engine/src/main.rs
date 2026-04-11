@@ -72,6 +72,7 @@ fn render(
     let mut last_cl: u64 = u64::MAX;
 
     for (nid, node) in &sorted {
+        if matches!(nid, NodeId::Field(..)) { continue; }
         let cl = node.addr / 64;
 
         if cl != last_cl {
@@ -107,19 +108,24 @@ fn render(
             alert, ptr_info, miss_str,
         );
 
-        for f in &node.type_info.fields {
-            if f.byte_size == 0 { continue; }
-            let fa = node.addr + f.byte_offset;
-            let fcross = (fa % 64) + f.byte_size > 64;
-            let falert = if fcross { format!("{}!CL{}", RED, RST) } else { "    ".into() };
-            let _ = writeln!(out,
-                "    {}{:>12x}{}  {:>4}B  {}{:<20}{} {}{:<14}{}{}",
-                DIM, fa, RST,
-                f.byte_size,
-                DIM, f.name, RST,
-                type_color(&f.type_info.name), f.type_info.name, RST,
-                falert,
-            );
+        if let NodeId::Global(gi) = nid {
+            for (fi, f) in node.type_info.fields.iter().enumerate() {
+                if f.byte_size == 0 { continue; }
+                let fa = node.addr + f.byte_offset;
+                let fid = NodeId::Field(*gi, fi as u16);
+                let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
+                let fcross = (fa % 64) + f.byte_size > 64;
+                let falert = if fcross { format!("{}!CL{}", RED, RST) } else { "    ".into() };
+                let _ = writeln!(out,
+                    "    {}{:>12x}{}  {:>4}B  {}{:<20}{} {}{:<14}{}  val={}{:>18x}{}{}",
+                    DIM, fa, RST,
+                    f.byte_size,
+                    DIM, f.name, RST,
+                    type_color(&f.type_info.name), f.type_info.name, RST,
+                    WHT, fval, RST,
+                    falert,
+                );
+            }
         }
     }
 
@@ -272,26 +278,40 @@ fn process_event(
                     eprintln!("memvis: relocation delta=0x{:x} (runtime=0x{:x} elf=0x{:x})",
                               delta, runtime_base, info.elf_base_vaddr);
                     *relocation_delta = Some(delta);
-
-                    // rebuild address index and world nodes with relocated addresses
                     *addr_index = AddressIndex::new();
-                    for (i, g) in info.globals.iter().enumerate() {
-                        let relocated_addr = g.addr.wrapping_add(delta);
-                        let nid = NodeId::Global(i as u32);
-                        addr_index.insert_global(
-                            relocated_addr, g.size, g.name.clone(),
-                            g.type_info.clone(), i as u32,
-                        );
-                        // force-update: remove old node at ELF addr, insert at runtime addr
-                        world.remove_node(nid);
-                        world.ensure_node(nid, &g.name, &g.type_info, relocated_addr, g.size);
-                    }
-                    addr_index.finalize();
+                    populate_globals(info, delta, addr_index, world);
                 }
             }
         }
         _ => {}
     }
+}
+
+fn populate_globals(
+    info: &DwarfInfo, delta: u64,
+    addr_index: &mut AddressIndex, world: &mut WorldState,
+) {
+    for (i, g) in info.globals.iter().enumerate() {
+        let base = g.addr.wrapping_add(delta);
+        let gi = i as u32;
+        addr_index.insert_global(base, g.size, g.name.clone(), g.type_info.clone(), gi);
+        world.remove_node(NodeId::Global(gi));
+        world.ensure_node(NodeId::Global(gi), &g.name, &g.type_info, base, g.size);
+        // decompose struct fields into separate addressable nodes
+        for (fi, f) in g.type_info.fields.iter().enumerate() {
+            if f.byte_size == 0 { continue; }
+            let faddr = base + f.byte_offset;
+            let fid = NodeId::Field(gi, fi as u16);
+            let qualified = format!("{}.{}", g.name, f.name);
+            addr_index.insert_field(
+                faddr, f.byte_size, qualified.clone(),
+                f.type_info.clone(), gi, fi as u16,
+            );
+            world.remove_node(fid);
+            world.ensure_node(fid, &qualified, &f.type_info, faddr, f.byte_size);
+        }
+    }
+    addr_index.finalize();
 }
 
 fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64) {
@@ -303,14 +323,8 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
     let mut relocation_delta: Option<u64> = None;
 
-    // insert globals with ELF vaddrs initially; they'll be relocated on MODULE_LOAD
     if let Some(ref info) = dwarf_info {
-        for (i, g) in info.globals.iter().enumerate() {
-            let nid = NodeId::Global(i as u32);
-            addr_index.insert_global(g.addr, g.size, g.name.clone(), g.type_info.clone(), i as u32);
-            world.ensure_node(nid, &g.name, &g.type_info, g.addr, g.size);
-        }
-        addr_index.finalize();
+        populate_globals(info, 0, &mut addr_index, &mut world);
     }
 
     let stdout = io::stdout();

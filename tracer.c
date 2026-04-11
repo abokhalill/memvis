@@ -272,6 +272,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     }
 
     if (instr_writes_memory(instr)) {
+        instr_t *next = instr_get_next(instr);
         for (int i = 0; i < instr_num_dsts(instr); i++) {
             opnd_t dst = instr_get_dst(instr, i);
             if (!opnd_is_memory_reference(dst))
@@ -285,14 +286,18 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
             }
             bool ok = drutil_insert_get_mem_addr(drcontext, bb, instr, dst, reg1, reg2);
             uint32_t sz = opnd_size_in_bytes(opnd_get_size(dst));
+            // insert clean call AFTER the write so safe_read_value sees post-write data.
+            // fall back to pre-write if this is the last instr in the BB.
+            instr_t *call_pt = next ? next : instr;
+            instr_t *unreserve_pt = call_pt;
             if (ok) {
-                dr_insert_clean_call(drcontext, bb, instr,
+                dr_insert_clean_call(drcontext, bb, call_pt,
                                      (void *)at_mem_write, false, 2,
                                      opnd_create_reg(reg1),
                                      OPND_CREATE_INT32((int)sz));
             }
-            drreg_unreserve_register(drcontext, bb, instr, reg2);
-            drreg_unreserve_register(drcontext, bb, instr, reg1);
+            drreg_unreserve_register(drcontext, bb, unreserve_pt, reg2);
+            drreg_unreserve_register(drcontext, bb, unreserve_pt, reg1);
         }
     }
 
