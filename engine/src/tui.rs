@@ -11,7 +11,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::index::NodeId;
-use crate::world::{WorldInner, REG_NAMES, REG_COUNT};
+use crate::world::{WorldInner, ShadowStack, REG_NAMES, REG_COUNT};
 
 #[derive(Clone)]
 pub struct JournalEntry {
@@ -32,11 +32,17 @@ pub struct AppState {
     pub focus: Panel,
     pub quit: bool,
     pub paused: bool,
+    pub time_travel_idx: Option<usize>,  // None = live, Some(idx) = historical
+    pub snap_count: usize,               // total snapshots available
 }
 
 impl AppState {
     pub fn new() -> Self {
-        Self { mem_scroll: 0, evt_scroll: 0, focus: Panel::Memory, quit: false, paused: false }
+        Self {
+            mem_scroll: 0, evt_scroll: 0, focus: Panel::Memory,
+            quit: false, paused: false,
+            time_travel_idx: None, snap_count: 0,
+        }
     }
 }
 
@@ -68,6 +74,35 @@ pub fn handle_input(state: &mut AppState) {
                     };
                 }
                 KeyCode::Char(' ') => state.paused = !state.paused,
+                KeyCode::Left | KeyCode::Char('h') => {
+                    let max = state.snap_count.saturating_sub(1);
+                    match state.time_travel_idx {
+                        Some(idx) => {
+                            if idx > 0 { state.time_travel_idx = Some(idx - 1); }
+                        }
+                        None if max > 0 => {
+                            state.time_travel_idx = Some(max.saturating_sub(1));
+                            state.paused = true;
+                        }
+                        _ => {}
+                    }
+                }
+                KeyCode::Right | KeyCode::Char('l') => {
+                    let max = state.snap_count.saturating_sub(1);
+                    match state.time_travel_idx {
+                        Some(idx) => {
+                            if idx >= max {
+                                state.time_travel_idx = None; // back to live
+                            } else {
+                                state.time_travel_idx = Some(idx + 1);
+                            }
+                        }
+                        None => {} // already live
+                    }
+                }
+                KeyCode::End => {
+                    state.time_travel_idx = None; // jump to live
+                }
                 KeyCode::Up | KeyCode::Char('k') => {
                     match state.focus {
                         Panel::Memory => state.mem_scroll = state.mem_scroll.saturating_sub(1),
@@ -245,7 +280,10 @@ pub fn draw(
     fill_used: u64,
     fill_pct: u32,
     state: &mut AppState,
+    snap_total: usize,
+    stacks: &[ShadowStack],
 ) {
+    state.snap_count = snap_total;
     let mem_lines = build_mem_lines(world);
     let evt_lines = build_event_lines(journal);
 
@@ -268,13 +306,18 @@ pub fn draw(
 
         // header
         let fill_color = if fill_pct > 85 { Color::Red } else if fill_pct > 50 { Color::Yellow } else { Color::Green };
-        let pause_indicator = if state.paused { " ⏸ PAUSED" } else { "" };
+        let time_indicator = match state.time_travel_idx {
+            Some(idx) => format!(" ◀ {}/{}", idx + 1, snap_total),
+            None => String::new(),
+        };
+        let pause_indicator = if state.paused && state.time_travel_idx.is_none() { " ⏸ PAUSED" } else { "" };
         let header = Paragraph::new(Line::from(vec![
             Span::styled("MEMVIS", Style::default().fg(Color::Cyan).bold()),
             Span::raw(format!(" │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ fill ",
                 world.insn_counter, total, world.nodes.len(), world.edges.len(), ring_count)),
             Span::styled(format!("{}%", fill_pct), Style::default().fg(fill_color)),
             Span::raw(format!(" ({}) ", fill_used)),
+            Span::styled(time_indicator.clone(), Style::default().fg(Color::Magenta).bold()),
             Span::styled(pause_indicator.to_string(), Style::default().fg(Color::Yellow).bold()),
         ]))
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
@@ -334,12 +377,13 @@ pub fn draw(
             .scroll((state.evt_scroll as u16, 0));
         f.render_widget(evt_widget, left[1]);
 
-        // right: registers (top) and pointer edges (bottom)
+        // right: registers, call stacks, pointer edges
         let right = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Percentage(60),
                 Constraint::Percentage(40),
+                Constraint::Percentage(30),
+                Constraint::Percentage(30),
             ])
             .split(body[1]);
 
@@ -377,6 +421,37 @@ pub fn draw(
                 .border_style(reg_border_style));
         f.render_widget(reg_widget, right[0]);
 
+        // call stack panel
+        let mut stack_lines: Vec<Line> = Vec::new();
+        for (ti, stack) in stacks.iter().enumerate() {
+            if stack.frames.is_empty() && stack.max_depth == 0 { continue; }
+            let depth_str = if stack.frames.is_empty() {
+                format!("T{} (idle, max={})", ti, stack.max_depth)
+            } else {
+                format!("T{} depth={}", ti, stack.frames.len())
+            };
+            stack_lines.push(Line::from(vec![
+                Span::styled(format!("  {}", depth_str), Style::default().fg(Color::Cyan)),
+            ]));
+            // show top 4 frames (newest first)
+            let start = stack.frames.len().saturating_sub(4);
+            for fi in (start..stack.frames.len()).rev() {
+                let f = &stack.frames[fi];
+                let indent = if fi == stack.frames.len() - 1 { "  → " } else { "    " };
+                stack_lines.push(Line::from(vec![
+                    Span::styled(indent.to_string(), Style::default().fg(Color::Magenta)),
+                    Span::styled(f.name.clone(), Style::default().fg(Color::White)),
+                ]));
+            }
+        }
+        let stack_widget = Paragraph::new(stack_lines)
+            .block(Block::default()
+                .title(" Call Stacks ")
+                .title_style(Style::default().fg(Color::White).bold())
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::DarkGray)));
+        f.render_widget(stack_widget, right[1]);
+
         // pointer edges panel
         let mut edge_lines: Vec<Line> = Vec::new();
         let mut seen: HashSet<(String, u64)> = HashSet::new();
@@ -402,7 +477,7 @@ pub fn draw(
                 .title_style(Style::default().fg(Color::White).bold())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)));
-        f.render_widget(edge_widget, right[1]);
+        f.render_widget(edge_widget, right[2]);
 
         // footer
         let footer = Paragraph::new(Line::from(vec![
@@ -415,7 +490,11 @@ pub fn draw(
             Span::styled("Space", Style::default().fg(Color::Yellow).bold()),
             Span::raw(" pause  "),
             Span::styled("PgUp/PgDn", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(" page"),
+            Span::raw(" page  "),
+            Span::styled("←→/hl", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(" time-travel  "),
+            Span::styled("End", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(" live"),
         ]));
         f.render_widget(footer, chunks[2]);
     });

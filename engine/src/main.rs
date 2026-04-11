@@ -8,7 +8,7 @@ use memvis::dwarf::{self, DwarfInfo};
 use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::ring::{Event, RingOrchestrator};
 use memvis::tui::{self, JournalEntry, AppState};
-use memvis::world::{WorldState, ShadowStack, REG_COUNT};
+use memvis::world::{WorldState, ShadowStack, SnapshotRing, REG_COUNT};
 
 const EVENT_WRITE: u8    = 0;
 const EVENT_CALL: u8     = 2;
@@ -179,6 +179,8 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         Err(e) => { eprintln!("memvis: failed to init terminal: {}", e); return; }
     };
     let mut app = AppState::new();
+    let mut snap_ring = SnapshotRing::new(512);
+    let mut tick: u64 = 0;
     let refresh = time::Duration::from_millis(50);
     let mut last_render = time::Instant::now();
     let mut last_discovery = time::Instant::now();
@@ -226,11 +228,24 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
 
         let now = time::Instant::now();
         if now.duration_since(last_render) >= refresh {
-            let snap = world.snapshot();
+            let live_snap = world.snapshot();
+            tick += 1;
+            snap_ring.push(live_snap.clone(), tick, total);
+
+            // time-travel: use historical snapshot if scrubbing, else live
+            let display_snap = match app.time_travel_idx {
+                Some(idx) => snap_ring.get(idx)
+                    .map(|sr| sr.snap.clone())
+                    .unwrap_or(live_snap),
+                None => live_snap,
+            };
+
             let (fill_used, fill_pct) = orch.total_fill();
+            let snap_total = snap_ring.len();
             tui::draw(
-                &mut terminal, &snap, &journal, total,
+                &mut terminal, &display_snap, &journal, total,
                 orch.ring_count(), fill_used, fill_pct, &mut app,
+                snap_total, &stacks,
             );
             last_render = now;
         }
