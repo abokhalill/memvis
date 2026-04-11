@@ -150,6 +150,7 @@ impl ThreadRing {
 
     #[inline]
     pub fn pop_n(&self, n: u64, out: &mut [Event]) -> bool {
+        debug_assert!(out.len() >= n as usize, "pop_n: out slice too small");
         let hdr = self.header();
         let mask = (hdr.capacity - 1) as u64;
         let data = unsafe { hdr.data() };

@@ -2,7 +2,7 @@
 // world state: variables, pointer edges, register file, cache miss tracking.
 // arc-wrapped inner for cow snapshotting - mutation clones only when shared.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::Arc;
 
 use crate::dwarf::TypeInfo;
@@ -39,7 +39,7 @@ const CACHE_LINE_SHIFT: u32 = 6; // 64 bytes
 #[derive(Debug, Clone)]
 pub struct CacheLineEntry {
     pub write_count: u32,
-    pub thread_mask: u64,  // bit per thread_id (up to 64 threads tracked)
+    pub writers: HashSet<u16>,
     pub last_writer: u16,
 }
 
@@ -54,23 +54,23 @@ impl CacheLineTracker {
     pub fn record_write(&mut self, addr: u64, thread_id: u16) {
         let cl = addr >> CACHE_LINE_SHIFT;
         let e = self.lines.entry(cl).or_insert(CacheLineEntry {
-            write_count: 0, thread_mask: 0, last_writer: thread_id,
+            write_count: 0, writers: HashSet::new(), last_writer: thread_id,
         });
         e.write_count += 1;
-        if thread_id < 64 { e.thread_mask |= 1u64 << thread_id; }
+        e.writers.insert(thread_id);
         e.last_writer = thread_id;
     }
 
     // cache line is false-shared if >1 thread has written to it
     pub fn is_false_shared(&self, addr: u64) -> bool {
         self.lines.get(&(addr >> CACHE_LINE_SHIFT))
-            .map(|e| e.thread_mask.count_ones() > 1)
+            .map(|e| e.writers.len() > 1)
             .unwrap_or(false)
     }
 
     pub fn contention_score(&self, addr: u64) -> u32 {
         self.lines.get(&(addr >> CACHE_LINE_SHIFT))
-            .map(|e| e.thread_mask.count_ones())
+            .map(|e| e.writers.len() as u32)
             .unwrap_or(0)
     }
 
