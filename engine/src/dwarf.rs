@@ -48,6 +48,59 @@ impl LocationTable {
     }
 }
 
+// x86-64 DWARF register number → memvis reg_file index.
+// DWARF reg 0=rax,1=rdx,2=rcx,3=rbx,4=rsi,5=rdi,6=rbp,7=rsp,8-15=r8-r15,16=rip
+// our layout: 0=rax,1=rbx,2=rcx,3=rdx,4=rsi,5=rdi,6=rbp,7=rsp,8-15=r8-r15,16=rip
+const DWARF_TO_REGFILE: [Option<usize>; 17] = [
+    Some(0),  // dwarf 0 = rax → idx 0
+    Some(3),  // dwarf 1 = rdx → idx 3
+    Some(2),  // dwarf 2 = rcx → idx 2
+    Some(1),  // dwarf 3 = rbx → idx 1
+    Some(4),  // dwarf 4 = rsi → idx 4
+    Some(5),  // dwarf 5 = rdi → idx 5
+    Some(6),  // dwarf 6 = rbp → idx 6
+    Some(7),  // dwarf 7 = rsp → idx 7
+    Some(8),  // dwarf 8  = r8
+    Some(9),  // dwarf 9  = r9
+    Some(10), // dwarf 10 = r10
+    Some(11), // dwarf 11 = r11
+    Some(12), // dwarf 12 = r12
+    Some(13), // dwarf 13 = r13
+    Some(14), // dwarf 14 = r14
+    Some(15), // dwarf 15 = r15
+    Some(16), // dwarf 16 = rip → idx 16
+];
+
+fn dwarf_reg_to_index(dwarf_reg: u16) -> Option<usize> {
+    DWARF_TO_REGFILE.get(dwarf_reg as usize).copied().flatten()
+}
+
+/// resolve a location piece to a concrete address given register state.
+/// regs: current register file values (indexed by memvis convention).
+/// frame_base: value passed by tracer (typically RSP at call site).
+/// cfa: true if function's DW_AT_frame_base is CFA (RSP+8 on x86-64).
+pub fn resolve_location(
+    piece: &LocationPiece,
+    regs: &[u64; 18],
+    frame_base: u64,
+    cfa: bool,
+) -> Option<u64> {
+    match piece {
+        LocationPiece::Address(a) => Some(*a),
+        LocationPiece::FrameBaseOffset(off) => {
+            let base = if cfa { regs[7].wrapping_add(8) } else { frame_base };
+            Some((base as i64).wrapping_add(*off) as u64)
+        }
+        LocationPiece::Register(r) => {
+            dwarf_reg_to_index(*r).map(|i| regs[i])
+        }
+        LocationPiece::RegisterOffset(r, off) => {
+            dwarf_reg_to_index(*r).map(|i| (regs[i] as i64).wrapping_add(*off) as u64)
+        }
+        LocationPiece::ImplicitValue(_) => None, // not addressable
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct FieldInfo {
     pub name: String,
