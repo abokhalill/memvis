@@ -33,7 +33,56 @@ impl LiveRegisterFile {
     }
 }
 
-// per node miss counter with exponential decay
+// per-cacheline write tracker. detects false sharing via thread bitmask.
+const CACHE_LINE_SHIFT: u32 = 6; // 64 bytes
+
+#[derive(Debug, Clone)]
+pub struct CacheLineEntry {
+    pub write_count: u32,
+    pub thread_mask: u64,  // bit per thread_id (up to 64 threads tracked)
+    pub last_writer: u16,
+}
+
+#[derive(Debug, Clone)]
+pub struct CacheLineTracker {
+    pub lines: HashMap<u64, CacheLineEntry>, // key = addr >> 6
+}
+
+impl CacheLineTracker {
+    pub fn new() -> Self { Self { lines: HashMap::new() } }
+
+    pub fn record_write(&mut self, addr: u64, thread_id: u16) {
+        let cl = addr >> CACHE_LINE_SHIFT;
+        let e = self.lines.entry(cl).or_insert(CacheLineEntry {
+            write_count: 0, thread_mask: 0, last_writer: thread_id,
+        });
+        e.write_count += 1;
+        if thread_id < 64 { e.thread_mask |= 1u64 << thread_id; }
+        e.last_writer = thread_id;
+    }
+
+    // cache line is false-shared if >1 thread has written to it
+    pub fn is_false_shared(&self, addr: u64) -> bool {
+        self.lines.get(&(addr >> CACHE_LINE_SHIFT))
+            .map(|e| e.thread_mask.count_ones() > 1)
+            .unwrap_or(false)
+    }
+
+    pub fn contention_score(&self, addr: u64) -> u32 {
+        self.lines.get(&(addr >> CACHE_LINE_SHIFT))
+            .map(|e| e.thread_mask.count_ones())
+            .unwrap_or(0)
+    }
+
+    // decay: halve write counts, clear lines with zero activity
+    pub fn tick(&mut self) {
+        self.lines.retain(|_, e| {
+            e.write_count /= 2;
+            e.write_count > 0
+        });
+    }
+}
+
 const DECAY_FACTOR: f32 = 0.95;
 
 #[derive(Debug, Clone)]
@@ -89,6 +138,7 @@ pub struct WorldInner {
     pub insn_counter: u64,
     pub reg_file: LiveRegisterFile,
     pub cache_heat: CacheHeatmap,
+    pub cl_tracker: CacheLineTracker,
 }
 
 impl WorldInner {
@@ -96,6 +146,7 @@ impl WorldInner {
         Self {
             nodes: BTreeMap::new(), edges: BTreeMap::new(), insn_counter: 0,
             reg_file: LiveRegisterFile::new(), cache_heat: CacheHeatmap::new(),
+            cl_tracker: CacheLineTracker::new(),
         }
     }
 }
@@ -179,6 +230,14 @@ impl WorldState {
 
     pub fn cache_heat_tick(&mut self) {
         self.cow().cache_heat.tick();
+    }
+
+    pub fn record_cl_write(&mut self, addr: u64, thread_id: u16) {
+        self.cow().cl_tracker.record_write(addr, thread_id);
+    }
+
+    pub fn cl_tracker_tick(&mut self) {
+        self.cow().cl_tracker.tick();
     }
 
     pub fn node_count(&self) -> usize { self.inner.nodes.len() }
@@ -341,18 +400,15 @@ mod tests {
             ring.push(ws.snapshot(), i, i);
         }
 
-        // cap=4, pushed 6, oldest 2 evicted
         assert_eq!(ring.len(), 4);
         assert_eq!(ring.get(0).unwrap().event_seq, 2);
         assert_eq!(ring.get(3).unwrap().event_seq, 5);
         assert_eq!(ring.latest().unwrap().event_seq, 5);
 
-        // binary search by insn (insn = seq+1 because inc happens before snapshot)
         let idx = ring.find_by_insn(4).unwrap();
         let sr = ring.get(idx).unwrap();
         assert!(sr.insn <= 4);
 
-        // out of range
         assert!(ring.find_by_insn(0).is_none());
     }
 }

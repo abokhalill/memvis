@@ -74,7 +74,9 @@ fn render(
         let cl = node.addr / 64;
 
         if cl != last_cl {
-            let _ = writeln!(out, "  {}── cacheline 0x{:x} ──{}", DIM, cl * 64, RST);
+            let fs = world.cl_tracker.contention_score(node.addr);
+            let fs_tag = if fs > 1 { format!(" {}FALSE_SHARE T={}{}", BGRED, fs, RST) } else { String::new() };
+            let _ = writeln!(out, "  {}── cacheline 0x{:x} ──{}{}", DIM, cl * 64, RST, fs_tag);
             last_cl = cl;
         }
 
@@ -195,6 +197,7 @@ fn process_event(
     let ev_kind = ev.kind();
     match ev_kind {
         EVENT_WRITE => {
+            world.record_cl_write(ev.addr, ev.thread_id);
             if let Some(h) = addr_index.lookup(ev.addr) {
                 let nid = h.node_id;
                 world.ensure_node(nid, h.name, h.type_info, ev.addr, ev.size as u64);
