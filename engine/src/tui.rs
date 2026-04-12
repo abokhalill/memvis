@@ -319,9 +319,11 @@ pub fn draw(
     state: &mut AppState,
     snap_total: usize,
     stacks: &HashMap<u16, ShadowStack>,
+    seq_gaps: u64,
 ) {
     state.snap_count = snap_total;
     let mem_lines = build_mem_lines(world);
+    let seq_gap_warn = seq_gaps; // capture for header
     let evt_lines = build_event_lines(journal, &state.filter);
 
     // clamp scrolls
@@ -356,6 +358,9 @@ pub fn draw(
             Span::raw(format!(" ({}) ", fill_used)),
             Span::styled(time_indicator.clone(), Style::default().fg(Color::Magenta).bold()),
             Span::styled(pause_indicator.to_string(), Style::default().fg(Color::Yellow).bold()),
+            if seq_gap_warn > 0 {
+                Span::styled(format!(" GAPS:{}", seq_gap_warn), Style::default().fg(Color::Red).bold())
+            } else { Span::raw("") },
         ]))
         .block(Block::default().borders(Borders::ALL).border_style(Style::default().fg(Color::DarkGray)));
         f.render_widget(header, chunks[0]);

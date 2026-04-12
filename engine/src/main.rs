@@ -158,6 +158,8 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
     let mut relocation_delta: Option<u64> = None;
     let mut returned_frames: VecDeque<FrameId> = VecDeque::with_capacity(64);
+    let mut expected_seq: HashMap<u16, u16> = HashMap::new();
+    let mut seq_gaps: u64 = 0;
 
     if let Some(ref info) = dwarf_info {
         populate_globals(info, 0, &mut addr_index, &mut world);
@@ -205,6 +207,13 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                         world.inc_insn_counter();
 
                         let ev_kind = ev.kind();
+                        // per-thread seq gap detection (u16 modular)
+                        let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
+                        if ev.seq != *exp && ev_kind != EVENT_REG_SNAPSHOT {
+                            seq_gaps += 1;
+                        }
+                        *exp = ev.seq.wrapping_add(1);
+
                         journal.push_back(JournalEntry {
                             seq: total, kind: ev_kind, thread_id: ev.thread_id,
                             addr: ev.addr, size: ev.size, value: ev.value,
@@ -246,7 +255,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             tui::draw(
                 &mut terminal, &display_snap, &journal, total,
                 orch.ring_count(), fill_used, fill_pct, &mut app,
-                snap_total, &stacks,
+                snap_total, &stacks, seq_gaps,
             );
             last_render = now;
         }
