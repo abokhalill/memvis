@@ -60,21 +60,18 @@ fn process_event(
                     stacks.entry(tid).or_insert_with(ShadowStack::new)
                         .push_call(fid, ev.addr, func.name.clone());
                     for (li, l) in func.locals.iter().enumerate() {
-                        let addr = if !l.location.is_empty() {
-                            match &l.location.entries[0].1 {
-                                // simple cases: tracer-provided frame_base is authoritative
-                                dwarf::LocationPiece::FrameBaseOffset(_)
-                                | dwarf::LocationPiece::RegisterOffset(_, _) =>
-                                    (ev.value as i64 + l.frame_offset) as u64,
-                                // complex: try resolve with current regs, fallback to frame_offset
-                                piece => {
-                                    let regs = world.regs();
-                                    dwarf::resolve_location(piece, &regs, ev.value, func.frame_base_is_cfa)
-                                        .unwrap_or((ev.value as i64 + l.frame_offset) as u64)
-                                }
+                        let piece = l.location.lookup(elf_pc)
+                            .or_else(|| l.location.entries.first().map(|(_, p)| p));
+                        let addr = match piece {
+                            Some(dwarf::LocationPiece::FrameBaseOffset(_))
+                            | Some(dwarf::LocationPiece::RegisterOffset(_, _))
+                            | None =>
+                                (ev.value as i64 + l.frame_offset) as u64,
+                            Some(p) => {
+                                let regs = world.regs();
+                                dwarf::resolve_location(p, &regs, ev.value, func.frame_base_is_cfa)
+                                    .unwrap_or((ev.value as i64 + l.frame_offset) as u64)
                             }
-                        } else {
-                            (ev.value as i64 + l.frame_offset) as u64
                         };
                         let nid = NodeId::Local(fid, li as u16);
                         world.ensure_node(nid, &l.name, &l.type_info, addr, l.size);
