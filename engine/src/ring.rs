@@ -266,10 +266,10 @@ impl RingOrchestrator {
     pub fn ring_count(&self) -> usize { self.rings.len() }
     pub fn active_count(&self) -> usize { self.rings.iter().filter(|r| r.alive).count() }
 
-    // adaptive backpressure: shed reads when ring fill > 7/8, resume at < 4/8
+    // adaptive backpressure: shed reads when ring fill > 6/8, resume at < 3/8
     pub fn update_backpressure(&self) {
-        const BP_HIGH: u32 = 7; // eighths
-        const BP_LOW: u32 = 4;
+        const BP_HIGH: u32 = 6; // eighths
+        const BP_LOW: u32 = 3;
         for ring in &self.rings {
             let hdr = ring.header();
             let h = hdr.head.load(Ordering::Relaxed);

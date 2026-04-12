@@ -54,8 +54,8 @@
 #define MEMVIS_REG_COUNT 18
 
 // backpressure thresholds in 8ths of capacity
-#define MEMVIS_BP_HIGH_WATER  7
-#define MEMVIS_BP_LOW_WATER   4
+#define MEMVIS_BP_HIGH_WATER  6
+#define MEMVIS_BP_LOW_WATER   3
 
 typedef struct __attribute__((packed, aligned(32))) {
     uint64_t addr;
@@ -236,7 +236,7 @@ static inline void memvis_push_overflow(memvis_ring_header_t *ring,
 #define MEMVIS_MAX_THREADS      256
 #define MEMVIS_RING_NAME_LEN    48
 
-#define MEMVIS_THREAD_RING_CAPACITY  (1u << 17)  
+#define MEMVIS_THREAD_RING_CAPACITY  (1u << 20)  
 
 #define MEMVIS_THREAD_STATE_EMPTY    0
 #define MEMVIS_THREAD_STATE_ACTIVE   1
