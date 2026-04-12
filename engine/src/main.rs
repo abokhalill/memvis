@@ -2,6 +2,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io;
+use std::sync::atomic::{AtomicI32, AtomicBool, Ordering as AtomicOrdering};
 use std::{env, thread, time};
 
 use memvis::dwarf::{self, DwarfInfo};
@@ -425,38 +426,249 @@ fn headless_render(
     }
 }
 
+fn cleanup_shm() {
+    // remove ctl ring
+    unsafe { libc::shm_unlink(b"/memvis_ctl\0".as_ptr() as *const libc::c_char); }
+    // remove per-thread rings (best effort, up to 256)
+    for i in 0..256u32 {
+        let name = format!("/memvis_ring_{}\0", i);
+        unsafe { libc::shm_unlink(name.as_ptr() as *const libc::c_char); }
+    }
+}
+
+fn find_drrun() -> Option<std::path::PathBuf> {
+    // 1. MEMVIS_DRRUN env var (explicit override)
+    if let Ok(p) = env::var("MEMVIS_DRRUN") {
+        let path = std::path::PathBuf::from(&p);
+        if path.exists() { return Some(path); }
+    }
+    // 2. DYNAMORIO_HOME env var
+    if let Ok(home) = env::var("DYNAMORIO_HOME") {
+        let path = std::path::PathBuf::from(&home).join("bin64/drrun");
+        if path.exists() { return Some(path); }
+    }
+    // 3. well-known location
+    let well_known = std::path::PathBuf::from("/home/ousef/DynamoRIO-Linux-11.91.20552/bin64/drrun");
+    if well_known.exists() { return Some(well_known); }
+    // 4. PATH lookup
+    if let Ok(output) = std::process::Command::new("which").arg("drrun").output() {
+        if output.status.success() {
+            let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
+            if !s.is_empty() { return Some(std::path::PathBuf::from(s)); }
+        }
+    }
+    None
+}
+
+fn find_tracer() -> Option<std::path::PathBuf> {
+    // 1. MEMVIS_TRACER env var
+    if let Ok(p) = env::var("MEMVIS_TRACER") {
+        let path = std::path::PathBuf::from(&p);
+        if path.exists() { return Some(path); }
+    }
+    // 2. relative to the current exe
+    if let Ok(exe) = env::current_exe() {
+        if let Some(dir) = exe.parent() {
+            // release binary is at engine/target/release/memvis
+            // tracer is at build/libmemvis_tracer.so
+            for candidate in &[
+                dir.join("../../build/libmemvis_tracer.so"),
+                dir.join("../../../build/libmemvis_tracer.so"),
+                dir.join("libmemvis_tracer.so"),
+            ] {
+                if let Ok(canon) = candidate.canonicalize() {
+                    if canon.exists() { return Some(canon); }
+                }
+            }
+        }
+    }
+    None
+}
+
+static TRACER_PID: AtomicI32 = AtomicI32::new(0);
+static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn signal_handler(_sig: libc::c_int) {
+    GOT_SIGNAL.store(true, AtomicOrdering::SeqCst);
+    let pid = TRACER_PID.load(AtomicOrdering::SeqCst);
+    if pid > 0 {
+        unsafe { libc::kill(pid, libc::SIGTERM); }
+    }
+}
+
+fn install_signal_handlers() {
+    unsafe {
+        libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
+    }
+}
+
+fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64) {
+    let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
+        eprintln!("memvis: parsing DWARF from {}", path);
+        match dwarf::parse_elf(path) {
+            Ok(info) => {
+                eprintln!("memvis: {} globals, {} functions", info.globals.len(), info.functions.len());
+                Some(info)
+            }
+            Err(e) => { eprintln!("memvis: DWARF parse failed: {}", e); None }
+        }
+    });
+
+    let mut orch = RingOrchestrator::new();
+    eprintln!("memvis: waiting for tracer...");
+    let deadline = time::Instant::now() + time::Duration::from_secs(30);
+    loop {
+        if GOT_SIGNAL.load(AtomicOrdering::Relaxed) {
+            eprintln!("memvis: interrupted while waiting for tracer");
+            return;
+        }
+        if time::Instant::now() > deadline {
+            eprintln!("memvis: timeout waiting for tracer (30s). Is DynamoRIO running?");
+            return;
+        }
+        if orch.try_attach_ctl() {
+            orch.poll_new_rings();
+            if orch.ring_count() > 0 {
+                eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
+                run(orch, dwarf_info, once, min_events);
+                return;
+            }
+        }
+        thread::sleep(time::Duration::from_millis(100));
+    }
+}
+
+fn launch(target: &str, target_args: &[String], once: bool, min_events: u64) {
+    let drrun = match find_drrun() {
+        Some(p) => p,
+        None => {
+            eprintln!("memvis: error: cannot find drrun.");
+            eprintln!("  Set DYNAMORIO_HOME or MEMVIS_DRRUN environment variable.");
+            std::process::exit(1);
+        }
+    };
+    let tracer = match find_tracer() {
+        Some(p) => p,
+        None => {
+            eprintln!("memvis: error: cannot find libmemvis_tracer.so.");
+            eprintln!("  Set MEMVIS_TRACER or build with: cd build && cmake --build .");
+            std::process::exit(1);
+        }
+    };
+
+    eprintln!("memvis: drrun  = {}", drrun.display());
+    eprintln!("memvis: tracer = {}", tracer.display());
+    eprintln!("memvis: target = {}", target);
+
+    // clean stale shm from previous runs
+    cleanup_shm();
+
+    install_signal_handlers();
+
+    // fork the tracer as a child process
+    let mut cmd = std::process::Command::new(&drrun);
+    cmd.arg("-c").arg(&tracer).arg("--").arg(target);
+    for a in target_args {
+        cmd.arg(a);
+    }
+    // redirect tracer stdout/stderr to /dev/null in TUI mode, keep in headless
+    if !once {
+        cmd.stdout(std::process::Stdio::null());
+        cmd.stderr(std::process::Stdio::null());
+    }
+
+    let child = match cmd.spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("memvis: failed to launch tracer: {}", e);
+            cleanup_shm();
+            std::process::exit(1);
+        }
+    };
+
+    let child_pid = child.id() as i32;
+    TRACER_PID.store(child_pid, AtomicOrdering::SeqCst);
+    eprintln!("memvis: tracer pid={}", child_pid);
+
+    // run consumer in this process
+    run_consumer(Some(target), once, min_events);
+
+    // cleanup: kill tracer if still running, reap
+    unsafe {
+        libc::kill(child_pid, libc::SIGTERM);
+        let mut status: libc::c_int = 0;
+        libc::waitpid(child_pid, &mut status, 0);
+    }
+    cleanup_shm();
+    eprintln!("memvis: done.");
+}
+
+fn print_usage() {
+    eprintln!("Usage:");
+    eprintln!("  memvis <target> [args...]        Launch target under tracer + TUI");
+    eprintln!("  memvis --once <target> [args...]  Headless mode (print to stdout, exit)");
+    eprintln!("  memvis --consumer-only [--once] [--min-events N] <target.elf>");
+    eprintln!("                                    Consumer-only (tracer started separately)");
+    eprintln!("");
+    eprintln!("Environment:");
+    eprintln!("  DYNAMORIO_HOME   Path to DynamoRIO installation");
+    eprintln!("  MEMVIS_DRRUN     Explicit path to drrun binary");
+    eprintln!("  MEMVIS_TRACER    Explicit path to libmemvis_tracer.so");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
 
+    if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
+        print_usage();
+        std::process::exit(if args.len() < 2 { 1 } else { 0 });
+    }
+
+    // --consumer-only: legacy mode (tracer started separately)
+    if args.iter().any(|a| a == "--consumer-only") {
+        let once = args.iter().any(|a| a == "--once");
+        let min_events: u64 = args.windows(2)
+            .find(|w| w[0] == "--min-events")
+            .and_then(|w| w[1].parse().ok())
+            .unwrap_or(1);
+        let elf_path = args.iter()
+            .filter(|a| !a.starts_with('-') && *a != &args[0])
+            .find(|a| a.parse::<u64>().is_err())
+            .map(|s| s.as_str());
+        run_consumer(elf_path, once, min_events);
+        return;
+    }
+
+    // launcher mode: memvis [--once] [--min-events N] <target> [target_args...]
     let once = args.iter().any(|a| a == "--once");
     let min_events: u64 = args.windows(2)
         .find(|w| w[0] == "--min-events")
         .and_then(|w| w[1].parse().ok())
         .unwrap_or(1);
-    let elf_path = args.iter().find(|a| !a.starts_with('-') && *a != &args[0] && !a.parse::<u64>().is_ok()).map(|s| s.as_str());
 
-    let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
-        eprintln!("memvis-dump: parsing DWARF from {}", path);
-        match dwarf::parse_elf(path) {
-            Ok(info) => {
-                eprintln!("memvis-dump: {} globals, {} functions", info.globals.len(), info.functions.len());
-                Some(info)
-            }
-            Err(e) => { eprintln!("memvis-dump: DWARF parse failed: {}", e); None }
-        }
-    });
-
-    let mut orch = RingOrchestrator::new();
-    eprintln!("memvis-dump: waiting for control ring...");
-    loop {
-        if orch.try_attach_ctl() {
-            orch.poll_new_rings();
-            if orch.ring_count() > 0 {
-                eprintln!("memvis-dump: attached, {} thread ring(s)", orch.ring_count());
-                run(orch, dwarf_info, once, min_events);
-                return;
-            }
-        }
-        thread::sleep(time::Duration::from_millis(250));
+    // find the target: first positional arg that isn't a flag or flag value
+    let mut skip_next = false;
+    let mut target_idx = None;
+    for (i, a) in args.iter().enumerate().skip(1) {
+        if skip_next { skip_next = false; continue; }
+        if a == "--min-events" { skip_next = true; continue; }
+        if a.starts_with('-') { continue; }
+        target_idx = Some(i);
+        break;
     }
+
+    let target_idx = match target_idx {
+        Some(i) => i,
+        None => {
+            eprintln!("memvis: error: no target specified");
+            print_usage();
+            std::process::exit(1);
+        }
+    };
+
+    let target = &args[target_idx];
+    let target_args: Vec<String> = args[target_idx + 1..].to_vec();
+
+    launch(target, &target_args, once, min_events);
 }

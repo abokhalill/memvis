@@ -6,7 +6,7 @@ license = "MIT"
 authors = ["Yousef Mahmoud <yosefkhalil610@gmail.com>"]
 
 [[bin]]
-name = "memvis-dump"
+name = "memvis"
 path = "src/main.rs"
 
 [dependencies]
