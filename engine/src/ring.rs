@@ -164,6 +164,23 @@ impl ThreadRing {
         true
     }
 
+    // pop up to `max` events. single head load, single tail store.
+    pub fn batch_pop(&self, max: usize, out: &mut Vec<Event>) -> usize {
+        let hdr = self.header();
+        let mask = (hdr.capacity - 1) as u64;
+        let data = unsafe { hdr.data() };
+        let t = hdr.tail.load(Ordering::Relaxed);
+        let h = hdr.head.load(Ordering::Acquire);
+        let avail = h.wrapping_sub(t) as usize;
+        let n = avail.min(max);
+        if n == 0 { return 0; }
+        for i in 0..n {
+            out.push(unsafe { ptr::read_volatile(data.add(((t + i as u64) & mask) as usize)) });
+        }
+        hdr.tail.store(t + n as u64, Ordering::Release);
+        n
+    }
+
     pub fn fill(&self) -> (u64, u32) {
         let hdr = self.header();
         let h = hdr.head.load(Ordering::Relaxed);
@@ -284,7 +301,26 @@ impl RingOrchestrator {
         }
     }
 
-    // round-robin drain across all rings. each ring is FIFO per-thread.
+    // batch drain: pop up to `per_ring` events from each ring, round-robin start.
+    // returns total events drained. caller processes via callback.
+    pub fn batch_drain(&mut self, per_ring: usize, buf: &mut Vec<(usize, Event)>) -> usize {
+        let n = self.rings.len();
+        if n == 0 { return 0; }
+        let mut tmp: Vec<Event> = Vec::with_capacity(per_ring);
+        let mut total = 0;
+        for offset in 0..n {
+            let i = (self.rr_idx + offset) % n;
+            tmp.clear();
+            let got = self.rings[i].batch_pop(per_ring, &mut tmp);
+            for ev in tmp.drain(..) {
+                buf.push((i, ev));
+            }
+            total += got;
+        }
+        self.rr_idx = (self.rr_idx + 1) % n.max(1);
+        total
+    }
+
     pub fn merge_pop(&mut self) -> Option<(usize, Event)> {
         let n = self.rings.len();
         if n == 0 { return None; }

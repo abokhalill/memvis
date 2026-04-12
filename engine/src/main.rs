@@ -81,7 +81,6 @@ fn process_event(
                     ).collect();
                     if !locals.is_empty() {
                         addr_index.insert_frame_locals(fid, ev.value, &locals);
-                        addr_index.finalize();
                     }
                 }
             }
@@ -199,6 +198,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let refresh = time::Duration::from_millis(50);
     let mut last_render = time::Instant::now();
     let mut last_discovery = time::Instant::now();
+    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(32_000);
 
     loop {
         tui::handle_input(&mut app);
@@ -211,41 +211,37 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         }
 
         if !app.paused {
-            let mut drained = 0u64;
-            while drained < 100_000 {
-                match orch.merge_pop() {
-                    Some((ri, ev)) => {
-                        total += 1;
-                        drained += 1;
-                        world.inc_insn_counter();
+            batch_buf.clear();
+            orch.batch_drain(5_000, &mut batch_buf);
+            let mut need_finalize = false;
 
-                        let ev_kind = ev.kind();
-                        // per-thread seq gap detection (u16 modular)
-                        let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
-                        if ev.seq != *exp && ev_kind != EVENT_REG_SNAPSHOT {
-                            seq_gaps += 1;
-                        }
-                        *exp = ev.seq.wrapping_add(1);
+            for &(ri, ref ev) in &batch_buf {
+                total += 1;
+                world.inc_insn_counter();
 
-                        journal.push_back(JournalEntry {
-                            seq: total, kind: ev_kind, thread_id: ev.thread_id,
-                            addr: ev.addr, size: ev.size, value: ev.value,
-                        });
-                        if journal.len() > 1000 { journal.pop_front(); }
-
-                        process_event(
-                            &ev, ri, &orch, &mut world, &mut addr_index,
-                            &dwarf_info, &mut stacks, &mut next_frame_id,
-                            &mut relocation_delta, &mut returned_frames,
-                        );
-                    }
-                    None => break,
+                let ev_kind = ev.kind();
+                let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
+                if ev.seq != *exp && ev_kind != EVENT_REG_SNAPSHOT {
+                    seq_gaps += 1;
                 }
+                *exp = ev.seq.wrapping_add(1);
+
+                journal.push_back(JournalEntry {
+                    seq: total, kind: ev_kind, thread_id: ev.thread_id,
+                    addr: ev.addr, size: ev.size, value: ev.value,
+                });
+                if journal.len() > 1000 { journal.pop_front(); }
+
+                process_event(
+                    ev, ri, &orch, &mut world, &mut addr_index,
+                    &dwarf_info, &mut stacks, &mut next_frame_id,
+                    &mut relocation_delta, &mut returned_frames,
+                );
+                if ev_kind == EVENT_CALL { need_finalize = true; }
             }
 
-            if total & 0xFFF == 0 {
-                world.cache_heat_tick();
-            }
+            if need_finalize { addr_index.finalize(); }
+            if total & 0xFFF == 0 { world.cache_heat_tick(); }
             orch.update_backpressure();
         }
 
@@ -303,6 +299,7 @@ fn run_headless(
     let mut last_render = time::Instant::now();
     let mut rendered_once = false;
     let mut last_discovery = time::Instant::now();
+    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(32_000);
 
     loop {
         let now_disc = time::Instant::now();
@@ -311,30 +308,30 @@ fn run_headless(
             last_discovery = now_disc;
         }
 
-        let mut drained = 0u64;
-        while drained < 50_000 {
-            match orch.merge_pop() {
-                Some((ri, ev)) => {
-                    *total += 1;
-                    drained += 1;
-                    world.inc_insn_counter();
+        batch_buf.clear();
+        let drained = orch.batch_drain(5_000, &mut batch_buf);
+        let mut need_finalize = false;
 
-                    let ev_kind = ev.kind();
-                    journal.push_back(JournalEntry {
-                        seq: *total, kind: ev_kind, thread_id: ev.thread_id,
-                        addr: ev.addr, size: ev.size, value: ev.value,
-                    });
-                    if journal.len() > 1000 { journal.pop_front(); }
+        for &(ri, ref ev) in &batch_buf {
+            *total += 1;
+            world.inc_insn_counter();
 
-                    process_event(
-                        &ev, ri, orch, world, addr_index,
-                        dwarf_info, stacks, next_frame_id,
-                        relocation_delta, returned_frames,
-                    );
-                }
-                None => break,
-            }
+            let ev_kind = ev.kind();
+            journal.push_back(JournalEntry {
+                seq: *total, kind: ev_kind, thread_id: ev.thread_id,
+                addr: ev.addr, size: ev.size, value: ev.value,
+            });
+            if journal.len() > 1000 { journal.pop_front(); }
+
+            process_event(
+                ev, ri, orch, world, addr_index,
+                dwarf_info, stacks, next_frame_id,
+                relocation_delta, returned_frames,
+            );
+            if ev_kind == EVENT_CALL { need_finalize = true; }
         }
+
+        if need_finalize { addr_index.finalize(); }
 
         let now = time::Instant::now();
         if now.duration_since(last_render) >= refresh || (!rendered_once && *total > 0) {
