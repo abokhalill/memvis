@@ -32,8 +32,7 @@ static _Atomic uint16_t g_next_thread_id    = 0;
 
 // main executable runtime base, captured at module load
 static uint64_t g_module_base = 0;
-static bool     g_module_base_set = false;
-static _Atomic int g_module_load_emitted = 0;
+static _Atomic int g_module_base_phase = 0; // 0=unset, 1=base captured, 2=emitted
 
 #define TLS_SLOT_GUARD     0
 #define TLS_SLOT_THREAD_ID 1
@@ -113,9 +112,9 @@ static inline memvis_ring_header_t *tls_ring(void *drcontext) {
 }
 
 static inline void maybe_emit_module_load(void *drcontext, memvis_ring_header_t *ring) {
-    if (!g_module_base_set) return;
-    int expected = 0;
-    if (!atomic_compare_exchange_strong_explicit(&g_module_load_emitted, &expected, 1,
+    int phase = atomic_load_explicit(&g_module_base_phase, memory_order_acquire);
+    if (phase != 1) return;
+    if (!atomic_compare_exchange_strong_explicit(&g_module_base_phase, &phase, 2,
                                                   memory_order_acq_rel, memory_order_relaxed))
         return;
     uint16_t tid = tls_thread_id(drcontext);
@@ -150,14 +149,10 @@ at_mem_write(uint64_t addr, uint32_t size)
     uint64_t val = safe_read_value(addr, size);
     int rc = memvis_push_sampled(ring, addr, size, val,
                                   MEMVIS_EVENT_WRITE, tid, seq);
-    if (rc == 0) {
+    if (rc == 0)
         atomic_fetch_add_explicit(&g_stat_writes, 1, memory_order_relaxed);
-    } else if (rc < 0) {
+    else if (rc < 0)
         atomic_fetch_add_explicit(&g_stat_dropped, 1, memory_order_relaxed);
-        memvis_push_overflow(ring,
-            atomic_load_explicit(&g_stat_writes, memory_order_relaxed),
-            tid, seq);
-    }
 
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
 }
@@ -324,7 +319,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     }
 
     if (instr_writes_memory(instr)) {
-        instr_t *next = instr_get_next(instr);
+        instr_t *next = instr_get_next_app(instr);
         for (int i = 0; i < instr_num_dsts(instr); i++) {
             opnd_t dst = instr_get_dst(instr, i);
             if (!opnd_is_memory_reference(dst))
@@ -405,9 +400,9 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 {
     (void)drcontext; (void)loaded;
     // capture the main executable's runtime load base (first non-vdso module)
-    if (!g_module_base_set && info->full_path[0] != '\0') {
+    if (atomic_load_explicit(&g_module_base_phase, memory_order_relaxed) == 0 &&
+        info->full_path[0] != '\0') {
         const char *name = dr_module_preferred_name(info);
-        // skip system modules: vdso, ld-linux, libc, libpthread, DR itself
         if (name && strstr(name, "vdso") == NULL &&
             strstr(name, "ld-linux") == NULL &&
             strstr(name, "libc") == NULL &&
@@ -416,7 +411,7 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             strstr(name, "libdynamorio") == NULL &&
             strstr(name, "libdr") == NULL) {
             g_module_base = (uint64_t)(uintptr_t)info->start;
-            g_module_base_set = true;
+            atomic_store_explicit(&g_module_base_phase, 1, memory_order_release);
             dr_printf("memvis: main module '%s' base=0x%llx\n",
                       name, (unsigned long long)g_module_base);
         }

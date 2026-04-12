@@ -57,7 +57,7 @@
 #define MEMVIS_BP_HIGH_WATER  6
 #define MEMVIS_BP_LOW_WATER   3
 
-typedef struct __attribute__((packed, aligned(32))) {
+typedef struct __attribute__((aligned(32))) {
     uint64_t addr;
     uint32_t size;
     uint16_t thread_id;
@@ -80,8 +80,6 @@ static inline uint64_t memvis_make_kind_flags(uint8_t kind, uint8_t flags) {
 
 #define MEMVIS_FLAG_DROP_ON_FULL  0x0
 #define MEMVIS_FLAG_SPIN_ON_FULL  0x1
-
-#define MEMVIS_DEFAULT_CAPACITY   (1u << 21)
 
 typedef struct {
     uint64_t magic;
@@ -119,8 +117,10 @@ static inline int memvis_push_ex(memvis_ring_header_t *ring,
     if (h - t >= ring->capacity) {
         if (!(ring->flags & MEMVIS_FLAG_SPIN_ON_FULL))
             return -1;
-        while (h - t >= ring->capacity)
+        while (h - t >= ring->capacity) {
+            __builtin_ia32_pause();
             t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+        }
     }
 
     uint64_t idx = h & mask;
