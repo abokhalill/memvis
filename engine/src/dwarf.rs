@@ -356,8 +356,16 @@ fn extract_locals<'a>(
 ) -> Result<(), gimli::Error> {
     let mut entries = unit.entries();
     let mut current_fn_pc: Option<u64> = None;
+    let mut depth: isize = 0;
+    let mut fn_depth: isize = 0; // depth at which current subprogram was entered
 
     while let Some((delta_depth, entry)) = entries.next_dfs()? {
+        depth += delta_depth as isize;
+        // if we've popped above the subprogram's depth, we've left it
+        if current_fn_pc.is_some() && depth <= fn_depth {
+            current_fn_pc = None;
+        }
+
         let tag = entry.tag();
         if tag == gimli::DW_TAG_subprogram {
             current_fn_pc = entry
@@ -366,13 +374,8 @@ fn extract_locals<'a>(
                     AttributeValue::Addr(a) => Some(a),
                     _ => None,
                 });
+            fn_depth = depth;
         } else if tag == gimli::DW_TAG_variable || tag == gimli::DW_TAG_formal_parameter {
-            if delta_depth <= 0 && tag == gimli::DW_TAG_variable {
-                if delta_depth < 0 {
-                    current_fn_pc = None;
-                }
-            }
-
             if let Some(fn_pc) = current_fn_pc {
                 if let Some(local) = try_extract_local(dwarf, unit, entry) {
                     if let Some(func) = functions.get_mut(&fn_pc) {
@@ -380,7 +383,6 @@ fn extract_locals<'a>(
                     }
                 }
             }
-        } else if delta_depth < 0 {
         }
     }
 
