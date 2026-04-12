@@ -609,8 +609,14 @@ fn launch(target: &str, target_args: &[String], once: bool, min_events: u64) {
     TRACER_PID.store(child_pid, AtomicOrdering::SeqCst);
     eprintln!("memvis: tracer pid={}", child_pid);
 
-    // run consumer in this process
-    run_consumer(Some(target), once, min_events);
+    // run consumer on a thread with 64MB stack (DWARF parsing of complex
+    // struct types like kernel sched.c can overflow the default 8MB stack)
+    let target_owned = target.to_string();
+    let handle = thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || run_consumer(Some(&target_owned), once, min_events))
+        .expect("memvis: failed to spawn consumer thread");
+    let _ = handle.join();
 
     // cleanup: kill tracer if still running, reap
     unsafe {
@@ -650,11 +656,15 @@ fn main() {
             .find(|w| w[0] == "--min-events")
             .and_then(|w| w[1].parse().ok())
             .unwrap_or(1);
-        let elf_path = args.iter()
+        let elf_path: Option<String> = args.iter()
             .filter(|a| !a.starts_with('-') && *a != &args[0])
             .find(|a| a.parse::<u64>().is_err())
-            .map(|s| s.as_str());
-        run_consumer(elf_path, once, min_events);
+            .cloned();
+        let handle = thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events))
+            .expect("memvis: failed to spawn consumer thread");
+        let _ = handle.join();
         return;
     }
 

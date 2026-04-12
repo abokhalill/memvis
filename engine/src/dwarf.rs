@@ -751,8 +751,14 @@ fn extract_struct_fields<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
     struct_offset: UnitOffset,
-    _parent_depth: u32,
+    parent_depth: u32,
 ) -> Vec<FieldInfo> {
+    // cap nested struct field extraction to avoid stack overflow on
+    // deeply nested types (e.g. kernel sched.c: rq -> cfs_rq -> sched_entity)
+    if parent_depth >= 2 {
+        return Vec::new();
+    }
+
     let mut fields = Vec::new();
 
     let mut tree = match unit.entries_tree(Some(struct_offset)) {
@@ -781,12 +787,21 @@ fn extract_struct_fields<'a>(
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
-        let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo {
-            name: "<unknown>".into(),
-            byte_size: 0,
-            is_pointer: false,
-            fields: Vec::new(),
-        });
+        // propagate depth through resolve_type_at, not resolve_type
+        // (resolve_type resets depth to 0, causing unbounded recursion)
+        let type_ref = entry.attr_value(gimli::DW_AT_type).ok().flatten()
+            .and_then(|v| match v {
+                AttributeValue::UnitRef(off) => Some(off),
+                _ => None,
+            });
+        let type_info = type_ref
+            .and_then(|off| resolve_type_at(dwarf, unit, off, parent_depth + 1))
+            .unwrap_or(TypeInfo {
+                name: "<unknown>".into(),
+                byte_size: 0,
+                is_pointer: false,
+                fields: Vec::new(),
+            });
 
         let byte_size = type_info.byte_size;
 
