@@ -224,6 +224,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             if total & 0xFFF == 0 {
                 world.cache_heat_tick();
             }
+            orch.update_backpressure();
         }
 
         let now = time::Instant::now();
@@ -329,6 +330,8 @@ fn run_headless(
         if drained == 0 {
             thread::sleep(time::Duration::from_millis(10));
         }
+
+        orch.update_backpressure();
 
         if *total & 0xFFF == 0 {
             world.cache_heat_tick();

@@ -266,6 +266,24 @@ impl RingOrchestrator {
     pub fn ring_count(&self) -> usize { self.rings.len() }
     pub fn active_count(&self) -> usize { self.rings.iter().filter(|r| r.alive).count() }
 
+    // adaptive backpressure: shed reads when ring fill > 7/8, resume at < 4/8
+    pub fn update_backpressure(&self) {
+        const BP_HIGH: u32 = 7; // eighths
+        const BP_LOW: u32 = 4;
+        for ring in &self.rings {
+            let hdr = ring.header();
+            let h = hdr.head.load(Ordering::Relaxed);
+            let t = hdr.tail.load(Ordering::Relaxed);
+            let fill_eighths = ((h.wrapping_sub(t)) << 3) / hdr.capacity as u64;
+            let bp = hdr.backpressure.load(Ordering::Relaxed);
+            if fill_eighths >= BP_HIGH as u64 && bp == 0 {
+                hdr.backpressure.store(1, Ordering::Release);
+            } else if fill_eighths < BP_LOW as u64 && bp != 0 {
+                hdr.backpressure.store(0, Ordering::Release);
+            }
+        }
+    }
+
     // round-robin drain across all rings. each ring is FIFO per-thread.
     pub fn merge_pop(&mut self) -> Option<(usize, Event)> {
         let n = self.rings.len();
