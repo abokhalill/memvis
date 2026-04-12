@@ -199,7 +199,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
 
         if !app.paused {
             let mut drained = 0u64;
-            while drained < 10_000 {
+            while drained < 100_000 {
                 match orch.merge_pop() {
                     Some((ri, ev)) => {
                         total += 1;
@@ -299,7 +299,7 @@ fn run_headless(
         }
 
         let mut drained = 0u64;
-        while drained < 10_000 {
+        while drained < 50_000 {
             match orch.merge_pop() {
                 Some((ri, ev)) => {
                     *total += 1;
