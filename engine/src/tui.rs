@@ -315,7 +315,7 @@ pub fn draw(
     total: u64,
     ring_count: usize,
     fill_used: u64,
-    fill_pct: u32,
+    _fill_pct: u32,
     state: &mut AppState,
     snap_total: usize,
     stacks: &HashMap<u16, ShadowStack>,
@@ -344,7 +344,14 @@ pub fn draw(
             .split(size);
 
         // header
-        let fill_color = if fill_pct > 85 { Color::Red } else if fill_pct > 50 { Color::Yellow } else { Color::Green };
+        let lag_color = if fill_used > 50_000 { Color::Red } else if fill_used > 1_000 { Color::Yellow } else { Color::Green };
+        let lag_str = if fill_used >= 1_000_000 {
+            format!("{}M", fill_used / 1_000_000)
+        } else if fill_used >= 1_000 {
+            format!("{}K", fill_used / 1_000)
+        } else {
+            format!("{}", fill_used)
+        };
         let time_indicator = match state.time_travel_idx {
             Some(idx) => format!(" ◀ {}/{}", idx + 1, snap_total),
             None => String::new(),
@@ -352,10 +359,9 @@ pub fn draw(
         let pause_indicator = if state.paused && state.time_travel_idx.is_none() { " ⏸ PAUSED" } else { "" };
         let header = Paragraph::new(Line::from(vec![
             Span::styled("MEMVIS", Style::default().fg(Color::Cyan).bold()),
-            Span::raw(format!(" │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ fill ",
+            Span::raw(format!(" │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ ",
                 world.insn_counter, total, world.nodes.len(), world.edges.len(), ring_count)),
-            Span::styled(format!("{}%", fill_pct), Style::default().fg(fill_color)),
-            Span::raw(format!(" ({}) ", fill_used)),
+            Span::styled(format!("LAG {}", lag_str), Style::default().fg(lag_color).bold()),
             Span::styled(time_indicator.clone(), Style::default().fg(Color::Magenta).bold()),
             Span::styled(pause_indicator.to_string(), Style::default().fg(Color::Yellow).bold()),
             if seq_gap_warn > 0 {

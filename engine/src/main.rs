@@ -368,11 +368,14 @@ fn headless_render(
     total: u64,
     orch: &RingOrchestrator,
 ) {
-    let (used, pct) = orch.total_fill();
+    let (lag, _) = orch.total_fill();
+    let lag_str = if lag >= 1_000_000 { format!("{}M", lag / 1_000_000) }
+        else if lag >= 1_000 { format!("{}K", lag / 1_000) }
+        else { format!("{}", lag) };
     let _ = writeln!(out,
-        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ fill {}% ({})",
+        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ LAG {}",
         world.insn_counter, total, world.nodes.len(), world.edges.len(),
-        orch.ring_count(), pct, used);
+        orch.ring_count(), lag_str);
     let _ = writeln!(out, "{}", "─".repeat(100));
     let _ = writeln!(out, "MEMORY MAP");
 
