@@ -14,11 +14,53 @@ type R<'a> = EndianSlice<'a, LittleEndian>;
 
 #[derive(Debug, Clone)]
 pub enum LocationPiece {
-    Address(u64),          // DW_OP_addr
-    FrameBaseOffset(i64),  // DW_OP_fbreg
-    Register(u16),         // DW_OP_reg*
-    RegisterOffset(u16, i64), // DW_OP_breg*
-    ImplicitValue(u64),    // const + DW_OP_stack_value
+    Address(u64),
+    FrameBaseOffset(i64),
+    Register(u16),
+    RegisterOffset(u16, i64),
+    ImplicitValue(u64),
+    CFA,
+    Expr(DwarfExprOp),
+}
+
+#[derive(Debug, Clone)]
+pub enum DwarfExprOp {
+    DerefRegOffset { reg: u16, offset: i64, deref_size: u8 },
+    RegPlusReg { r1: u16, off1: i64, r2: u16, off2: i64 },
+    StackMachine(Vec<ExprStep>),
+}
+
+#[derive(Debug, Clone)]
+pub enum ExprStep {
+    Lit(u64),
+    SignedLit(i64),
+    Reg(u16),
+    BReg(u16, i64),
+    FrameBase(i64),
+    Addr(u64),
+    CFA,
+    Deref(u8),
+    Plus,
+    Minus,
+    Mul,
+    Div,
+    Mod,
+    Neg,
+    Abs,
+    And,
+    Or,
+    Xor,
+    Shl,
+    Shr,
+    Shra,
+    Not,
+    Drop,
+    Pick(u8),
+    Swap,
+    Rot,
+    PlusConst(u64),
+    StackValue,
+    Piece(u64),
 }
 
 #[derive(Debug, Clone)]
@@ -75,7 +117,9 @@ fn dwarf_reg_to_index(dwarf_reg: u16) -> Option<usize> {
     DWARF_TO_REGFILE.get(dwarf_reg as usize).copied().flatten()
 }
 
-/// resolve a location piece to a concrete address given register state.
+// x86-64: CFA = RSP + 8 (return addr pushed)
+fn compute_cfa(regs: &[u64; 18]) -> u64 { regs[7].wrapping_add(8) }
+
 pub fn resolve_location(
     piece: &LocationPiece,
     regs: &[u64; 18],
@@ -85,7 +129,7 @@ pub fn resolve_location(
     match piece {
         LocationPiece::Address(a) => Some(*a),
         LocationPiece::FrameBaseOffset(off) => {
-            let base = if cfa { regs[7].wrapping_add(8) } else { frame_base };
+            let base = if cfa { compute_cfa(regs) } else { frame_base };
             Some((base as i64).wrapping_add(*off) as u64)
         }
         LocationPiece::Register(r) => {
@@ -94,8 +138,178 @@ pub fn resolve_location(
         LocationPiece::RegisterOffset(r, off) => {
             dwarf_reg_to_index(*r).map(|i| (regs[i] as i64).wrapping_add(*off) as u64)
         }
-        LocationPiece::ImplicitValue(_) => None, // not addressable
+        LocationPiece::ImplicitValue(_) => None,
+        LocationPiece::CFA => Some(compute_cfa(regs)),
+        LocationPiece::Expr(expr_op) => resolve_expr(expr_op, regs, frame_base, cfa),
     }
+}
+
+fn resolve_expr(
+    expr: &DwarfExprOp,
+    regs: &[u64; 18],
+    frame_base: u64,
+    cfa: bool,
+) -> Option<u64> {
+    match expr {
+        DwarfExprOp::DerefRegOffset { reg, offset, .. } => {
+            // no target memory access — return pre-deref address for index lookup
+            dwarf_reg_to_index(*reg).map(|i| (regs[i] as i64).wrapping_add(*offset) as u64)
+        }
+        DwarfExprOp::RegPlusReg { r1, off1, r2, off2 } => {
+            let v1 = dwarf_reg_to_index(*r1).map(|i| (regs[i] as i64).wrapping_add(*off1) as u64)?;
+            let v2 = dwarf_reg_to_index(*r2).map(|i| (regs[i] as i64).wrapping_add(*off2) as u64)?;
+            Some(v1.wrapping_add(v2))
+        }
+        DwarfExprOp::StackMachine(steps) => {
+            eval_stack_machine(steps, regs, frame_base, cfa)
+        }
+    }
+}
+
+fn eval_stack_machine(
+    steps: &[ExprStep],
+    regs: &[u64; 18],
+    frame_base: u64,
+    cfa: bool,
+) -> Option<u64> {
+    let mut stack: Vec<u64> = Vec::with_capacity(8);
+    let mut is_stack_value = false;
+
+    for step in steps {
+        match step {
+            ExprStep::Lit(v) => stack.push(*v),
+            ExprStep::SignedLit(v) => stack.push(*v as u64),
+            ExprStep::Reg(r) => {
+                let val = dwarf_reg_to_index(*r).map(|i| regs[i])?;
+                stack.push(val);
+            }
+            ExprStep::BReg(r, off) => {
+                let val = dwarf_reg_to_index(*r).map(|i| (regs[i] as i64).wrapping_add(*off) as u64)?;
+                stack.push(val);
+            }
+            ExprStep::FrameBase(off) => {
+                let base = if cfa { compute_cfa(regs) } else { frame_base };
+                stack.push((base as i64).wrapping_add(*off) as u64);
+            }
+            ExprStep::Addr(a) => stack.push(*a),
+            ExprStep::CFA => stack.push(compute_cfa(regs)),
+            ExprStep::Deref(_size) => {
+                // can't read target memory — leave address on stack (best effort)
+                if stack.is_empty() { return None; }
+            }
+            ExprStep::Plus => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a.wrapping_add(b));
+            }
+            ExprStep::Minus => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a.wrapping_sub(b));
+            }
+            ExprStep::Mul => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a.wrapping_mul(b));
+            }
+            ExprStep::Div => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap() as i64;
+                let a = stack.pop().unwrap() as i64;
+                if b == 0 { return None; }
+                stack.push((a / b) as u64);
+            }
+            ExprStep::Mod => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                if b == 0 { return None; }
+                stack.push(a % b);
+            }
+            ExprStep::Neg => {
+                let v = stack.last_mut()?;
+                *v = (0u64).wrapping_sub(*v);
+            }
+            ExprStep::Abs => {
+                let v = stack.last_mut()?;
+                let sv = *v as i64;
+                *v = sv.unsigned_abs();
+            }
+            ExprStep::And => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a & b);
+            }
+            ExprStep::Or => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a | b);
+            }
+            ExprStep::Xor => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a ^ b);
+            }
+            ExprStep::Shl => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a.wrapping_shl(b as u32));
+            }
+            ExprStep::Shr => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap();
+                stack.push(a.wrapping_shr(b as u32));
+            }
+            ExprStep::Shra => {
+                if stack.len() < 2 { return None; }
+                let b = stack.pop().unwrap();
+                let a = stack.pop().unwrap() as i64;
+                stack.push((a >> (b as u32)) as u64);
+            }
+            ExprStep::Not => {
+                let v = stack.last_mut()?;
+                *v = !*v;
+            }
+            ExprStep::Drop => { stack.pop()?; }
+            ExprStep::Pick(idx) => {
+                let len = stack.len();
+                if (*idx as usize) >= len { return None; }
+                stack.push(stack[len - 1 - *idx as usize]);
+            }
+            ExprStep::Swap => {
+                let len = stack.len();
+                if len < 2 { return None; }
+                stack.swap(len - 1, len - 2);
+            }
+            ExprStep::Rot => {
+                let len = stack.len();
+                if len < 3 { return None; }
+                // top three: [a, b, c] (c=TOS) -> [c, a, b]
+                let c = stack[len - 1];
+                stack[len - 1] = stack[len - 2];
+                stack[len - 2] = stack[len - 3];
+                stack[len - 3] = c;
+            }
+            ExprStep::PlusConst(c) => {
+                let v = stack.last_mut()?;
+                *v = v.wrapping_add(*c);
+            }
+            ExprStep::StackValue => { is_stack_value = true; }
+            ExprStep::Piece(_) => break,
+        }
+    }
+
+    // stack_value = result is value, not address — not indexable
+    if is_stack_value { return None; }
+    stack.last().copied()
 }
 
 #[derive(Debug, Clone)]
@@ -198,10 +412,14 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                 if let Some(f) = try_extract_function(&dw, &unit, entry) {
                     functions.insert(f.low_pc, f);
                 }
+            } else if tag == gimli::DW_TAG_inlined_subroutine {
+                if let Some(f) = try_extract_inlined(&dw, &unit, entry) {
+                    functions.insert(f.low_pc, f);
+                }
             }
         }
 
-        // second pass: attach locals to their parent subprograms
+        // second pass: attach locals to their parent subprograms and inlines
         extract_locals(&dw, &unit, &mut functions)?;
     }
 
@@ -214,38 +432,99 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
     Ok(DwarfInfo { globals, functions, elf_base_vaddr })
 }
 
-// single expression --> piece. returns None for unsupported ops.
-fn decode_expression(unit: &Unit<R<'_>>, expr: &gimli::Expression<R<'_>>) -> Option<LocationPiece> {
-    let mut ops = expr.operations(unit.encoding());
-    let first = match ops.next() {
-        Ok(Some(op)) => op,
-        _ => return None,
-    };
-
-    match first {
-        Operation::Address { address } => Some(LocationPiece::Address(address)),
-        Operation::FrameOffset { offset } => Some(LocationPiece::FrameBaseOffset(offset)),
-        Operation::Register { register } => Some(LocationPiece::Register(register.0)),
+fn op_to_steps(op: &Operation<R<'_>>, steps: &mut Vec<ExprStep>) -> bool {
+    match op {
+        Operation::Address { address } => { steps.push(ExprStep::Addr(*address)); true }
+        Operation::UnsignedConstant { value } => { steps.push(ExprStep::Lit(*value)); true }
+        Operation::SignedConstant { value } => { steps.push(ExprStep::SignedLit(*value)); true }
+        Operation::Register { register } => { steps.push(ExprStep::Reg(register.0)); true }
         Operation::RegisterOffset { register, offset, .. } => {
-            Some(LocationPiece::RegisterOffset(register.0, offset))
+            steps.push(ExprStep::BReg(register.0, *offset)); true
         }
-        Operation::UnsignedConstant { value } => {
-            match ops.next() {
-                Ok(Some(Operation::StackValue)) => Some(LocationPiece::ImplicitValue(value)),
-                _ => None,
-            }
+        Operation::FrameOffset { offset } => { steps.push(ExprStep::FrameBase(*offset)); true }
+        Operation::CallFrameCFA => { steps.push(ExprStep::CFA); true }
+        Operation::Deref { size, space, .. } => {
+            if *space { return false; } // xderef needs address space arg — unsupported
+            steps.push(ExprStep::Deref(*size)); true
         }
-        Operation::SignedConstant { value } => {
-            match ops.next() {
-                Ok(Some(Operation::StackValue)) => Some(LocationPiece::ImplicitValue(value as u64)),
-                _ => None,
-            }
+        Operation::Plus => { steps.push(ExprStep::Plus); true }
+        Operation::Minus => { steps.push(ExprStep::Minus); true }
+        Operation::Mul => { steps.push(ExprStep::Mul); true }
+        Operation::Div => { steps.push(ExprStep::Div); true }
+        Operation::Mod => { steps.push(ExprStep::Mod); true }
+        Operation::Neg => { steps.push(ExprStep::Neg); true }
+        Operation::Abs => { steps.push(ExprStep::Abs); true }
+        Operation::And => { steps.push(ExprStep::And); true }
+        Operation::Or => { steps.push(ExprStep::Or); true }
+        Operation::Xor => { steps.push(ExprStep::Xor); true }
+        Operation::Shl => { steps.push(ExprStep::Shl); true }
+        Operation::Shr => { steps.push(ExprStep::Shr); true }
+        Operation::Shra => { steps.push(ExprStep::Shra); true }
+        Operation::Not => { steps.push(ExprStep::Not); true }
+        Operation::PlusConstant { value } => { steps.push(ExprStep::PlusConst(*value)); true }
+        Operation::StackValue => { steps.push(ExprStep::StackValue); true }
+        Operation::Piece { size_in_bits, .. } => {
+            steps.push(ExprStep::Piece(size_in_bits / 8)); true
         }
-        _ => None,
+        Operation::ImplicitValue { data } => {
+            let bytes: &[u8] = data.slice();
+            let val = match bytes.len() {
+                1 => bytes[0] as u64,
+                2 => u16::from_le_bytes([bytes[0], bytes[1]]) as u64,
+                4 => u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]) as u64,
+                8 => u64::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3], bytes[4], bytes[5], bytes[6], bytes[7]]),
+                _ => return false,
+            };
+            steps.push(ExprStep::Lit(val));
+            steps.push(ExprStep::StackValue);
+            true
+        }
+        Operation::Nop => true,
+        Operation::Drop => { steps.push(ExprStep::Drop); true }
+        Operation::Pick { index } => { steps.push(ExprStep::Pick(*index)); true }
+        Operation::Swap => { steps.push(ExprStep::Swap); true }
+        Operation::Rot => { steps.push(ExprStep::Rot); true }
+        _ => false,
     }
 }
 
-// exprloc --> single-entry table, loclist --> multi-entry table
+fn decode_expression(unit: &Unit<R<'_>>, expr: &gimli::Expression<R<'_>>) -> Option<LocationPiece> {
+    let mut ops = expr.operations(unit.encoding());
+    let mut steps: Vec<ExprStep> = Vec::new();
+
+    loop {
+        match ops.next() {
+            Ok(Some(op)) => {
+                if !op_to_steps(&op, &mut steps) {
+                    return None;
+                }
+            }
+            Ok(None) => break,
+            Err(_) => return None,
+        }
+    }
+
+    if steps.is_empty() { return None; }
+
+    match steps.as_slice() {
+        [ExprStep::Addr(a)] => Some(LocationPiece::Address(*a)),
+        [ExprStep::FrameBase(off)] => Some(LocationPiece::FrameBaseOffset(*off)),
+        [ExprStep::Reg(r)] => Some(LocationPiece::Register(*r)),
+        [ExprStep::BReg(r, off)] => Some(LocationPiece::RegisterOffset(*r, *off)),
+        [ExprStep::CFA] => Some(LocationPiece::CFA),
+        [ExprStep::Lit(v), ExprStep::StackValue] => Some(LocationPiece::ImplicitValue(*v)),
+        [ExprStep::SignedLit(v), ExprStep::StackValue] => Some(LocationPiece::ImplicitValue(*v as u64)),
+        [ExprStep::BReg(r, off), ExprStep::Deref(sz)] => {
+            Some(LocationPiece::Expr(DwarfExprOp::DerefRegOffset { reg: *r, offset: *off, deref_size: *sz }))
+        }
+        [ExprStep::BReg(r1, o1), ExprStep::BReg(r2, o2), ExprStep::Plus, ExprStep::StackValue] => {
+            Some(LocationPiece::Expr(DwarfExprOp::RegPlusReg { r1: *r1, off1: *o1, r2: *r2, off2: *o2 }))
+        }
+        [ExprStep::Addr(a), ExprStep::StackValue] => Some(LocationPiece::ImplicitValue(*a)),
+        _ => Some(LocationPiece::Expr(DwarfExprOp::StackMachine(steps))),
+    }
+}
+
 fn decode_location<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
@@ -290,7 +569,7 @@ fn try_extract_global<'a>(
 
     let addr = match &location.entries[0].1 {
         LocationPiece::Address(a) => *a,
-        _ => return None, // not a global (fbreg/reg/etc are locals)
+        _ => return None,
     };
 
     let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo {
@@ -348,7 +627,53 @@ fn try_extract_function<'a>(
     })
 }
 
-// second pass: attach locals to parent subprogram
+fn try_extract_inlined<'a>(
+    dwarf: &Dwarf<R<'a>>,
+    unit: &Unit<R<'a>>,
+    entry: &DebuggingInformationEntry<R<'a>>,
+) -> Option<FunctionMeta> {
+    let origin_offset = match entry.attr_value(gimli::DW_AT_abstract_origin).ok().flatten()? {
+        AttributeValue::UnitRef(off) => off,
+        _ => return None,
+    };
+    let origin_entry = unit.entry(origin_offset).ok()?;
+    let name = attr_name(dwarf, unit, &origin_entry)?;
+
+    let low_pc = entry.attr_value(gimli::DW_AT_low_pc).ok().flatten()
+        .and_then(|v| match v { AttributeValue::Addr(a) => Some(a), _ => None })
+        .or_else(|| entry.attr_value(gimli::DW_AT_entry_pc).ok().flatten()
+            .and_then(|v| match v { AttributeValue::Addr(a) => Some(a), _ => None }))?;
+
+    let high_pc = entry.attr_value(gimli::DW_AT_high_pc).ok().flatten()
+        .and_then(|v| match v {
+            AttributeValue::Udata(len) => Some(low_pc + len),
+            AttributeValue::Addr(a) => Some(a),
+            _ => None,
+        })
+        .unwrap_or(low_pc + 1);
+
+    let frame_base_is_cfa = origin_entry
+        .attr_value(gimli::DW_AT_frame_base)
+        .ok()
+        .flatten()
+        .map(|attr| match attr {
+            AttributeValue::Exprloc(expr) => {
+                let mut ops = expr.operations(unit.encoding());
+                matches!(ops.next(), Ok(Some(Operation::CallFrameCFA)))
+            }
+            _ => false,
+        })
+        .unwrap_or(false);
+
+    Some(FunctionMeta {
+        name: format!("[inlined] {}", name),
+        low_pc,
+        high_pc,
+        frame_base_is_cfa,
+        locals: Vec::new(),
+    })
+}
+
 fn extract_locals<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
@@ -357,24 +682,24 @@ fn extract_locals<'a>(
     let mut entries = unit.entries();
     let mut current_fn_pc: Option<u64> = None;
     let mut depth: isize = 0;
-    let mut fn_depth: isize = 0; // depth at which current subprogram was entered
+    let mut fn_depth: isize = 0;
 
     while let Some((delta_depth, entry)) = entries.next_dfs()? {
         depth += delta_depth as isize;
-        // if we've popped above the subprogram's depth, we've left it
         if current_fn_pc.is_some() && depth <= fn_depth {
             current_fn_pc = None;
         }
 
         let tag = entry.tag();
-        if tag == gimli::DW_TAG_subprogram {
-            current_fn_pc = entry
-                .attr_value(gimli::DW_AT_low_pc)?
-                .and_then(|v| match v {
-                    AttributeValue::Addr(a) => Some(a),
-                    _ => None,
-                });
-            fn_depth = depth;
+        if tag == gimli::DW_TAG_subprogram || tag == gimli::DW_TAG_inlined_subroutine {
+            let pc = entry.attr_value(gimli::DW_AT_low_pc)?
+                .and_then(|v| match v { AttributeValue::Addr(a) => Some(a), _ => None })
+                .or_else(|| entry.attr_value(gimli::DW_AT_entry_pc).ok().flatten()
+                    .and_then(|v| match v { AttributeValue::Addr(a) => Some(a), _ => None }));
+            if pc.is_some() {
+                current_fn_pc = pc;
+                fn_depth = depth;
+            }
         } else if tag == gimli::DW_TAG_variable || tag == gimli::DW_TAG_formal_parameter {
             if let Some(fn_pc) = current_fn_pc {
                 if let Some(local) = try_extract_local(dwarf, unit, entry) {
