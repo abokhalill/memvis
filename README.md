@@ -1,137 +1,144 @@
 # memvis
 
-Live memory model visualization for C programs. Instruments a running binary via
-DynamoRIO, reconstructs semantic state from DWARF, and renders it in the terminal.
+Real-time memory visualization for Linux x86-64 programs. Instruments a target
+binary at runtime, captures every memory write, read, function call, and return,
+then correlates those events with DWARF debug information to produce a live,
+named view of the program's memory state in the terminal.
 
-No source modifications. No recompilation. Point it at a `-g -O0` binary and see
-how your program lives in memory.
+No source modifications. No recompilation. Point it at a `-g` binary and watch.
 
 ## What it shows
 
 ```
-MEMVIS │ insn 6044 │ events 6044 │ nodes 5 │ edges 1 │ ring 0% (0/1048576)
-────────────────────────────────────────────────────────────────────────────
+MEMVIS | insn 50622 | events 50622 | nodes 17 | edges 3 | rings 3 | LAG 0
+
 MEMORY MAP
-  ── cacheline 0x4040 ──
-          4040    40B  g_state              GameState       val=               2
-            4060     4B  count                int
-            4064     4B  tick                 int
-  ── cacheline 0x4080 ──
-          4080    48B  g_player             Entity          val= ffffffffffffff3b  [297 misses]
-            4090     4B  health               int
-            40a8     8B  inventory            *void
-          40f0     4B  g_score              int             val=              b9a
-          40f8     8B  g_score_ptr          *int            val=             40f0  → g_score
+  -- cacheline 0x55a3e000 --
+  55a3e004     4B  g_counter            int             val=               12c
+  55a3e008     4B  g_shared             int             val=               12c
+  55a3e010     8B  g_ptr                *int            val=      55a3e004  -> g_counter
+  -- cacheline 0x7ffd2780 --
+  7ffd2798     4B  local_sum            int             val=                1e
+  7ffd27a0     8B  local_ptr            *int            val=      7ffd2798  -> local_sum
 
 POINTER EDGES
-  g_score_ptr ──> g_score (0x40f0)
-
-REGISTERS (insn 4455)
-   rax=             b9a   rbx=            4040   rcx=             129
-   rdi=            4080   rbp=    7fffffffde00   rsp=    7fffffffddf0
-
-EVENTS (last 12)
-      6040 W            4060     4                 2
-      6041 RET             0     0                 0
-      6042 REG          1167     0                 0
-      6043 CMIS         4090     1              1139
+  g_ptr --> g_counter (0x55a3e004)
+  local_ptr --> local_sum (0x7ffd2798)
 ```
 
-- **Memory map**: every DWARF-resolved variable, sorted by address, with struct
-  field expansion, cache line boundaries, and crossing alerts
-- **Pointer edges**: resolved `→ target_name` inline and as a dedicated section
-- **Registers**: 18 x86-64 GPRs, yellow when pointing into a live variable
-- **Cache misses**: per-variable miss counts from the ring
-- **Event journal**: raw SPSC tail showing writes, calls, returns, reg snapshots
-
-## Architecture
-
-```
-┌─────────────────────┐         ┌──────────────────────┐
-│   Target binary     │         │    memvis-dump       │
-│   (instrumented)    │         │    (terminal UI)     │
-│                     │  shm    │                      │
-│   tracer.c          ├────────►│    main.rs           │
-│   (DynamoRIO client)│  SPSC   │   DWARF + ring → tty │
-│                     │  ring   │                      │ 
-└─────────────────────┘         └──────────────────────┘
-```
-
-The tracer and consumer share a single SPSC lock-free ring buffer (`/dev/shm/memvis_ring`).
-No sockets. No serialization. No IPC framework. Raw shared memory with atomic head/tail
-pointers on separate cache lines.
+- **Memory map.** Every DWARF-resolved global and local variable, sorted by
+  address, with struct field decomposition, cache-line boundaries, and
+  false-sharing annotations.
+- **Pointer edges.** Live pointer-to-variable resolution. Updated on every
+  write to a pointer variable.
+- **Cache-line contention.** Tracks which threads write to each cache line.
+  Flags lines written by multiple threads as false-shared.
+- **Event journal.** The most recent events (writes, calls, returns, register
+  snapshots, cache misses) with thread IDs and sequence numbers.
+- **LAG metric.** Total events buffered across all per-thread rings. Shows
+  how far behind the consumer is from the producer.
 
 ## Requirements
 
 - Linux x86-64
 - Rust 1.70+
-- Target binary compiled with `gcc -g -O0` (DWARF required)
-- [DynamoRIO](https://dynamorio.org/) (for real instrumentation; not needed for the consumer)
+- [DynamoRIO](https://dynamorio.org/) 11.x
+- Target binary compiled with `-g` (DWARF debug info required)
 
 ## Build
 
 ```sh
-# consumer (terminal visualizer)
+# engine (Rust consumer + TUI)
 cd engine
 cargo build --release
-```
 
-The binary is `engine/target/release/memvis-dump` (~700KB, 3 dependencies).
-
-```sh
-# tracer (DynamoRIO client, optional — only needed for real instrumentation)
-mkdir build && cd build
-cmake .. -DDynamoRIO_DIR=/path/to/dynamorio/cmake
+# tracer (DynamoRIO client)
+mkdir -p build && cd build
+cmake .. -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake
 make
 ```
 
 ## Usage
 
-### With DynamoRIO (real instrumentation)
+```sh
+# interactive TUI mode
+DYNAMORIO_HOME=/path/to/DynamoRIO memvis ./my_program [args...]
+
+# headless mode (print to stdout, exit after N events)
+DYNAMORIO_HOME=/path/to/DynamoRIO memvis --once --min-events 50000 ./my_program
+```
+
+The `memvis` binary launches the target under DynamoRIO, attaches to the shared
+memory rings, and starts consuming events. There is no need to run the tracer
+and consumer separately.
+
+For manual two-process operation:
 
 ```sh
-# terminal 1: run target under DynamoRIO
+# terminal 1: run target under tracer
 drrun -c build/libmemvis_tracer.so -- ./my_program
 
-# terminal 2: attach the visualizer
-./engine/target/release/memvis-dump ./my_program
+# terminal 2: attach consumer
+./engine/target/release/memvis --consumer-only ./my_program
 ```
 
-### Pipe-friendly snapshot
+### Environment variables
 
-```sh
-./engine/target/release/memvis-dump --once ./my_program
-```
+| Variable | Purpose |
+|---|---|
+| `DYNAMORIO_HOME` | Path to the DynamoRIO installation directory |
+| `MEMVIS_DRRUN` | Explicit path to the `drrun` binary |
+| `MEMVIS_TRACER` | Explicit path to `libmemvis_tracer.so` |
 
-Prints a single snapshot and exits. Compose with `grep`, `less -R`, `watch`.
+## How it works
 
-## Ring protocol
-
-The shared memory layout is defined in [`memvis_bridge.h`](memvis_bridge.h) — a
-single header, no dependencies beyond `<stdatomic.h>`. The ring is SPSC, lock-free,
-and sized at 2M entries (64MB) by default. Events are 32 bytes each, aligned so two
-fit per cache line with no split loads.
-
-Event types: `WRITE`, `READ`, `CALL`, `RETURN`, `OVERFLOW`, `REG_SNAPSHOT`, `CACHE_MISS`.
-
-Backpressure: when the ring fills past 7/8, the producer sheds `READ` events.
-`WRITE`, `CALL`, and `RETURN` are never dropped — world state correctness is preserved.
-
-## Project structure
+The system consists of two cooperating OS processes connected by POSIX shared
+memory:
 
 ```
-memvis_bridge.h     ring buffer protocol (C header)
-tracer.c            DynamoRIO client (producer)
-CMakeLists.txt      tracer build
-engine/
-  src/
-    main.rs         terminal visualizer (consumer)
-    lib.rs          crate root
-    dwarf.rs        DWARF parser (gimli)
-    index.rs        address → variable interval map
-    world.rs        state model + CoW snapshots
+ +---------------------------+        /dev/shm/           +---------------------------+
+ |         TRACER            |  ========================> |          ENGINE           |
+ |  (DynamoRIO client, C)    |   per-thread SPSC rings    |  (Rust consumer + TUI)    |
+ |                           |   control ring             |                           |
+ |  instruments target       |                            |  DWARF parser             |
+ |  emits 32-byte events     |                            |  address index            |
+ |  per-thread TLS state     |                            |  world state + CoW snap   |
+ |  adaptive backpressure    |                            |  ratatui terminal UI      |
+ +---------------------------+                            +---------------------------+
+        runs inside                                             runs as the
+     target's address space                                   memvis binary
+      (via DynamoRIO)                                       (separate process)
 ```
+
+1. The **tracer** (`tracer.c`) is a DynamoRIO client loaded into the target
+   process. It intercepts every basic block and inserts callbacks at memory
+   writes, reads, calls, and returns. Each thread gets its own SPSC ring
+   buffer over POSIX shared memory.
+
+2. The **engine** (`engine/`) parses DWARF debug info from the target ELF,
+   discovers per-thread rings via a control ring, batch-drains events (up to
+   20K per ring per cycle), and correlates memory addresses with named
+   variables. The result is rendered as an interactive TUI at 20 Hz or as
+   headless text output.
+
+No sockets. No serialization. No IPC framework. Raw shared memory with atomic
+head/tail pointers on separate cache lines. The only synchronization in the
+data path is a single release store (producer) and a single acquire load
+(consumer) per batch.
+
+## Documentation
+
+Detailed technical documentation is in the [`docs/`](docs/) directory:
+
+- [**Architecture**](docs/architecture.md) -- system overview, component map,
+  data flow, relocation, concurrency model.
+- [**Ring Protocol**](docs/ring-protocol.md) -- event format, ring header
+  layout, SPSC memory ordering, batch operations, backpressure, control ring.
+- [**Tracer**](docs/tracer.md) -- DynamoRIO client, instrumentation callbacks,
+  TLS slots, read buffering, module load detection.
+- [**Engine**](docs/engine.md) -- DWARF parser, ring orchestrator, address
+  index, world state, CoW snapshots, TUI rendering.
 
 ## License
 
-[MIT](LICENSE) 
+[MIT](LICENSE)
