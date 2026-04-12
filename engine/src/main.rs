@@ -19,6 +19,7 @@ const EVENT_CACHE_MISS: u8   = 6;
 const EVENT_MODULE_LOAD: u8  = 7;
 
 
+// returns true if event was "interesting" (tracked write, or control event)
 #[inline]
 fn process_event(
     ev: &Event,
@@ -31,7 +32,7 @@ fn process_event(
     next_frame_id: &mut FrameId,
     relocation_delta: &mut Option<u64>,
     returned_frames: &mut VecDeque<FrameId>,
-) {
+) -> bool {
     let ev_kind = ev.kind();
     match ev_kind {
         EVENT_WRITE => {
@@ -45,7 +46,9 @@ fn process_event(
                         else { addr_index.lookup(ev.value).map(|t| t.node_id) };
                     world.update_edge(nid, target, ev.value);
                 }
+                return true;
             }
+            return false;
         }
         EVENT_CALL => {
             if let Some(ref info) = dwarf_info {
@@ -84,6 +87,7 @@ fn process_event(
                     }
                 }
             }
+            true
         }
         EVENT_RETURN => {
             let tid = ev.thread_id;
@@ -91,7 +95,6 @@ fn process_event(
                 if let Some(frame) = stack.pop_return() {
                     addr_index.remove_frame(frame.frame_id);
                     returned_frames.push_back(frame.frame_id);
-                    // evict oldest retained frames to bound memory
                     while returned_frames.len() > 32 {
                         if let Some(old_fid) = returned_frames.pop_front() {
                             world.remove_frame_nodes(old_fid);
@@ -99,6 +102,7 @@ fn process_event(
                     }
                 }
             }
+            true
         }
         EVENT_REG_SNAPSHOT => {
             let mut cont = [Event::zero(); 6];
@@ -111,11 +115,13 @@ fn process_event(
                 }
                 world.update_regs(regs, ev.addr);
             }
+            true
         }
         EVENT_CACHE_MISS => {
             if let Some(h) = addr_index.lookup(ev.addr) {
                 world.record_cache_miss(h.node_id);
             }
+            true
         }
         EVENT_MODULE_LOAD => {
             if relocation_delta.is_none() {
@@ -129,8 +135,9 @@ fn process_event(
                     populate_globals(info, delta, addr_index, world);
                 }
             }
+            true
         }
-        _ => {}
+        _ => false,
     }
 }
 
@@ -198,7 +205,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let refresh = time::Duration::from_millis(50);
     let mut last_render = time::Instant::now();
     let mut last_discovery = time::Instant::now();
-    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(32_000);
+    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
 
     loop {
         tui::handle_input(&mut app);
@@ -212,7 +219,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
 
         if !app.paused {
             batch_buf.clear();
-            orch.batch_drain(5_000, &mut batch_buf);
+            orch.batch_drain(20_000, &mut batch_buf);
             let mut need_finalize = false;
 
             for &(ri, ref ev) in &batch_buf {
@@ -226,17 +233,18 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                 }
                 *exp = ev.seq.wrapping_add(1);
 
-                journal.push_back(JournalEntry {
-                    seq: total, kind: ev_kind, thread_id: ev.thread_id,
-                    addr: ev.addr, size: ev.size, value: ev.value,
-                });
-                if journal.len() > 1000 { journal.pop_front(); }
-
-                process_event(
+                let interesting = process_event(
                     ev, ri, &orch, &mut world, &mut addr_index,
                     &dwarf_info, &mut stacks, &mut next_frame_id,
                     &mut relocation_delta, &mut returned_frames,
                 );
+                if interesting {
+                    journal.push_back(JournalEntry {
+                        seq: total, kind: ev_kind, thread_id: ev.thread_id,
+                        addr: ev.addr, size: ev.size, value: ev.value,
+                    });
+                    if journal.len() > 1000 { journal.pop_front(); }
+                }
                 if ev_kind == EVENT_CALL { need_finalize = true; }
             }
 
@@ -299,7 +307,7 @@ fn run_headless(
     let mut last_render = time::Instant::now();
     let mut rendered_once = false;
     let mut last_discovery = time::Instant::now();
-    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(32_000);
+    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
 
     loop {
         let now_disc = time::Instant::now();
@@ -309,7 +317,7 @@ fn run_headless(
         }
 
         batch_buf.clear();
-        let drained = orch.batch_drain(5_000, &mut batch_buf);
+        let drained = orch.batch_drain(20_000, &mut batch_buf);
         let mut need_finalize = false;
 
         for &(ri, ref ev) in &batch_buf {
@@ -317,17 +325,18 @@ fn run_headless(
             world.inc_insn_counter();
 
             let ev_kind = ev.kind();
-            journal.push_back(JournalEntry {
-                seq: *total, kind: ev_kind, thread_id: ev.thread_id,
-                addr: ev.addr, size: ev.size, value: ev.value,
-            });
-            if journal.len() > 1000 { journal.pop_front(); }
-
-            process_event(
+            let interesting = process_event(
                 ev, ri, orch, world, addr_index,
                 dwarf_info, stacks, next_frame_id,
                 relocation_delta, returned_frames,
             );
+            if interesting {
+                journal.push_back(JournalEntry {
+                    seq: *total, kind: ev_kind, thread_id: ev.thread_id,
+                    addr: ev.addr, size: ev.size, value: ev.value,
+                });
+                if journal.len() > 1000 { journal.pop_front(); }
+            }
             if ev_kind == EVENT_CALL { need_finalize = true; }
         }
 
