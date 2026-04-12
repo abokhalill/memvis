@@ -447,10 +447,7 @@ fn find_drrun() -> Option<std::path::PathBuf> {
         let path = std::path::PathBuf::from(&home).join("bin64/drrun");
         if path.exists() { return Some(path); }
     }
-    // 3. well-known location
-    let well_known = std::path::PathBuf::from("/home/ousef/DynamoRIO-Linux-11.91.20552/bin64/drrun");
-    if well_known.exists() { return Some(well_known); }
-    // 4. PATH lookup
+    // 3. PATH lookup
     if let Ok(output) = std::process::Command::new("which").arg("drrun").output() {
         if output.status.success() {
             let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
