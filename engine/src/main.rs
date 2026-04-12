@@ -1,6 +1,6 @@
 // SPDX-License-Identifier: MIT
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io;
 use std::{env, thread, time};
 
@@ -26,7 +26,7 @@ fn process_event(
     world: &mut WorldState,
     addr_index: &mut AddressIndex,
     dwarf_info: &Option<DwarfInfo>,
-    stacks: &mut Vec<ShadowStack>,
+    stacks: &mut HashMap<u16, ShadowStack>,
     next_frame_id: &mut FrameId,
     relocation_delta: &mut Option<u64>,
     returned_frames: &mut VecDeque<FrameId>,
@@ -55,10 +55,9 @@ fn process_event(
                 if let Some(func) = info.functions.get(&elf_pc) {
                     let fid = *next_frame_id;
                     *next_frame_id += 1;
-                    while stacks.len() <= ring_idx {
-                        stacks.push(ShadowStack::new());
-                    }
-                    stacks[ring_idx].push_call(fid, ev.addr, func.name.clone());
+                    let tid = ev.thread_id;
+                    stacks.entry(tid).or_insert_with(ShadowStack::new)
+                        .push_call(fid, ev.addr, func.name.clone());
                     for (li, l) in func.locals.iter().enumerate() {
                         let addr = (ev.value as i64 + l.frame_offset) as u64;
                         let nid = NodeId::Local(fid, li as u16);
@@ -75,8 +74,9 @@ fn process_event(
             }
         }
         EVENT_RETURN => {
-            if ring_idx < stacks.len() {
-                if let Some(frame) = stacks[ring_idx].pop_return() {
+            let tid = ev.thread_id;
+            if let Some(stack) = stacks.get_mut(&tid) {
+                if let Some(frame) = stack.pop_return() {
                     addr_index.remove_frame(frame.frame_id);
                     returned_frames.push_back(frame.frame_id);
                     // evict oldest retained frames to bound memory
@@ -152,7 +152,7 @@ fn populate_globals(
 fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
-    let mut stacks: Vec<ShadowStack> = Vec::new();
+    let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
     let mut next_frame_id: FrameId = 1;
     let mut total: u64 = 0;
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
@@ -267,7 +267,7 @@ fn run_headless(
     min_events: u64,
     addr_index: &mut AddressIndex,
     world: &mut WorldState,
-    stacks: &mut Vec<ShadowStack>,
+    stacks: &mut HashMap<u16, ShadowStack>,
     next_frame_id: &mut FrameId,
     total: &mut u64,
     journal: &mut VecDeque<JournalEntry>,

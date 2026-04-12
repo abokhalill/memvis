@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // ratatui interactive TUI for memvis
 
-use std::collections::{HashSet, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io;
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers};
@@ -318,7 +318,7 @@ pub fn draw(
     fill_pct: u32,
     state: &mut AppState,
     snap_total: usize,
-    stacks: &[ShadowStack],
+    stacks: &HashMap<u16, ShadowStack>,
 ) {
     state.snap_count = snap_total;
     let mem_lines = build_mem_lines(world);
@@ -469,12 +469,15 @@ pub fn draw(
 
         // call stack panel
         let mut stack_lines: Vec<Line> = Vec::new();
-        for (ti, stack) in stacks.iter().enumerate() {
+        let mut sorted_tids: Vec<u16> = stacks.keys().copied().collect();
+        sorted_tids.sort();
+        for tid in &sorted_tids {
+            let stack = &stacks[tid];
             if stack.frames.is_empty() && stack.max_depth == 0 { continue; }
             let depth_str = if stack.frames.is_empty() {
-                format!("T{} (idle, max={})", ti, stack.max_depth)
+                format!("T{} (idle, max={})", tid, stack.max_depth)
             } else {
-                format!("T{} depth={}", ti, stack.frames.len())
+                format!("T{} depth={}", tid, stack.frames.len())
             };
             stack_lines.push(Line::from(vec![
                 Span::styled(format!("  {}", depth_str), Style::default().fg(Color::Cyan)),
