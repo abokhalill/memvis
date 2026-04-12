@@ -26,6 +26,7 @@ static _Atomic uint64_t g_stat_returns      = 0;
 static _Atomic uint64_t g_stat_shed         = 0;
 static _Atomic uint64_t g_stat_dropped      = 0;
 static _Atomic uint64_t g_stat_reg_snaps    = 0;
+static _Atomic uint64_t g_stat_rdbuf_flushes = 0;
 
 static _Atomic uint16_t g_next_thread_id    = 0;
 
@@ -172,6 +173,18 @@ at_mem_read_buf(uint64_t addr, uint32_t size)
     buf->entries[idx].size = size;
 }
 
+static void flush_read_buf(void);
+
+static void
+flush_read_buf_if_needed(int needed)
+{
+    void *drcontext = dr_get_current_drcontext();
+    read_buf_t *buf = (read_buf_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF]);
+    if (!buf || (int)buf->count + needed <= RDBUF_CAP) return;
+    // delegate to full flush
+    flush_read_buf();
+}
+
 static void
 flush_read_buf(void)
 {
@@ -204,6 +217,7 @@ flush_read_buf(void)
             atomic_fetch_add_explicit(&g_stat_shed, 1, memory_order_relaxed);
     }
     buf->count = 0;
+    atomic_fetch_add_explicit(&g_stat_rdbuf_flushes, 1, memory_order_relaxed);
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
 }
 
@@ -339,8 +353,19 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
         }
     }
 
-    // buffer reads into TLS
+    // buffer reads into TLS; flush mid-BB if buffer would overflow
     if (instr_reads_memory(instr)) {
+        // count how many mem-read operands this instr has
+        int rd_ops = 0;
+        for (int i = 0; i < instr_num_srcs(instr); i++) {
+            if (opnd_is_memory_reference(instr_get_src(instr, i))) rd_ops++;
+        }
+        // if this instr's reads would overflow the buffer, flush first
+        if (rd_ops > 0) {
+            dr_insert_clean_call(drcontext, bb, instr,
+                                 (void *)flush_read_buf_if_needed, false, 1,
+                                 OPND_CREATE_INT32(rd_ops));
+        }
         for (int i = 0; i < instr_num_srcs(instr); i++) {
             opnd_t src = instr_get_src(instr, i);
             if (!opnd_is_memory_reference(src))
@@ -365,9 +390,9 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
         }
     }
 
-    // flush read buffer once at the last instruction of BB
+    // flush read buffer at the last app instruction of BB
     bool bb_has_reads = (bool)(uintptr_t)user_data;
-    if (bb_has_reads && instr_get_next(instr) == NULL) {
+    if (bb_has_reads && instr_get_next_app(instr) == NULL) {
         dr_insert_clean_call(drcontext, bb, instr,
                              (void *)flush_read_buf, false, 0);
     }
@@ -459,6 +484,7 @@ event_exit(void)
     dr_printf("memvis:   shed:    %llu\n", (unsigned long long)atomic_load(&g_stat_shed));
     dr_printf("memvis:   dropped: %llu\n", (unsigned long long)atomic_load(&g_stat_dropped));
     dr_printf("memvis:   regsnap: %llu\n", (unsigned long long)atomic_load(&g_stat_reg_snaps));
+    dr_printf("memvis:   rdflush: %llu\n", (unsigned long long)atomic_load(&g_stat_rdbuf_flushes));
     dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
 
     unmap_ctl_ring();
