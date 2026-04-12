@@ -184,6 +184,12 @@ impl WorldState {
         true
     }
 
+    pub fn update_node_addr(&mut self, id: NodeId, addr: u64) {
+        if let Some(node) = self.cow().nodes.get_mut(&id) {
+            node.addr = addr;
+        }
+    }
+
     pub fn remove_node(&mut self, id: NodeId) {
         let inner = self.cow();
         inner.nodes.remove(&id);
@@ -228,6 +234,8 @@ impl WorldState {
             }
         }
     }
+
+    pub fn regs(&self) -> [u64; REG_COUNT] { self.inner.reg_file.values }
 
     pub fn update_regs(&mut self, regs: [u64; REG_COUNT], insn: u64) {
         self.cow().reg_file.update(regs, insn);
