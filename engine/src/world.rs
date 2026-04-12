@@ -74,10 +74,13 @@ impl CacheLineTracker {
             .unwrap_or(0)
     }
 
-    // decay: halve write counts, clear lines with zero activity
+    // decay: halve write counts, clear stale writers, evict dead entries
     pub fn tick(&mut self) {
         self.lines.retain(|_, e| {
             e.write_count /= 2;
+            if e.write_count == 0 {
+                e.writers.clear();
+            }
             e.write_count > 0
         });
     }
