@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: MIT
 // ratatui interactive TUI for memvis
 
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{HashMap, VecDeque};
 use std::io;
 
 use crossterm::event::{self, Event as CEvent, KeyCode, KeyModifiers};
@@ -12,6 +12,7 @@ use crossterm::terminal::{
 use ratatui::prelude::*;
 use ratatui::widgets::*;
 
+use crate::heap_graph::HeapGraph;
 use crate::index::NodeId;
 use crate::shadow_regs::{Confidence, ShadowRegisterFile};
 use crate::world::{ShadowStack, WorldInner, REG_COUNT, REG_NAMES};
@@ -423,6 +424,7 @@ pub fn draw(
     stacks: &HashMap<u16, ShadowStack>,
     seq_gaps: u64,
     shadow_regs: &HashMap<u16, ShadowRegisterFile>,
+    heap_graph: &HeapGraph,
 ) {
     state.snap_count = snap_total;
     let mem_lines = build_mem_lines(world);
@@ -714,49 +716,74 @@ pub fn draw(
         );
         f.render_widget(stack_widget, right[1]);
 
-        // pointer edges panel
-        let mut edge_lines: Vec<Line> = Vec::new();
-        let mut seen: HashSet<(String, u64)> = HashSet::new();
-        for (src, edge) in &world.edges {
-            let src_name = world
-                .nodes
-                .get(src)
-                .map(|n| n.name.clone())
-                .unwrap_or_default();
-            let key = (src_name.clone(), edge.ptr_value);
-            if !seen.insert(key) {
-                continue;
-            }
-            let tgt_name = world
-                .nodes
-                .get(&edge.target)
-                .map(|n| n.name.as_str())
-                .unwrap_or("?");
-            let mut spans = vec![
-                Span::styled(format!("  {}", src_name), Style::default().fg(Color::Cyan)),
-                Span::styled(" ──> ", Style::default().fg(Color::Magenta)),
-                Span::styled(tgt_name.to_string(), Style::default().fg(Color::Cyan)),
+        // heap objects panel
+        let heap_objs = heap_graph.objects();
+        let mut heap_lines: Vec<Line> = Vec::new();
+        if heap_objs.is_empty() {
+            heap_lines.push(Line::from(Span::styled(
+                "  (no heap objects discovered)",
+                Style::default().fg(Color::DarkGray),
+            )));
+        } else {
+            heap_lines.push(Line::from(vec![
                 Span::styled(
-                    format!(" (0x{:x})", edge.ptr_value),
+                    format!("  {} objects", heap_objs.len()),
+                    Style::default().fg(Color::Cyan),
+                ),
+                Span::styled(
+                    format!("  {} edges", heap_graph.edge_count()),
                     Style::default().fg(Color::DarkGray),
                 ),
-            ];
-            if edge.is_dangling {
-                spans.push(Span::styled(
-                    " DANGLING",
-                    Style::default().fg(Color::White).bg(Color::Red),
-                ));
+            ]));
+            // show up to 8 most recently written objects
+            let mut sorted: Vec<_> = heap_objs.values().collect();
+            sorted.sort_by(|a, b| b.last_seq.cmp(&a.last_seq));
+            for obj in sorted.iter().take(8) {
+                let type_str = obj.inferred_type.as_deref().unwrap_or("?");
+                let conf_pct = (obj.type_confidence * 100.0) as u32;
+                let conf_color = if conf_pct >= 80 {
+                    Color::Green
+                } else if conf_pct >= 50 {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                heap_lines.push(Line::from(vec![
+                    Span::styled(
+                        format!("  {:>12x}", obj.base_addr),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!(" {:>4}B", obj.inferred_size),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled(
+                        format!(" {:<16}", type_str),
+                        Style::default().fg(Color::Cyan),
+                    ),
+                    Span::styled(
+                        format!(" {}%", conf_pct),
+                        Style::default().fg(conf_color),
+                    ),
+                    Span::styled(
+                        format!(" {}F", obj.fields.len()),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!(" {}E", obj.outgoing_edges.len()),
+                        Style::default().fg(Color::Magenta),
+                    ),
+                ]));
             }
-            edge_lines.push(Line::from(spans));
         }
-        let edge_widget = Paragraph::new(edge_lines).block(
+        let heap_widget = Paragraph::new(heap_lines).block(
             Block::default()
-                .title(" Pointer Edges ")
+                .title(" Heap Objects ")
                 .title_style(Style::default().fg(Color::White).bold())
                 .borders(Borders::ALL)
                 .border_style(Style::default().fg(Color::DarkGray)),
         );
-        f.render_widget(edge_widget, right[2]);
+        f.render_widget(heap_widget, right[2]);
 
         // footer
         let footer = Paragraph::new(Line::from(vec![
