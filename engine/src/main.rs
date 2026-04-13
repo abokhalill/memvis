@@ -19,6 +19,7 @@ const EVENT_RETURN: u8 = 3;
 const EVENT_REG_SNAPSHOT: u8 = 5;
 const EVENT_CACHE_MISS: u8 = 6;
 const EVENT_MODULE_LOAD: u8 = 7;
+const EVENT_RELOAD: u8 = 12;
 
 // returns true if event was "interesting" (tracked write, or control event)
 #[inline]
@@ -53,6 +54,13 @@ fn process_event(
                     .entry(ev.thread_id)
                     .or_insert_with(ShadowRegisterFile::new);
                 srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
+            }
+            // cross-thread coherence: check if this write invalidates any other
+            // thread's register that was loaded from this address.
+            for (&tid, srf) in shadow_regs.iter_mut() {
+                if tid != ev.thread_id {
+                    srf.check_coherence(ev.addr, ev.value, ev.seq as u64);
+                }
             }
             // heap graph: feed writes to heap addresses
             if heap_oracle.is_heap(ev.addr) {
@@ -171,6 +179,15 @@ fn process_event(
             if let Some(h) = addr_index.lookup(ev.addr) {
                 world.record_cache_miss(h.node_id);
             }
+            true
+        }
+        EVENT_RELOAD => {
+            // semantic reload: MOV reg, [mem]. flags byte = dest register index.
+            let reg_idx = ((ev.kind_flags >> 8) & 0xFF) as usize;
+            let srf = shadow_regs
+                .entry(ev.thread_id)
+                .or_insert_with(ShadowRegisterFile::new);
+            srf.on_reload(reg_idx, ev.value, ev.addr, ev.seq as u64, ev.addr);
             true
         }
         EVENT_MODULE_LOAD => {
