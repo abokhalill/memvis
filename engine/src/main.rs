@@ -8,6 +8,7 @@ use std::{env, thread, time};
 use memvis::dwarf::{self, DwarfInfo};
 use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::ring::{Event, RingOrchestrator};
+use memvis::shadow_regs::ShadowRegisterFile;
 use memvis::tui::{self, AppState, JournalEntry};
 use memvis::world::{ShadowStack, SnapshotRing, WorldState, REG_COUNT};
 
@@ -32,11 +33,24 @@ fn process_event(
     next_frame_id: &mut FrameId,
     relocation_delta: &mut Option<u64>,
     returned_frames: &mut VecDeque<FrameId>,
+    shadow_regs: &mut HashMap<u16, ShadowRegisterFile>,
 ) -> bool {
     let ev_kind = ev.kind();
     match ev_kind {
         EVENT_WRITE => {
             world.record_cl_write(ev.addr, ev.thread_id);
+            // SRF write-back correlation
+            if let Some(ref info) = dwarf_info {
+                let elf_pc = match *relocation_delta {
+                    Some(d) => ev.addr.wrapping_sub(d),
+                    None => ev.addr,
+                };
+                let func = info.func_containing(elf_pc);
+                let srf = shadow_regs
+                    .entry(ev.thread_id)
+                    .or_insert_with(ShadowRegisterFile::new);
+                srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
+            }
             if let Some(h) = addr_index.lookup(ev.addr) {
                 let nid = h.node_id;
                 world.ensure_node(nid, h.name, h.type_info, ev.addr, ev.size as u64);
@@ -54,6 +68,13 @@ fn process_event(
             false
         }
         EVENT_CALL => {
+            // SRF: push call frame. ev.addr = callee_pc, ev.value = rsp/frame_base
+            {
+                let srf = shadow_regs
+                    .entry(ev.thread_id)
+                    .or_insert_with(ShadowRegisterFile::new);
+                srf.on_call(ev.addr, ev.value, ev.seq as u64);
+            }
             if let Some(ref info) = dwarf_info {
                 let elf_pc = match *relocation_delta {
                     Some(d) => ev.addr.wrapping_sub(d),
@@ -98,6 +119,13 @@ fn process_event(
             true
         }
         EVENT_RETURN => {
+            // SRF: pop call frame
+            {
+                let srf = shadow_regs
+                    .entry(ev.thread_id)
+                    .or_insert_with(ShadowRegisterFile::new);
+                srf.on_return(ev.seq as u64, ev.addr);
+            }
             let tid = ev.thread_id;
             if let Some(stack) = stacks.get_mut(&tid) {
                 if let Some(frame) = stack.pop_return() {
@@ -122,6 +150,11 @@ fn process_event(
                     regs[s * 3 + 2] = cont[s].value;
                 }
                 world.update_regs(regs, ev.addr);
+                // SRF: ground-truth anchor
+                let srf = shadow_regs
+                    .entry(ev.thread_id)
+                    .or_insert_with(ShadowRegisterFile::new);
+                srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
             }
             true
         }
@@ -197,6 +230,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let mut returned_frames: VecDeque<FrameId> = VecDeque::with_capacity(64);
     let mut expected_seq: HashMap<u16, u16> = HashMap::new();
     let mut seq_gaps: u64 = 0;
+    let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
 
     if let Some(ref info) = dwarf_info {
         populate_globals(info, 0, &mut addr_index, &mut world);
@@ -216,6 +250,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             &mut journal,
             &mut relocation_delta,
             &mut returned_frames,
+            &mut shadow_regs,
         );
         return;
     }
@@ -275,6 +310,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                     &mut next_frame_id,
                     &mut relocation_delta,
                     &mut returned_frames,
+                    &mut shadow_regs,
                 );
                 if interesting {
                     journal.push_back(JournalEntry {
@@ -332,6 +368,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                 snap_total,
                 &stacks,
                 seq_gaps,
+                &shadow_regs,
             );
             last_render = now;
         }
@@ -359,6 +396,7 @@ fn run_headless(
     journal: &mut VecDeque<JournalEntry>,
     relocation_delta: &mut Option<u64>,
     returned_frames: &mut VecDeque<FrameId>,
+    shadow_regs: &mut HashMap<u16, ShadowRegisterFile>,
 ) {
     use std::io::Write;
     let stdout = io::stdout();
@@ -396,6 +434,7 @@ fn run_headless(
                 next_frame_id,
                 relocation_delta,
                 returned_frames,
+                shadow_regs,
             );
             if interesting {
                 journal.push_back(JournalEntry {
