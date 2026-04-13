@@ -509,10 +509,6 @@ static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
     GOT_SIGNAL.store(true, AtomicOrdering::SeqCst);
-    let pid = TRACER_PID.load(AtomicOrdering::SeqCst);
-    if pid > 0 {
-        unsafe { libc::kill(pid, libc::SIGTERM); }
-    }
 }
 
 fn install_signal_handlers() {
