@@ -18,7 +18,7 @@
 
 #define MEMVIS_CACHE_LINE    64
 #define MEMVIS_MAGIC         0x4D454D56495342ULL  /* "MEMVISB\0" */
-#define MEMVIS_PROTO_VERSION 2
+#define MEMVIS_PROTO_VERSION 3
 #define MEMVIS_SHM_NAME      "/memvis_ring"
 #define MEMVIS_SHM_ENV       "MEMVIS_SHM_PATH"
 
@@ -30,6 +30,10 @@
 #define MEMVIS_EVENT_REG_SNAPSHOT 5
 #define MEMVIS_EVENT_CACHE_MISS   6
 #define MEMVIS_EVENT_MODULE_LOAD  7
+#define MEMVIS_EVENT_TAIL_CALL    8
+#define MEMVIS_EVENT_ALLOC        9
+#define MEMVIS_EVENT_FREE        10
+#define MEMVIS_EVENT_BB_ENTRY    11
 
 #define MEMVIS_REG_SNAPSHOT_SLOTS 7
 
@@ -53,20 +57,65 @@
 #define MEMVIS_REG_RFLAGS 17
 #define MEMVIS_REG_COUNT 18
 
-// backpressure thresholds in 8ths of capacity
-#define MEMVIS_BP_HIGH_WATER  6
+#define MEMVIS_BP_HIGH_WATER  6  // 6/8 capacity
 #define MEMVIS_BP_LOW_WATER   3
 
+#define MEMVIS_RAW_TLS_SLOTS     8
+#define MEMVIS_RAW_SLOT_RING     0
+#define MEMVIS_RAW_SLOT_HEAD     1
+#define MEMVIS_RAW_SLOT_SEQ      2
+#define MEMVIS_RAW_SLOT_TID      3
+#define MEMVIS_RAW_SLOT_BP       4
+#define MEMVIS_RAW_SLOT_SCRATCH  5
+#define MEMVIS_RAW_SLOT_RDBUF    6
+#define MEMVIS_RAW_SLOT_GUARD    7
+
+#define MEMVIS_HEAD_FLUSH_MASK  0x3F
+
+// predictable spill pad: drreg fallback. one cache line per thread.
+typedef struct __attribute__((aligned(MEMVIS_CACHE_LINE))) {
+    uint64_t scratch[2];
+    uint64_t ring_data;
+    uint32_t ring_mask;
+    uint32_t _pad;
+} memvis_scratch_pad_t;
+
+_Static_assert(sizeof(memvis_scratch_pad_t) == MEMVIS_CACHE_LINE, "");
+
+// v2 layout (compat)
 typedef struct __attribute__((aligned(32))) {
     uint64_t addr;
     uint32_t size;
     uint16_t thread_id;
     uint16_t seq;
     uint64_t value;
-    uint64_t kind_flags;  /* kind:8 | flags:8 | reserved:48 */
+    uint64_t kind_flags;
 } memvis_event_t;
 
-_Static_assert(sizeof(memvis_event_t) == 32, "event must be 32 bytes");
+_Static_assert(sizeof(memvis_event_t) == 32, "");
+
+// v3: +rip_lo, extended seq
+typedef struct __attribute__((aligned(32))) {
+    uint64_t addr;
+    uint32_t size;
+    uint16_t thread_id;
+    uint16_t seq_lo;
+    uint64_t value;
+    uint32_t kind_flags;  // kind:8 | flags:8 | seq_hi:16
+    uint32_t rip_lo;      // app PC offset from module base
+} memvis_event_v3_t;
+
+_Static_assert(sizeof(memvis_event_v3_t) == 32, "");
+
+static inline uint8_t memvis_v3_kind(const memvis_event_v3_t *e) {
+    return (uint8_t)(e->kind_flags & 0xFF);
+}
+static inline uint32_t memvis_v3_seq(const memvis_event_v3_t *e) {
+    return (uint32_t)e->seq_lo | ((uint32_t)(e->kind_flags >> 16) << 16);
+}
+static inline uint32_t memvis_v3_make_kf(uint8_t kind, uint8_t flags, uint16_t seq_hi) {
+    return (uint32_t)kind | ((uint32_t)flags << 8) | ((uint32_t)seq_hi << 16);
+}
 
 static inline uint8_t memvis_event_kind(const memvis_event_t *e) {
     return (uint8_t)(e->kind_flags & 0xFF);
@@ -229,7 +278,7 @@ static inline void memvis_push_overflow(memvis_ring_header_t *ring,
     memvis_push_ex(ring, insn_counter, 0, 0, MEMVIS_EVENT_OVERFLOW, thread_id, seq);
 }
 
-/* Control ring: thread ring discovery protocol  */
+// ctl ring: thread discovery
 
 #define MEMVIS_CTL_SHM_NAME     "/memvis_ctl"
 #define MEMVIS_CTL_MAGIC        0x4D56435430303032ULL  /* "MVCTL002" */
