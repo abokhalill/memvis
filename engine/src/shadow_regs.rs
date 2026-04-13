@@ -23,16 +23,18 @@ fn dwarf_reg_to_idx(dwarf_reg: u16) -> Option<usize> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum Confidence {
     Unknown = 0,
-    Speculative = 1,
-    WriteBack = 2,
-    AbiInferred = 3,
-    Observed = 4,
+    Stale = 1,
+    Speculative = 2,
+    WriteBack = 3,
+    AbiInferred = 4,
+    Observed = 5,
 }
 
 impl Confidence {
     pub fn label(self) -> &'static str {
         match self {
             Confidence::Unknown => "???",
+            Confidence::Stale => "STALE",
             Confidence::Speculative => "spec",
             Confidence::WriteBack => "wb",
             Confidence::AbiInferred => "abi",
@@ -43,11 +45,16 @@ impl Confidence {
     pub fn bar_tenths(self) -> u8 {
         match self {
             Confidence::Unknown => 0,
+            Confidence::Stale => 2,
             Confidence::Speculative => 5,
             Confidence::WriteBack => 7,
             Confidence::AbiInferred => 9,
             Confidence::Observed => 10,
         }
+    }
+
+    pub fn is_stale(self) -> bool {
+        self == Confidence::Stale
     }
 }
 
@@ -57,6 +64,7 @@ pub enum Provenance {
     CalleeSaved { since_seq: u64 },
     AbiArg { callee_pc: u64, arg_index: u8 },
     WriteBack { write_seq: u64, retroactive_pc: u64 },
+    Reload { from_addr: u64, reload_seq: u64 },
     Copy { from_idx: usize, when_seq: u64 },
     ReturnValue { callee_pc: u64, ret_seq: u64 },
     Unknown,
@@ -69,6 +77,8 @@ pub struct ShadowReg {
     pub confidence: Confidence,
     pub last_seq: u64,
     pub last_pc: u64,
+    // memory address this register was loaded from (for coherence checks)
+    pub mem_source: Option<u64>,
 }
 
 impl ShadowReg {
@@ -79,6 +89,7 @@ impl ShadowReg {
             confidence: Confidence::Unknown,
             last_seq: 0,
             last_pc: 0,
+            mem_source: None,
         }
     }
 
@@ -88,6 +99,8 @@ impl ShadowReg {
         self.confidence = conf;
         self.last_seq = seq;
         self.last_pc = pc;
+        // clear source unless caller sets it explicitly
+        self.mem_source = None;
     }
 }
 
@@ -231,6 +244,39 @@ impl ShadowRegisterFile {
         for &idx in &CALLER_SAVED {
             if idx == 0 { continue; }
             self.regs[idx] = frame.saved_regs[idx].clone();
+        }
+    }
+
+    // semantic reload: MOV reg, [mem] captured by tracer's selective instrumenter.
+    // ground-truth anchor: we know the register's exact value and source address.
+    pub fn on_reload(&mut self, reg_idx: usize, value: u64, from_addr: u64, seq: u64, pc: u64) {
+        if reg_idx >= REG_COUNT { return; }
+        self.regs[reg_idx].set(
+            value,
+            Provenance::Reload { from_addr, reload_seq: seq },
+            Confidence::Observed,
+            seq,
+            pc,
+        );
+        self.regs[reg_idx].mem_source = Some(from_addr);
+    }
+
+    // dirty-shadow coherence check: called on every WRITE event.
+    // if any register's mem_source matches the written address, and the write
+    // came from a *different* thread (foreign_tid != self_tid), mark it Stale.
+    // also marks stale if same thread wrote a different value to the source.
+    pub fn check_coherence(&mut self, written_addr: u64, written_value: u64, _write_seq: u64) {
+        for i in 0..REG_COUNT {
+            if let Some(src) = self.regs[i].mem_source {
+                // check if written address overlaps the source (8-byte window)
+                if written_addr <= src && src < written_addr + 8 {
+                    if self.regs[i].value != written_value
+                        && self.regs[i].confidence > Confidence::Stale
+                    {
+                        self.regs[i].confidence = Confidence::Stale;
+                    }
+                }
+            }
         }
     }
 
@@ -659,6 +705,63 @@ mod tests {
         assert_eq!(frags.len(), 1);
         assert_eq!(frags[0].var_offset, 0);
         assert!(matches!(frags[0].source, PieceSource::Register(3)));
+    }
+
+    #[test]
+    fn test_reload_sets_observed_and_mem_source() {
+        let mut srf = ShadowRegisterFile::new();
+        // R12 = idx 12. load from 0x5555_0000_1000
+        srf.on_reload(12, 0xCAFEBABE, 0x5555_0000_1000, 100, 0x4000);
+        assert_eq!(srf.regs[12].value, 0xCAFEBABE);
+        assert_eq!(srf.regs[12].confidence, Confidence::Observed);
+        assert_eq!(srf.regs[12].mem_source, Some(0x5555_0000_1000));
+        assert!(matches!(srf.regs[12].provenance, Provenance::Reload { .. }));
+    }
+
+    #[test]
+    fn test_coherence_marks_stale_on_foreign_write() {
+        let mut srf = ShadowRegisterFile::new();
+        // simulate reload: R12 loaded from 0x5555_0000_1000
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
+        assert_eq!(srf.regs[12].confidence, Confidence::Observed);
+
+        // foreign thread writes a *different* value to the same address
+        srf.check_coherence(0x5555_0000_1000, 0xBBBB, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Stale);
+        assert!(srf.regs[12].confidence.is_stale());
+    }
+
+    #[test]
+    fn test_coherence_no_stale_if_same_value() {
+        let mut srf = ShadowRegisterFile::new();
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
+
+        // write same value: no staleness
+        srf.check_coherence(0x5555_0000_1000, 0xAAAA, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Observed);
+    }
+
+    #[test]
+    fn test_coherence_no_stale_if_unrelated_address() {
+        let mut srf = ShadowRegisterFile::new();
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
+
+        // write to unrelated address
+        srf.check_coherence(0x5555_0000_2000, 0xBBBB, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Observed);
+    }
+
+    #[test]
+    fn test_reload_clears_stale() {
+        let mut srf = ShadowRegisterFile::new();
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
+        srf.check_coherence(0x5555_0000_1000, 0xBBBB, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Stale);
+
+        // fresh reload restores Observed
+        srf.on_reload(12, 0xBBBB, 0x5555_0000_1000, 300, 0x4010);
+        assert_eq!(srf.regs[12].confidence, Confidence::Observed);
+        assert_eq!(srf.regs[12].value, 0xBBBB);
     }
 
     #[test]
