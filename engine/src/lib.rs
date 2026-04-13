@@ -1,5 +1,6 @@
 // SPDX-License-Identifier: MIT
 pub mod dwarf;
+pub mod heap_graph;
 pub mod index;
 pub mod ring;
 pub mod shadow_regs;
