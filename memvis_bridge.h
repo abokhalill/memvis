@@ -73,15 +73,28 @@
 
 #define MEMVIS_HEAD_FLUSH_MASK  0x3F
 
-// predictable spill pad: drreg fallback. one cache line per thread.
+// predictable spill pad + ambient per-thread stats. two cache lines per thread.
+// line 0: scratch, ring_data, ring_mask (hot — touched every inline write)
+// line 1: per-thread stat counters (warm — incremented inline, read at exit)
 typedef struct __attribute__((aligned(MEMVIS_CACHE_LINE))) {
-    uint64_t scratch[2];
-    uint64_t ring_data;
-    uint32_t ring_mask;
-    uint32_t _pad;
+    // --- cache line 0: hot path ---
+    uint64_t scratch[2];       
+    uint64_t ring_data;        
+    uint32_t ring_mask;         
+    uint32_t _pad0;             
+    uint64_t _cl0_reserved[4];  
+    // --- cache line 1: ambient telemetry ---
+    uint64_t stat_inline_writes;
+    uint64_t stat_write_slow;       // page-straddling writes (clean call)
+    uint64_t stat_reads;
+    uint64_t stat_reloads;
+    uint64_t stat_calls;
+    uint64_t stat_returns;
+    uint64_t stat_tail_calls;
+    uint64_t stat_dropped;
 } memvis_scratch_pad_t;
 
-_Static_assert(sizeof(memvis_scratch_pad_t) == MEMVIS_CACHE_LINE, "");
+_Static_assert(sizeof(memvis_scratch_pad_t) == 2 * MEMVIS_CACHE_LINE, "");
 
 // v2 layout (compat)
 typedef struct __attribute__((aligned(32))) {
