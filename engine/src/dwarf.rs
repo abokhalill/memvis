@@ -415,6 +415,18 @@ pub struct DwarfInfo {
     pub elf_base_vaddr: u64, // lowest PT_LOAD vaddr (0 for PIE)
 }
 
+impl DwarfInfo {
+    // range lookup: find function containing pc via BTreeMap upper_bound.
+    pub fn func_containing(&self, pc: u64) -> Option<&FunctionMeta> {
+        use std::ops::Bound;
+        self.functions
+            .range((Bound::Unbounded, Bound::Included(&pc)))
+            .next_back()
+            .map(|(_, f)| f)
+            .filter(|f| pc < f.high_pc)
+    }
+}
+
 fn attr_name<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
