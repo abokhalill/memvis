@@ -1,5 +1,44 @@
 // SPDX-License-Identifier: MIT
-// ghost v3 tracer. inline write events, clean-call CALL/RET.
+// Ghost v3 tracer. inline write events, clean call CALL/RET.
+
+#include <stddef.h>
+
+#include "memvis_bridge.h"
+
+// static offset manifest — compile-time struct layout, not runtime.
+// hard-contract: _Static_assert catches bridge/pad drift at build time.
+
+#define OFF_PAD_SCRATCH0   ((int)offsetof(memvis_scratch_pad_t, scratch[0]))
+#define OFF_PAD_SCRATCH1   ((int)offsetof(memvis_scratch_pad_t, scratch[1]))
+#define OFF_PAD_RING_MASK  ((int)offsetof(memvis_scratch_pad_t, ring_mask))
+#define OFF_PAD_RING_DATA  ((int)offsetof(memvis_scratch_pad_t, ring_data))
+
+_Static_assert(offsetof(memvis_scratch_pad_t, scratch[0]) ==  0, "pad.scratch[0] drift");
+_Static_assert(offsetof(memvis_scratch_pad_t, ring_data)  == 16, "pad.ring_data drift");
+_Static_assert(offsetof(memvis_scratch_pad_t, ring_mask)  == 24, "pad.ring_mask drift");
+
+#define OFF_EV3_ADDR       ((int)offsetof(memvis_event_v3_t, addr))
+#define OFF_EV3_SIZE       ((int)offsetof(memvis_event_v3_t, size))
+#define OFF_EV3_THREAD_ID  ((int)offsetof(memvis_event_v3_t, thread_id))
+#define OFF_EV3_SEQ_LO     ((int)offsetof(memvis_event_v3_t, seq_lo))
+#define OFF_EV3_VALUE      ((int)offsetof(memvis_event_v3_t, value))
+#define OFF_EV3_KIND_FLAGS ((int)offsetof(memvis_event_v3_t, kind_flags))
+#define OFF_EV3_RIP_LO     ((int)offsetof(memvis_event_v3_t, rip_lo))
+
+_Static_assert(offsetof(memvis_event_v3_t, addr)       ==  0, "ev3.addr drift");
+_Static_assert(offsetof(memvis_event_v3_t, size)       ==  8, "ev3.size drift");
+_Static_assert(offsetof(memvis_event_v3_t, thread_id)  == 12, "ev3.thread_id drift");
+_Static_assert(offsetof(memvis_event_v3_t, seq_lo)     == 14, "ev3.seq_lo drift");
+_Static_assert(offsetof(memvis_event_v3_t, value)      == 16, "ev3.value drift");
+_Static_assert(offsetof(memvis_event_v3_t, kind_flags) == 24, "ev3.kind_flags drift");
+_Static_assert(offsetof(memvis_event_v3_t, rip_lo)     == 28, "ev3.rip_lo drift");
+_Static_assert(sizeof(memvis_event_v3_t)               == 32, "ev3 size drift");
+
+#define OFF_RING_HEAD      ((int)offsetof(memvis_ring_header_t, head))
+#define OFF_RING_TAIL      ((int)offsetof(memvis_ring_header_t, tail))
+
+_Static_assert(offsetof(memvis_ring_header_t, head) == 1 * MEMVIS_CACHE_LINE, "ring.head drift");
+_Static_assert(offsetof(memvis_ring_header_t, tail) == 2 * MEMVIS_CACHE_LINE, "ring.tail drift");
 
 #include "dr_api.h"
 #include "drmgr.h"
@@ -12,8 +51,6 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
-
-#include "memvis_bridge.h"
 
 static memvis_ctl_header_t *g_ctl     = NULL;
 static int                  g_ctl_fd  = -1;
@@ -58,6 +95,17 @@ static reg_id_t g_raw_tls_seg;
 static uint     g_raw_tls_off;
 #define RAW_TLS(slot) (g_raw_tls_off + (slot) * sizeof(void *))
 
+// clean-call raw TLS access via segment base + offset pointer arithmetic.
+// dr_raw_tls_get/set_value don't exist in this SDK; use segment base directly.
+static inline void *raw_tls_get(void *drcontext, uint off) {
+    void **base = (void **)dr_get_dr_segment_base(g_raw_tls_seg);
+    return *(void **)((char *)base + off);
+}
+static inline void raw_tls_set(void *drcontext, uint off, void *val) {
+    void **base = (void **)dr_get_dr_segment_base(g_raw_tls_seg);
+    *(void **)((char *)base + off) = val;
+}
+
 static void
 map_ctl_ring(void)
 {
@@ -73,197 +121,136 @@ map_ctl_ring(void)
         memvis_ctl_init(g_ctl);
 }
 
-// predictable spill: deterministic RAX/RCX fallback when drreg fails.
+// cross-instruction state for the memval_simple pattern.
+// pre-write reserves reg_addr (EA) at instr N; post-write unreserves at instr N+1.
 typedef struct {
-    reg_id_t r1;
-    reg_id_t r2;
-    bool r1_from_drreg;
-    bool r2_from_drreg;
-} scratch_pair_t;
+    reg_id_t reg_addr;  // drreg-reserved, holds EA across app instr
+    bool     has_reads; // from analysis pass
+} instru_data_t;
 
-static scratch_pair_t
-acquire_scratch_pair(void *drcontext, instrlist_t *bb, instr_t *where)
-{
-    scratch_pair_t sp = { DR_REG_NULL, DR_REG_NULL, false, false };
-
-    if (drreg_reserve_register(drcontext, bb, where, NULL, &sp.r1) == DRREG_SUCCESS) {
-        sp.r1_from_drreg = true;
-    } else {
-        sp.r1 = DR_REG_RAX;
-        sp.r1_from_drreg = false;
-        // spill rax to raw TLS slot (repurposed as 64-bit spill)
-        instrlist_meta_preinsert(bb, where,
-            XINST_CREATE_store(drcontext,
-                dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                    RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH)),
-                opnd_create_reg(DR_REG_RAX)));
-        instrlist_meta_preinsert(bb, where,
-            INSTR_CREATE_mov_st(drcontext,
-                opnd_create_base_disp(sp.r1, DR_REG_NULL, 0, 0, OPSZ_0),
-                opnd_create_reg(sp.r1)));
-    }
-
-    if (drreg_reserve_register(drcontext, bb, where, NULL, &sp.r2) == DRREG_SUCCESS) {
-        sp.r2_from_drreg = true;
-    } else {
-        sp.r2 = (sp.r1 == DR_REG_RAX) ? DR_REG_RCX : DR_REG_RAX;
-        sp.r2_from_drreg = false;
-        // spill r2 to GUARD slot (unused during inline emit)
-        instrlist_meta_preinsert(bb, where,
-            XINST_CREATE_store(drcontext,
-                dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                    RAW_TLS(MEMVIS_RAW_SLOT_GUARD)),
-                opnd_create_reg(sp.r2)));
-    }
-
-    return sp;
-}
-
+// pre write: check ring/bp, compute slot, store event fields, save slot ptr.
+// reg_addr holds the EA (from drutil). scratch is a second drreg reg.
+// on skip (ring null / backpressure), stores 0 to pad.scratch[1].
+// on success, stores event slot ptr to pad.scratch[1].
+// restores EA into reg_addr so the app write executes with correct address.
 static void
-release_scratch_pair(void *drcontext, instrlist_t *bb, instr_t *where,
-                     scratch_pair_t *sp)
-{
-    if (sp->r2_from_drreg) {
-        drreg_unreserve_register(drcontext, bb, where, sp->r2);
-    } else {
-        instrlist_meta_preinsert(bb, where,
-            XINST_CREATE_load(drcontext,
-                opnd_create_reg(sp->r2),
-                dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                    RAW_TLS(MEMVIS_RAW_SLOT_GUARD))));
-    }
-    if (sp->r1_from_drreg) {
-        drreg_unreserve_register(drcontext, bb, where, sp->r1);
-    } else {
-        instrlist_meta_preinsert(bb, where,
-            XINST_CREATE_load(drcontext,
-                opnd_create_reg(sp->r1),
-                dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                    RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
-    }
-}
-
-static void
-emit_inline_write_v3(void *drcontext, instrlist_t *bb, instr_t *where,
-                     reg_id_t addr_reg, reg_id_t scratch,
-                     uint32_t sz, app_pc app_pc_val)
+emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
+               reg_id_t reg_addr, reg_id_t scratch,
+               uint32_t sz, app_pc app_pc_val)
 {
     uint32_t rip_offset = (uint32_t)((uint64_t)(ptr_uint_t)app_pc_val
                                      - g_module_base);
 
     instr_t *skip_label = INSTR_CREATE_label(drcontext);
 
-    // hot path: ring null check
+    // save aflags — our inline code clobbers EFLAGS
+    drreg_reserve_aflags(drcontext, bb, where);
+
+    // save EA to pad.scratch[0]
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0),
+            opnd_create_reg(reg_addr)));
+
+    // ring null check
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(reg_addr),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(MEMVIS_RAW_SLOT_RING))));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_test(drcontext,
-            opnd_create_reg(scratch), opnd_create_reg(scratch)));
+            opnd_create_reg(reg_addr), opnd_create_reg(reg_addr)));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
 
     // backpressure check
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
-            opnd_create_reg(scratch),
+            opnd_create_reg(reg_addr),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(MEMVIS_RAW_SLOT_BP))));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_test(drcontext,
-            opnd_create_reg(scratch), opnd_create_reg(scratch)));
+            opnd_create_reg(reg_addr), opnd_create_reg(reg_addr)));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jnz, opnd_create_instr(skip_label)));
 
-    // slot = ring_data + (head & mask) * 32
+    // slot = ring_data + (head & mask) * 32. scratch still holds pad ptr.
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
-            opnd_create_reg(scratch),
-            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
-
-    // save EA to pad, borrow addr_reg for head
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_mov_st(drcontext,
-            OPND_CREATE_MEMPTR(scratch, offsetof(memvis_scratch_pad_t, scratch[0])),
-            opnd_create_reg(addr_reg)));
-
-    instrlist_meta_preinsert(bb, where,
-        XINST_CREATE_load(drcontext,
-            opnd_create_reg(addr_reg),
+            opnd_create_reg(reg_addr),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(MEMVIS_RAW_SLOT_HEAD))));
-
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_and(drcontext,
-            opnd_create_reg(addr_reg),
-            OPND_CREATE_MEMPTR(scratch, offsetof(memvis_scratch_pad_t, ring_mask))));
-
+            opnd_create_reg(reg_addr),
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_RING_MASK)));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_shl(drcontext,
-            opnd_create_reg(addr_reg),
+            opnd_create_reg(reg_addr),
             OPND_CREATE_INT8(5)));
-
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_add(drcontext,
-            opnd_create_reg(addr_reg),
-            OPND_CREATE_MEMPTR(scratch, offsetof(memvis_scratch_pad_t, ring_data))));
+            opnd_create_reg(reg_addr),
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_RING_DATA)));
 
-    // store event fields. reload saved EA via pad ptr.
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_mov_ld(drcontext,
-            opnd_create_reg(scratch),
-            OPND_CREATE_MEMPTR(addr_reg,
-                -(int)(offsetof(memvis_scratch_pad_t, ring_data))
-                )));
+    // reg_addr = event slot ptr. recover EA from pad.scratch[0].
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
-
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_ld(drcontext,
             opnd_create_reg(scratch),
-            OPND_CREATE_MEMPTR(scratch, offsetof(memvis_scratch_pad_t, scratch[0]))));
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0)));
 
+    // ev.addr
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
-            OPND_CREATE_MEMPTR(addr_reg,
-                offsetof(memvis_event_v3_t, addr)),
+            OPND_CREATE_MEMPTR(reg_addr, OFF_EV3_ADDR),
             opnd_create_reg(scratch)));
 
+    // ev.size
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
-            opnd_create_base_disp(addr_reg, DR_REG_NULL, 0,
-                offsetof(memvis_event_v3_t, size), OPSZ_4),
+            opnd_create_base_disp(reg_addr, DR_REG_NULL, 0,
+                OFF_EV3_SIZE, OPSZ_4),
             OPND_CREATE_INT32((int)sz)));
 
-    instrlist_meta_preinsert(bb, where,
-        XINST_CREATE_load(drcontext,
-            opnd_create_reg(scratch),
-            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                RAW_TLS(MEMVIS_RAW_SLOT_TID))));
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_mov_st(drcontext,
-            opnd_create_base_disp(addr_reg, DR_REG_NULL, 0,
-                offsetof(memvis_event_v3_t, thread_id), OPSZ_2),
-            opnd_create_reg(reg_64_to_16(scratch))));
-
+    // pack [thread_id:16 | seq_lo:16] into one OPSZ_4 store
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(MEMVIS_RAW_SLOT_SEQ))));
     instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_shl(drcontext,
+            opnd_create_reg(scratch),
+            OPND_CREATE_INT8(16)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_or(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_TID))));
+    instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
-            opnd_create_base_disp(addr_reg, DR_REG_NULL, 0,
-                offsetof(memvis_event_v3_t, seq_lo), OPSZ_2),
-            opnd_create_reg(reg_64_to_16(scratch))));
+            opnd_create_base_disp(reg_addr, DR_REG_NULL, 0,
+                OFF_EV3_THREAD_ID, OPSZ_4),
+            opnd_create_reg(reg_64_to_32(scratch))));
 
-    // kind_flags = WRITE | (seq >> 16) << 16
+    // kind_flags = WRITE | (seq_hi << 16)
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SEQ))));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_shr(drcontext,
             opnd_create_reg(scratch),
@@ -278,17 +265,83 @@ emit_inline_write_v3(void *drcontext, instrlist_t *bb, instr_t *where,
             OPND_CREATE_INT32(MEMVIS_EVENT_WRITE)));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
-            opnd_create_base_disp(addr_reg, DR_REG_NULL, 0,
-                offsetof(memvis_event_v3_t, kind_flags), OPSZ_4),
+            opnd_create_base_disp(reg_addr, DR_REG_NULL, 0,
+                OFF_EV3_KIND_FLAGS, OPSZ_4),
             opnd_create_reg(reg_64_to_32(scratch))));
 
+    // ev.rip_lo
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
-            opnd_create_base_disp(addr_reg, DR_REG_NULL, 0,
-                offsetof(memvis_event_v3_t, rip_lo), OPSZ_4),
+            opnd_create_base_disp(reg_addr, DR_REG_NULL, 0,
+                OFF_EV3_RIP_LO, OPSZ_4),
             OPND_CREATE_INT32((int)rip_offset)));
 
-    // post-write value read
+    // save event slot ptr to pad.scratch[1] for post-write phase
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1),
+            opnd_create_reg(reg_addr)));
+
+    // restore EA into reg_addr for the app write
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_ld(drcontext,
+            opnd_create_reg(reg_addr),
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0)));
+
+    instr_t *done_label = INSTR_CREATE_label(drcontext);
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jmp(drcontext, opnd_create_instr(done_label)));
+
+    // skip path: zero pad.scratch[1] to signal post-write to skip, restore EA
+    instrlist_meta_preinsert(bb, where, skip_label);
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_xor(drcontext,
+            opnd_create_reg(reg_addr), opnd_create_reg(reg_addr)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1),
+            opnd_create_reg(reg_addr)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_ld(drcontext,
+            opnd_create_reg(reg_addr),
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0)));
+
+    instrlist_meta_preinsert(bb, where, done_label);
+
+    // restore aflags
+    drreg_unreserve_aflags(drcontext, bb, where);
+}
+
+// post-write: zero value field, bump seq+head, conditional head flush.
+// called at the NEXT app instruction after the write.
+// reg_addr is the drreg-reserved EA register from pre-write.
+// checks pad.scratch[1]: if 0 (pre-write was skipped), skips entirely.
+// NOTE: inline value capture deferred — reading from EA risks page faults
+// for sub-8B writes near page boundaries.
+static void
+emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
+                reg_id_t reg_addr)
+{
+    reg_id_t scratch;
+    if (drreg_reserve_register(drcontext, bb, where, NULL, &scratch) != DRREG_SUCCESS) {
+        DR_ASSERT(false);
+        return;
+    }
+
+    instr_t *skip_label = INSTR_CREATE_label(drcontext);
+    drreg_reserve_aflags(drcontext, bb, where);
+
+    // load event slot ptr from pad.scratch[1]
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -297,24 +350,26 @@ emit_inline_write_v3(void *drcontext, instrlist_t *bb, instr_t *where,
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_ld(drcontext,
             opnd_create_reg(scratch),
-            OPND_CREATE_MEMPTR(scratch, offsetof(memvis_scratch_pad_t, scratch[0]))));
-    if (sz <= 8) {
-        instrlist_meta_preinsert(bb, where,
-            INSTR_CREATE_mov_ld(drcontext,
-                opnd_create_reg(scratch),
-                opnd_create_base_disp(scratch, DR_REG_NULL, 0, 0,
-                    opnd_size_from_bytes(sz > 4 ? 8 : sz))));
-    } else {
-        instrlist_meta_preinsert(bb, where,
-            INSTR_CREATE_xor(drcontext,
-                opnd_create_reg(scratch), opnd_create_reg(scratch)));
-    }
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1)));
+
+    // if slot ptr is 0, pre-write was skipped — skip post-write
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_test(drcontext,
+            opnd_create_reg(scratch), opnd_create_reg(scratch)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
+
+    // zero the value field — inline value capture deferred to future optimization.
+    // reading sz bytes from EA inline risks page-boundary faults for small writes.
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_xor(drcontext,
+            opnd_create_reg(reg_addr), opnd_create_reg(reg_addr)));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
-            OPND_CREATE_MEMPTR(addr_reg,
-                offsetof(memvis_event_v3_t, value)),
-            opnd_create_reg(scratch)));
+            OPND_CREATE_MEMPTR(scratch, OFF_EV3_VALUE),
+            opnd_create_reg(reg_addr)));
 
+    // seq++
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -329,6 +384,7 @@ emit_inline_write_v3(void *drcontext, instrlist_t *bb, instr_t *where,
                 RAW_TLS(MEMVIS_RAW_SLOT_SEQ)),
             opnd_create_reg(scratch)));
 
+    // head++
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -343,66 +399,41 @@ emit_inline_write_v3(void *drcontext, instrlist_t *bb, instr_t *where,
                 RAW_TLS(MEMVIS_RAW_SLOT_HEAD)),
             opnd_create_reg(scratch)));
 
-    // cold trampoline: conditional head flush (1/64 events)
+    // conditional head flush (1/64 events)
+    instr_t *no_flush_label = INSTR_CREATE_label(drcontext);
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_test(drcontext,
             opnd_create_reg(scratch),
             OPND_CREATE_INT32(MEMVIS_HEAD_FLUSH_MASK)));
-
-    instr_t *no_flush_label = INSTR_CREATE_label(drcontext);
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jnz, opnd_create_instr(no_flush_label)));
 
-    // cold flush
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
-            opnd_create_reg(addr_reg),
+            opnd_create_reg(reg_addr),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(MEMVIS_RAW_SLOT_RING))));
-    // TSO: MOV is store-release
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
-            OPND_CREATE_MEMPTR(addr_reg,
-                offsetof(memvis_ring_header_t, head)),
+            OPND_CREATE_MEMPTR(reg_addr, OFF_RING_HEAD),
             opnd_create_reg(scratch)));
 
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_mov_ld(drcontext,
-            opnd_create_reg(addr_reg),
-            OPND_CREATE_MEMPTR(addr_reg,
-                offsetof(memvis_ring_header_t, tail))));
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_sub(drcontext,
-            opnd_create_reg(scratch), opnd_create_reg(addr_reg)));
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_cmp(drcontext,
-            opnd_create_reg(scratch),
-            OPND_CREATE_INT32(
-                (int)((MEMVIS_THREAD_RING_CAPACITY * MEMVIS_BP_HIGH_WATER) >> 3))));
-
-    instr_t *bp_off_label = INSTR_CREATE_label(drcontext);
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_jcc(drcontext, OP_jb, opnd_create_instr(bp_off_label)));
-
-    instrlist_meta_preinsert(bb, where,
-        XINST_CREATE_store(drcontext,
-            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                RAW_TLS(MEMVIS_RAW_SLOT_BP)),
-            OPND_CREATE_INT32(1)));
-
-    instrlist_meta_preinsert(bb, where, bp_off_label);
     instrlist_meta_preinsert(bb, where, no_flush_label);
     instrlist_meta_preinsert(bb, where, skip_label);
+    drreg_unreserve_aflags(drcontext, bb, where);
+
+    if (drreg_unreserve_register(drcontext, bb, where, scratch) != DRREG_SUCCESS)
+        DR_ASSERT(false);
 }
 
 static void
 flush_head_cache(void *drcontext)
 {
-    memvis_ring_header_t *ring = (memvis_ring_header_t *)dr_raw_tls_get_value(
-        drcontext, g_raw_tls_seg, RAW_TLS(MEMVIS_RAW_SLOT_RING));
+    memvis_ring_header_t *ring = (memvis_ring_header_t *)raw_tls_get(
+        drcontext, RAW_TLS(MEMVIS_RAW_SLOT_RING));
     if (!ring) return;
-    uint64_t cached_head = (uint64_t)(uintptr_t)dr_raw_tls_get_value(
-        drcontext, g_raw_tls_seg, RAW_TLS(MEMVIS_RAW_SLOT_HEAD));
+    uint64_t cached_head = (uint64_t)(uintptr_t)raw_tls_get(
+        drcontext, RAW_TLS(MEMVIS_RAW_SLOT_HEAD));
     atomic_store_explicit(&ring->head, cached_head, memory_order_release);
 }
 
@@ -700,14 +731,28 @@ static dr_emit_flags_t
 event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb,
                   bool for_trace, bool translating, void **user_data)
 {
-    (void)drcontext; (void)tag;
-    (void)for_trace; (void)translating;
-    bool has_reads = false;
+    (void)tag; (void)for_trace; (void)translating;
+    instru_data_t *data = (instru_data_t *)dr_thread_alloc(drcontext, sizeof(*data));
+    data->reg_addr = DR_REG_NULL;
+    data->has_reads = false;
     for (instr_t *i = instrlist_first_app(bb); i != NULL; i = instr_get_next_app(i)) {
-        if (instr_reads_memory(i)) { has_reads = true; break; }
+        if (instr_reads_memory(i)) { data->has_reads = true; break; }
     }
-    *user_data = (void *)(uintptr_t)has_reads;
+    *user_data = (void *)data;
     return DR_EMIT_DEFAULT;
+}
+
+// handle deferred post-write from previous app instruction
+static void
+handle_pending_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
+                          instru_data_t *data)
+{
+    if (data->reg_addr == DR_REG_NULL)
+        return;
+    emit_post_write(drcontext, bb, where, data->reg_addr);
+    if (drreg_unreserve_register(drcontext, bb, where, data->reg_addr) != DRREG_SUCCESS)
+        DR_ASSERT(false);
+    data->reg_addr = DR_REG_NULL;
 }
 
 static dr_emit_flags_t
@@ -715,6 +760,10 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                 bool for_trace, bool translating, void *user_data)
 {
     (void)tag; (void)for_trace; (void)translating;
+    instru_data_t *data = (instru_data_t *)user_data;
+
+    // complete any pending post-write from previous app instruction
+    handle_pending_post_write(drcontext, bb, instr, data);
 
     if (instr_is_call_direct(instr)) {
         dr_insert_clean_call(drcontext, bb, instr,
@@ -735,74 +784,64 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                                  instr_get_app_pc(instr)));
     }
 
-    // inline write path
+    // inline write path: pre-write at current instr, post-write deferred to next
     if (instr_writes_memory(instr)) {
-        instr_t *next = instr_get_next_app(instr);
+        bool seen_memref = false;
         for (int i = 0; i < instr_num_dsts(instr); i++) {
             opnd_t dst = instr_get_dst(instr, i);
             if (!opnd_is_memory_reference(dst))
                 continue;
+            if (seen_memref)
+                break;
+            seen_memref = true;
 
             uint32_t sz = opnd_size_in_bytes(opnd_get_size(dst));
             app_pc write_pc = instr_get_app_pc(instr);
-            instr_t *emit_pt = next ? next : instr;
 
-            scratch_pair_t sp = acquire_scratch_pair(drcontext, bb, instr);
+            reg_id_t reg_addr, reg_scratch;
+            if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg_addr) !=
+                    DRREG_SUCCESS)
+                break;
+            if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg_scratch) !=
+                    DRREG_SUCCESS) {
+                drreg_unreserve_register(drcontext, bb, instr, reg_addr);
+                break;
+            }
+
+            if (opnd_uses_reg(dst, reg_addr))
+                drreg_get_app_value(drcontext, bb, instr, reg_addr, reg_addr);
+            if (opnd_uses_reg(dst, reg_scratch))
+                drreg_get_app_value(drcontext, bb, instr, reg_scratch, reg_scratch);
 
             bool ok = drutil_insert_get_mem_addr(
-                drcontext, bb, instr, dst, sp.r1, sp.r2);
+                drcontext, bb, instr, dst, reg_addr, reg_scratch);
+
+            drreg_unreserve_register(drcontext, bb, instr, reg_scratch);
 
             if (ok) {
-                if (sp.r2_from_drreg)
-                    drreg_unreserve_register(drcontext, bb, emit_pt, sp.r2);
-                else {
-                    instrlist_meta_preinsert(bb, emit_pt,
-                        XINST_CREATE_load(drcontext,
-                            opnd_create_reg(sp.r2),
-                            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                                RAW_TLS(MEMVIS_RAW_SLOT_GUARD))));
+                reg_id_t pre_scratch;
+                if (drreg_reserve_register(drcontext, bb, instr, NULL, &pre_scratch) !=
+                        DRREG_SUCCESS) {
+                    drreg_unreserve_register(drcontext, bb, instr, reg_addr);
+                    break;
                 }
 
-                reg_id_t ring_scratch;
-                bool ring_scratch_drreg = false;
-                if (drreg_reserve_register(drcontext, bb, emit_pt,
-                                           NULL, &ring_scratch) == DRREG_SUCCESS) {
-                    ring_scratch_drreg = true;
-                } else {
-                    ring_scratch = (sp.r1 == DR_REG_RCX) ? DR_REG_RDX : DR_REG_RCX;
-                    instrlist_meta_preinsert(bb, emit_pt,
-                        XINST_CREATE_store(drcontext,
-                            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                                RAW_TLS(MEMVIS_RAW_SLOT_GUARD)),
-                            opnd_create_reg(ring_scratch)));
-                }
+                emit_pre_write(drcontext, bb, instr,
+                               reg_addr, pre_scratch, sz, write_pc);
 
-                emit_inline_write_v3(drcontext, bb, emit_pt,
-                                     sp.r1, ring_scratch, sz, write_pc);
+                drreg_unreserve_register(drcontext, bb, instr, pre_scratch);
 
-                if (ring_scratch_drreg)
-                    drreg_unreserve_register(drcontext, bb, emit_pt, ring_scratch);
-                else {
-                    instrlist_meta_preinsert(bb, emit_pt,
-                        XINST_CREATE_load(drcontext,
-                            opnd_create_reg(ring_scratch),
-                            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                                RAW_TLS(MEMVIS_RAW_SLOT_GUARD))));
-                }
-
-                if (sp.r1_from_drreg)
-                    drreg_unreserve_register(drcontext, bb, emit_pt, sp.r1);
-                else {
-                    instrlist_meta_preinsert(bb, emit_pt,
-                        XINST_CREATE_load(drcontext,
-                            opnd_create_reg(sp.r1),
-                            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
-                }
+                data->reg_addr = reg_addr;
             } else {
-                release_scratch_pair(drcontext, bb, instr, &sp);
+                drreg_unreserve_register(drcontext, bb, instr, reg_addr);
             }
         }
+    }
+
+    // free user_data at end of bb
+    if (drmgr_is_last_instr(drcontext, instr)) {
+        handle_pending_post_write(drcontext, bb, instr, data);
+        dr_thread_free(drcontext, data, sizeof(instru_data_t));
     }
 
     if (instr_reads_memory(instr)) {
@@ -879,8 +918,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
         }
     }
 
-    bool bb_has_reads = (bool)(uintptr_t)user_data;
-    if (bb_has_reads && instr_get_next_app(instr) == NULL) {
+    if (data->has_reads && instr_get_next_app(instr) == NULL) {
         dr_insert_clean_call(drcontext, bb, instr,
                              (void *)flush_read_buf, false, 0);
     }
@@ -928,22 +966,14 @@ event_thread_init(void *drcontext)
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF], (void *)rdbuf);
 
     memvis_scratch_pad_t *pad = alloc_scratch_pad(drcontext, ring);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_RING), (void *)ring);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_HEAD), (void *)(uintptr_t)0);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_SEQ), (void *)(uintptr_t)0);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_TID), (void *)(uintptr_t)tid);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_BP), (void *)(uintptr_t)0);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH), (void *)pad);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_RDBUF), (void *)rdbuf);
-    dr_raw_tls_set_value(drcontext, g_raw_tls_seg,
-        RAW_TLS(MEMVIS_RAW_SLOT_GUARD), NULL);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_RING), (void *)ring);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_HEAD), (void *)(uintptr_t)0);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_SEQ), (void *)(uintptr_t)0);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_TID), (void *)(uintptr_t)tid);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_BP), (void *)(uintptr_t)0);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH), (void *)pad);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_RDBUF), (void *)rdbuf);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_GUARD), NULL);
 
     int ctl_idx = -1;
     if (ring && g_ctl)
@@ -974,8 +1004,8 @@ event_thread_exit(void *drcontext)
     }
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], NULL);
 
-    memvis_scratch_pad_t *pad = (memvis_scratch_pad_t *)dr_raw_tls_get_value(
-        drcontext, g_raw_tls_seg, RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH));
+    memvis_scratch_pad_t *pad = (memvis_scratch_pad_t *)raw_tls_get(
+        drcontext, RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH));
     if (pad)
         dr_thread_free(drcontext, pad, sizeof(memvis_scratch_pad_t));
 
@@ -1022,7 +1052,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
 
     drmgr_init();
     drutil_init();
-    drreg_options_t drreg_ops = { sizeof(drreg_ops), 4, false };
+    drreg_options_t drreg_ops = { sizeof(drreg_ops), 8, false };
     drreg_init(&drreg_ops);
 
     if (!dr_raw_tls_calloc(&g_raw_tls_seg, &g_raw_tls_off,
