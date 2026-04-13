@@ -24,10 +24,19 @@ const _: () = assert!(mem::size_of::<Event>() == 32);
 
 impl Event {
     #[inline(always)]
-    pub fn kind(&self) -> u8 { (self.kind_flags & 0xFF) as u8 }
+    pub fn kind(&self) -> u8 {
+        (self.kind_flags & 0xFF) as u8
+    }
 
     pub fn zero() -> Self {
-        Self { addr: 0, size: 0, thread_id: 0, seq: 0, value: 0, kind_flags: 0 }
+        Self {
+            addr: 0,
+            size: 0,
+            thread_id: 0,
+            seq: 0,
+            value: 0,
+            kind_flags: 0,
+        }
     }
 }
 
@@ -88,25 +97,43 @@ impl MappedShm {
     fn open(name: &[u8]) -> Option<Self> {
         unsafe {
             let fd = libc::shm_open(name.as_ptr() as *const libc::c_char, libc::O_RDWR, 0o600);
-            if fd < 0 { return None; }
+            if fd < 0 {
+                return None;
+            }
             let mut st: libc::stat = mem::zeroed();
-            if libc::fstat(fd, &mut st) != 0 { libc::close(fd); return None; }
+            if libc::fstat(fd, &mut st) != 0 {
+                libc::close(fd);
+                return None;
+            }
             let len = st.st_size as usize;
-            if len == 0 { libc::close(fd); return None; }
+            if len == 0 {
+                libc::close(fd);
+                return None;
+            }
             let p = libc::mmap(
-                ptr::null_mut(), len,
+                ptr::null_mut(),
+                len,
                 libc::PROT_READ | libc::PROT_WRITE,
-                libc::MAP_SHARED, fd, 0,
+                libc::MAP_SHARED,
+                fd,
+                0,
             );
             libc::close(fd);
-            if p == libc::MAP_FAILED { return None; }
-            Some(Self { ptr: p as *mut u8, len })
+            if p == libc::MAP_FAILED {
+                return None;
+            }
+            Some(Self {
+                ptr: p as *mut u8,
+                len,
+            })
         }
     }
 }
 impl Drop for MappedShm {
     fn drop(&mut self) {
-        unsafe { libc::munmap(self.ptr as *mut libc::c_void, self.len); }
+        unsafe {
+            libc::munmap(self.ptr as *mut libc::c_void, self.len);
+        }
     }
 }
 
@@ -119,8 +146,14 @@ pub struct ThreadRing {
 impl ThreadRing {
     fn from_shm(shm: MappedShm, thread_id: u16) -> Option<Self> {
         let hdr = unsafe { &*(shm.ptr as *const RingHeader) };
-        if hdr.magic != MEMVIS_MAGIC { return None; }
-        Some(Self { shm, thread_id, alive: true })
+        if hdr.magic != MEMVIS_MAGIC {
+            return None;
+        }
+        Some(Self {
+            shm,
+            thread_id,
+            alive: true,
+        })
     }
 
     pub fn header(&self) -> &RingHeader {
@@ -134,7 +167,9 @@ impl ThreadRing {
         let data = unsafe { hdr.data() };
         let t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
-        if t == h { return None; }
+        if t == h {
+            return None;
+        }
         Some(unsafe { ptr::read_volatile(data.add((t & mask) as usize)) })
     }
 
@@ -145,7 +180,9 @@ impl ThreadRing {
         let data = unsafe { hdr.data() };
         let t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
-        if t == h { return None; }
+        if t == h {
+            return None;
+        }
         let ev = unsafe { ptr::read_volatile(data.add((t & mask) as usize)) };
         hdr.tail.store(t + 1, Ordering::Release);
         Some(ev)
@@ -159,7 +196,9 @@ impl ThreadRing {
         let data = unsafe { hdr.data() };
         let t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
-        if h - t < n { return false; }
+        if h - t < n {
+            return false;
+        }
         for i in 0..n {
             out[i as usize] = unsafe { ptr::read_volatile(data.add(((t + i) & mask) as usize)) };
         }
@@ -176,7 +215,9 @@ impl ThreadRing {
         let h = hdr.head.load(Ordering::Acquire);
         let avail = h.wrapping_sub(t) as usize;
         let n = avail.min(max);
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         for i in 0..n {
             out.push(unsafe { ptr::read_volatile(data.add(((t + i as u64) & mask) as usize)) });
         }
@@ -204,17 +245,26 @@ pub struct RingOrchestrator {
 impl RingOrchestrator {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { ctl: None, rings: Vec::new(), known_count: 0, rr_idx: 0 }
+        Self {
+            ctl: None,
+            rings: Vec::new(),
+            known_count: 0,
+            rr_idx: 0,
+        }
     }
 
     pub fn try_attach_ctl(&mut self) -> bool {
-        if self.ctl.is_some() { return true; }
+        if self.ctl.is_some() {
+            return true;
+        }
         let shm = match MappedShm::open(b"/memvis_ctl\0") {
             Some(s) => s,
             None => return false,
         };
         let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
-        if hdr.magic != MEMVIS_CTL_MAGIC { return false; }
+        if hdr.magic != MEMVIS_CTL_MAGIC {
+            return false;
+        }
         self.ctl = Some(shm);
         true
     }
@@ -233,11 +283,18 @@ impl RingOrchestrator {
 
             let entry = &hdr.threads[idx];
             let state = entry.state.load(Ordering::Acquire);
-            if state == THREAD_STATE_EMPTY { continue; }
+            if state == THREAD_STATE_EMPTY {
+                continue;
+            }
 
             let name_bytes = &entry.shm_name;
-            let name_len = name_bytes.iter().position(|&b| b == 0).unwrap_or(RING_NAME_LEN);
-            if name_len == 0 { continue; }
+            let name_len = name_bytes
+                .iter()
+                .position(|&b| b == 0)
+                .unwrap_or(RING_NAME_LEN);
+            if name_len == 0 {
+                continue;
+            }
 
             let mut shm_name = Vec::with_capacity(name_len + 1);
             shm_name.extend_from_slice(&name_bytes[..name_len]);
@@ -245,15 +302,21 @@ impl RingOrchestrator {
 
             if let Some(shm) = MappedShm::open(&shm_name) {
                 if let Some(ring) = ThreadRing::from_shm(shm, entry.thread_id) {
-                    eprintln!("memvis: discovered ring for thread {} ({})",
+                    eprintln!(
+                        "memvis: discovered ring for thread {} ({})",
                         entry.thread_id,
-                        std::str::from_utf8(&name_bytes[..name_len]).unwrap_or("?"));
+                        std::str::from_utf8(&name_bytes[..name_len]).unwrap_or("?")
+                    );
                     self.rings.push(ring);
                 }
             }
 
             if state == THREAD_STATE_DEAD {
-                if let Some(r) = self.rings.iter_mut().find(|r| r.thread_id == entry.thread_id) {
+                if let Some(r) = self
+                    .rings
+                    .iter_mut()
+                    .find(|r| r.thread_id == entry.thread_id)
+                {
                     r.alive = false;
                 }
             }
@@ -263,7 +326,11 @@ impl RingOrchestrator {
         for entry_idx in 0..count as usize {
             let entry = &hdr.threads[entry_idx];
             if entry.state.load(Ordering::Relaxed) == THREAD_STATE_DEAD {
-                if let Some(r) = self.rings.iter_mut().find(|r| r.thread_id == entry.thread_id && r.alive) {
+                if let Some(r) = self
+                    .rings
+                    .iter_mut()
+                    .find(|r| r.thread_id == entry.thread_id && r.alive)
+                {
                     r.alive = false;
                 }
             }
@@ -280,12 +347,20 @@ impl RingOrchestrator {
             total_used += h.wrapping_sub(t);
             total_cap += hdr.capacity as u64;
         }
-        let pct = if total_cap > 0 { ((total_used * 100) / total_cap) as u32 } else { 0 };
+        let pct = if total_cap > 0 {
+            ((total_used * 100) / total_cap) as u32
+        } else {
+            0
+        };
         (total_used, pct)
     }
 
-    pub fn ring_count(&self) -> usize { self.rings.len() }
-    pub fn active_count(&self) -> usize { self.rings.iter().filter(|r| r.alive).count() }
+    pub fn ring_count(&self) -> usize {
+        self.rings.len()
+    }
+    pub fn active_count(&self) -> usize {
+        self.rings.iter().filter(|r| r.alive).count()
+    }
 
     // adaptive backpressure: shed reads when ring fill > 6/8, resume at < 3/8
     pub fn update_backpressure(&self) {
@@ -309,7 +384,9 @@ impl RingOrchestrator {
     // returns total events drained. caller processes via callback.
     pub fn batch_drain(&mut self, per_ring: usize, buf: &mut Vec<(usize, Event)>) -> usize {
         let n = self.rings.len();
-        if n == 0 { return 0; }
+        if n == 0 {
+            return 0;
+        }
         let mut tmp: Vec<Event> = Vec::with_capacity(per_ring);
         let mut total = 0;
         for offset in 0..n {
@@ -327,7 +404,9 @@ impl RingOrchestrator {
 
     pub fn merge_pop(&mut self) -> Option<(usize, Event)> {
         let n = self.rings.len();
-        if n == 0 { return None; }
+        if n == 0 {
+            return None;
+        }
         for _ in 0..n {
             let i = self.rr_idx % n;
             self.rr_idx = (self.rr_idx + 1) % n;

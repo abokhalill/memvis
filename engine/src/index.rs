@@ -10,7 +10,7 @@ pub type FrameId = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
     Global(u32),
-    Field(u32, u16),   // (global_idx, field_idx) — struct field decomposition
+    Field(u32, u16), // (global_idx, field_idx) — struct field decomposition
     Local(FrameId, u16),
 }
 
@@ -45,30 +45,54 @@ pub struct AddressIndex {
 impl AddressIndex {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { intervals: Vec::with_capacity(2048), needs_sort: false }
+        Self {
+            intervals: Vec::with_capacity(2048),
+            needs_sort: false,
+        }
     }
 
     pub fn insert_global(
-        &mut self, addr: u64, size: u64, name: String,
-        type_info: TypeInfo, global_idx: u32,
+        &mut self,
+        addr: u64,
+        size: u64,
+        name: String,
+        type_info: TypeInfo,
+        global_idx: u32,
     ) {
-        if size == 0 { return; }
+        if size == 0 {
+            return;
+        }
         self.intervals.push(Interval {
-            lo: addr, hi: addr + size,
-            meta: VarMeta { name, type_info, node_id: NodeId::Global(global_idx), frame_id: None },
+            lo: addr,
+            hi: addr + size,
+            meta: VarMeta {
+                name,
+                type_info,
+                node_id: NodeId::Global(global_idx),
+                frame_id: None,
+            },
         });
         self.needs_sort = true;
     }
 
     pub fn insert_field(
-        &mut self, addr: u64, size: u64, name: String,
-        type_info: TypeInfo, global_idx: u32, field_idx: u16,
+        &mut self,
+        addr: u64,
+        size: u64,
+        name: String,
+        type_info: TypeInfo,
+        global_idx: u32,
+        field_idx: u16,
     ) {
-        if size == 0 { return; }
+        if size == 0 {
+            return;
+        }
         self.intervals.push(Interval {
-            lo: addr, hi: addr + size,
+            lo: addr,
+            hi: addr + size,
             meta: VarMeta {
-                name, type_info,
+                name,
+                type_info,
                 node_id: NodeId::Field(global_idx, field_idx),
                 frame_id: None,
             },
@@ -77,16 +101,22 @@ impl AddressIndex {
     }
 
     pub fn insert_frame_locals(
-        &mut self, frame_id: FrameId, frame_base: u64,
+        &mut self,
+        frame_id: FrameId,
+        frame_base: u64,
         locals: &[(i64, u64, String, TypeInfo)],
     ) {
         for (li, (offset, size, name, type_info)) in locals.iter().enumerate() {
-            if *size == 0 { continue; }
+            if *size == 0 {
+                continue;
+            }
             let addr = (frame_base as i64 + offset) as u64;
             self.intervals.push(Interval {
-                lo: addr, hi: addr + size,
+                lo: addr,
+                hi: addr + size,
                 meta: VarMeta {
-                    name: name.clone(), type_info: type_info.clone(),
+                    name: name.clone(),
+                    type_info: type_info.clone(),
                     node_id: NodeId::Local(frame_id, li as u16),
                     frame_id: Some(frame_id),
                 },
@@ -96,7 +126,8 @@ impl AddressIndex {
     }
 
     pub fn remove_frame(&mut self, frame_id: FrameId) {
-        self.intervals.retain(|iv| iv.meta.frame_id != Some(frame_id));
+        self.intervals
+            .retain(|iv| iv.meta.frame_id != Some(frame_id));
     }
 
     pub fn finalize(&mut self) {
@@ -111,13 +142,17 @@ impl AddressIndex {
     #[inline(always)]
     pub fn lookup(&self, addr: u64) -> Option<LookupResult<'_>> {
         let idx = self.intervals.partition_point(|iv| iv.lo <= addr);
-        if idx == 0 { return None; }
+        if idx == 0 {
+            return None;
+        }
 
         let mut best: Option<&Interval> = None;
         let mut i = idx - 1;
         loop {
             let iv = &self.intervals[i];
-            if iv.lo > addr { break; }
+            if iv.lo > addr {
+                break;
+            }
             if addr < iv.hi {
                 let dominated = match best {
                     None => true,
@@ -133,19 +168,25 @@ impl AddressIndex {
                             NodeId::Field(..) => 1,
                             NodeId::Global(..) => 0,
                         };
-                        iv_rank > prev_rank ||
-                            (iv_rank == prev_rank && (iv.hi - iv.lo) < (prev.hi - prev.lo))
+                        iv_rank > prev_rank
+                            || (iv_rank == prev_rank && (iv.hi - iv.lo) < (prev.hi - prev.lo))
                     }
                 };
-                if dominated { best = Some(iv); }
+                if dominated {
+                    best = Some(iv);
+                }
             }
-            if i == 0 || self.intervals[i - 1].lo < iv.lo { break; }
+            if i == 0 || self.intervals[i - 1].lo < iv.lo {
+                break;
+            }
             i -= 1;
         }
 
         best.map(|iv| LookupResult {
-            name: &iv.meta.name, type_info: &iv.meta.type_info,
-            node_id: iv.meta.node_id, offset_in_var: addr - iv.lo,
+            name: &iv.meta.name,
+            type_info: &iv.meta.type_info,
+            node_id: iv.meta.node_id,
+            offset_in_var: addr - iv.lo,
         })
     }
 }
@@ -155,7 +196,12 @@ mod tests {
     use super::*;
 
     fn ti(name: &str, sz: u64) -> TypeInfo {
-        TypeInfo { name: name.into(), byte_size: sz, is_pointer: false, fields: Vec::new() }
+        TypeInfo {
+            name: name.into(),
+            byte_size: sz,
+            is_pointer: false,
+            fields: Vec::new(),
+        }
     }
 
     #[test]

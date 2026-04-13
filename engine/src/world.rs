@@ -9,9 +9,8 @@ use crate::dwarf::TypeInfo;
 use crate::index::NodeId;
 
 pub const REG_NAMES: &[&str] = &[
-    "rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp",
-    "r8","r9","r10","r11","r12","r13","r14","r15",
-    "rip","rflags",
+    "rax", "rbx", "rcx", "rdx", "rsi", "rdi", "rbp", "rsp", "r8", "r9", "r10", "r11", "r12", "r13",
+    "r14", "r15", "rip", "rflags",
 ];
 pub const REG_COUNT: usize = 18;
 
@@ -25,7 +24,11 @@ pub struct LiveRegisterFile {
 impl LiveRegisterFile {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { values: [0; REG_COUNT], prev: [0; REG_COUNT], insn: 0 }
+        Self {
+            values: [0; REG_COUNT],
+            prev: [0; REG_COUNT],
+            insn: 0,
+        }
     }
     pub fn update(&mut self, regs: [u64; REG_COUNT], insn: u64) {
         self.prev = self.values;
@@ -51,12 +54,18 @@ pub struct CacheLineTracker {
 
 impl CacheLineTracker {
     #[allow(clippy::new_without_default)]
-    pub fn new() -> Self { Self { lines: HashMap::new() } }
+    pub fn new() -> Self {
+        Self {
+            lines: HashMap::new(),
+        }
+    }
 
     pub fn record_write(&mut self, addr: u64, thread_id: u16) {
         let cl = addr >> CACHE_LINE_SHIFT;
         let e = self.lines.entry(cl).or_insert(CacheLineEntry {
-            write_count: 0, writers: HashSet::new(), last_writer: thread_id,
+            write_count: 0,
+            writers: HashSet::new(),
+            last_writer: thread_id,
         });
         e.write_count += 1;
         e.writers.insert(thread_id);
@@ -65,13 +74,15 @@ impl CacheLineTracker {
 
     // cache line is false-shared if >1 thread has written to it
     pub fn is_false_shared(&self, addr: u64) -> bool {
-        self.lines.get(&(addr >> CACHE_LINE_SHIFT))
+        self.lines
+            .get(&(addr >> CACHE_LINE_SHIFT))
             .map(|e| e.writers.len() > 1)
             .unwrap_or(false)
     }
 
     pub fn contention_score(&self, addr: u64) -> u32 {
-        self.lines.get(&(addr >> CACHE_LINE_SHIFT))
+        self.lines
+            .get(&(addr >> CACHE_LINE_SHIFT))
             .map(|e| e.writers.len() as u32)
             .unwrap_or(0)
     }
@@ -104,10 +115,15 @@ pub struct CacheHeatmap {
 impl CacheHeatmap {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { per_node: HashMap::new() }
+        Self {
+            per_node: HashMap::new(),
+        }
     }
     pub fn record_miss(&mut self, nid: NodeId) {
-        let e = self.per_node.entry(nid).or_insert(CacheMissEntry { count: 0, heat: 0.0 });
+        let e = self.per_node.entry(nid).or_insert(CacheMissEntry {
+            count: 0,
+            heat: 0.0,
+        });
         e.count += 1;
         e.heat = (e.heat + 1.0).min(1.0);
     }
@@ -151,8 +167,11 @@ impl WorldInner {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            nodes: BTreeMap::new(), edges: BTreeMap::new(), insn_counter: 0,
-            reg_file: LiveRegisterFile::new(), cache_heat: CacheHeatmap::new(),
+            nodes: BTreeMap::new(),
+            edges: BTreeMap::new(),
+            insn_counter: 0,
+            reg_file: LiveRegisterFile::new(),
+            cache_heat: CacheHeatmap::new(),
             cl_tracker: CacheLineTracker::new(),
         }
     }
@@ -165,27 +184,50 @@ pub struct WorldState {
 impl WorldState {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { inner: Arc::new(WorldInner::new()) }
+        Self {
+            inner: Arc::new(WorldInner::new()),
+        }
     }
 
-    pub fn snapshot(&self) -> Arc<WorldInner> { Arc::clone(&self.inner) }
+    pub fn snapshot(&self) -> Arc<WorldInner> {
+        Arc::clone(&self.inner)
+    }
 
     #[inline]
-    fn cow(&mut self) -> &mut WorldInner { Arc::make_mut(&mut self.inner) }
+    fn cow(&mut self) -> &mut WorldInner {
+        Arc::make_mut(&mut self.inner)
+    }
 
-    pub fn insn_counter(&self) -> u64 { self.inner.insn_counter }
-    pub fn inc_insn_counter(&mut self) { self.cow().insn_counter += 1; }
+    pub fn insn_counter(&self) -> u64 {
+        self.inner.insn_counter
+    }
+    pub fn inc_insn_counter(&mut self) {
+        self.cow().insn_counter += 1;
+    }
 
     pub fn ensure_node(
-        &mut self, id: NodeId, name: &str, type_info: &TypeInfo,
-        addr: u64, size: u64,
+        &mut self,
+        id: NodeId,
+        name: &str,
+        type_info: &TypeInfo,
+        addr: u64,
+        size: u64,
     ) -> bool {
         let inner = self.cow();
-        if inner.nodes.contains_key(&id) { return false; }
-        inner.nodes.insert(id, Node {
-            name: name.to_string(), type_info: type_info.clone(),
-            addr, size, raw_value: 0, last_write_insn: 0,
-        });
+        if inner.nodes.contains_key(&id) {
+            return false;
+        }
+        inner.nodes.insert(
+            id,
+            Node {
+                name: name.to_string(),
+                type_info: type_info.clone(),
+                addr,
+                size,
+                raw_value: 0,
+                last_write_insn: 0,
+            },
+        );
         true
     }
 
@@ -211,9 +253,12 @@ impl WorldState {
 
     pub fn remove_frame_nodes(&mut self, frame_id: crate::index::FrameId) {
         let inner = self.cow();
-        let dead: Vec<NodeId> = inner.nodes.keys()
+        let dead: Vec<NodeId> = inner
+            .nodes
+            .keys()
             .filter(|k| matches!(k, NodeId::Local(fid, _) if *fid == frame_id))
-            .copied().collect();
+            .copied()
+            .collect();
         for id in &dead {
             inner.nodes.remove(id);
             inner.edges.remove(id);
@@ -226,21 +271,36 @@ impl WorldState {
         let inner = self.cow();
         match target {
             Some(tgt) => {
-                inner.edges.insert(source, PointerEdge {
-                    source, target: tgt, ptr_value, is_dangling: false,
-                });
+                inner.edges.insert(
+                    source,
+                    PointerEdge {
+                        source,
+                        target: tgt,
+                        ptr_value,
+                        is_dangling: false,
+                    },
+                );
             }
-            None if ptr_value == 0 => { inner.edges.remove(&source); }
+            None if ptr_value == 0 => {
+                inner.edges.remove(&source);
+            }
             None => {
-                inner.edges.insert(source, PointerEdge {
-                    source, target: NodeId::Global(u32::MAX),
-                    ptr_value, is_dangling: true,
-                });
+                inner.edges.insert(
+                    source,
+                    PointerEdge {
+                        source,
+                        target: NodeId::Global(u32::MAX),
+                        ptr_value,
+                        is_dangling: true,
+                    },
+                );
             }
         }
     }
 
-    pub fn regs(&self) -> [u64; REG_COUNT] { self.inner.reg_file.values }
+    pub fn regs(&self) -> [u64; REG_COUNT] {
+        self.inner.reg_file.values
+    }
 
     pub fn update_regs(&mut self, regs: [u64; REG_COUNT], insn: u64) {
         self.cow().reg_file.update(regs, insn);
@@ -262,8 +322,12 @@ impl WorldState {
         self.cow().cl_tracker.tick();
     }
 
-    pub fn node_count(&self) -> usize { self.inner.nodes.len() }
-    pub fn edge_count(&self) -> usize { self.inner.edges.len() }
+    pub fn node_count(&self) -> usize {
+        self.inner.nodes.len()
+    }
+    pub fn edge_count(&self) -> usize {
+        self.inner.edges.len()
+    }
 }
 
 // per-thread shadow stack. validates CALL/RETURN pairing.
@@ -284,11 +348,19 @@ pub struct ShadowStack {
 impl ShadowStack {
     #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self { frames: Vec::with_capacity(64), mismatches: 0, max_depth: 0 }
+        Self {
+            frames: Vec::with_capacity(64),
+            mismatches: 0,
+            max_depth: 0,
+        }
     }
 
     pub fn push_call(&mut self, frame_id: crate::index::FrameId, callee_pc: u64, name: String) {
-        self.frames.push(ShadowFrame { frame_id, callee_pc, name });
+        self.frames.push(ShadowFrame {
+            frame_id,
+            callee_pc,
+            name,
+        });
         if self.frames.len() > self.max_depth {
             self.max_depth = self.frames.len();
         }
@@ -298,11 +370,16 @@ impl ShadowStack {
     pub fn pop_return(&mut self) -> Option<ShadowFrame> {
         match self.frames.pop() {
             Some(f) => Some(f),
-            None => { self.mismatches += 1; None }
+            None => {
+                self.mismatches += 1;
+                None
+            }
         }
     }
 
-    pub fn depth(&self) -> usize { self.frames.len() }
+    pub fn depth(&self) -> usize {
+        self.frames.len()
+    }
 }
 
 // circular snapshot buffer with triple-index for time-travel
@@ -329,12 +406,22 @@ pub struct SnapRef<'a> {
 
 impl SnapshotRing {
     pub fn new(cap: usize) -> Self {
-        Self { buf: Vec::with_capacity(cap), cap, write_pos: 0, len: 0 }
+        Self {
+            buf: Vec::with_capacity(cap),
+            cap,
+            write_pos: 0,
+            len: 0,
+        }
     }
 
     pub fn push(&mut self, snap: Arc<WorldInner>, tick: u64, event_seq: u64) {
         let insn = snap.insn_counter;
-        let entry = SnapEntry { snap, insn, tick, event_seq };
+        let entry = SnapEntry {
+            snap,
+            insn,
+            tick,
+            event_seq,
+        };
         if self.buf.len() < self.cap {
             self.buf.push(entry);
         } else {
@@ -344,60 +431,105 @@ impl SnapshotRing {
         self.len = (self.len + 1).min(self.cap);
     }
 
-    pub fn len(&self) -> usize { self.len }
-    pub fn is_empty(&self) -> bool { self.len == 0 }
+    pub fn len(&self) -> usize {
+        self.len
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
 
     // index 0 = oldest, len-1 = newest
     fn slot(&self, idx: usize) -> Option<&SnapEntry> {
-        if idx >= self.len { return None; }
-        let start = if self.len < self.cap { 0 } else { self.write_pos };
+        if idx >= self.len {
+            return None;
+        }
+        let start = if self.len < self.cap {
+            0
+        } else {
+            self.write_pos
+        };
         let real = (start + idx) % self.cap;
         Some(&self.buf[real])
     }
 
     pub fn get(&self, idx: usize) -> Option<SnapRef<'_>> {
         self.slot(idx).map(|e| SnapRef {
-            snap: &e.snap, insn: e.insn, tick: e.tick, event_seq: e.event_seq,
+            snap: &e.snap,
+            insn: e.insn,
+            tick: e.tick,
+            event_seq: e.event_seq,
         })
     }
 
     pub fn latest(&self) -> Option<SnapRef<'_>> {
-        if self.len == 0 { return None; }
+        if self.len == 0 {
+            return None;
+        }
         self.get(self.len - 1)
     }
 
     // binary search by insn counter, returns nearest <= target
     pub fn find_by_insn(&self, target_insn: u64) -> Option<usize> {
-        if self.len == 0 { return None; }
+        if self.len == 0 {
+            return None;
+        }
         let mut lo = 0usize;
         let mut hi = self.len;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.slot(mid).unwrap().insn <= target_insn { lo = mid + 1; } else { hi = mid; }
+            if self.slot(mid).unwrap().insn <= target_insn {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        if lo > 0 { Some(lo - 1) } else { None }
+        if lo > 0 {
+            Some(lo - 1)
+        } else {
+            None
+        }
     }
 
     pub fn find_by_tick(&self, target_tick: u64) -> Option<usize> {
-        if self.len == 0 { return None; }
+        if self.len == 0 {
+            return None;
+        }
         let mut lo = 0usize;
         let mut hi = self.len;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.slot(mid).unwrap().tick <= target_tick { lo = mid + 1; } else { hi = mid; }
+            if self.slot(mid).unwrap().tick <= target_tick {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        if lo > 0 { Some(lo - 1) } else { None }
+        if lo > 0 {
+            Some(lo - 1)
+        } else {
+            None
+        }
     }
 
     pub fn find_by_seq(&self, target_seq: u64) -> Option<usize> {
-        if self.len == 0 { return None; }
+        if self.len == 0 {
+            return None;
+        }
         let mut lo = 0usize;
         let mut hi = self.len;
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
-            if self.slot(mid).unwrap().event_seq <= target_seq { lo = mid + 1; } else { hi = mid; }
+            if self.slot(mid).unwrap().event_seq <= target_seq {
+                lo = mid + 1;
+            } else {
+                hi = mid;
+            }
         }
-        if lo > 0 { Some(lo - 1) } else { None }
+        if lo > 0 {
+            Some(lo - 1)
+        } else {
+            None
+        }
     }
 }
 
@@ -407,7 +539,12 @@ mod tests {
     use crate::dwarf::TypeInfo;
 
     fn ti(name: &str, sz: u64, ptr: bool) -> TypeInfo {
-        TypeInfo { name: name.into(), byte_size: sz, is_pointer: ptr, fields: Vec::new() }
+        TypeInfo {
+            name: name.into(),
+            byte_size: sz,
+            is_pointer: ptr,
+            fields: Vec::new(),
+        }
     }
 
     #[test]
