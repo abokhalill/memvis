@@ -14,8 +14,8 @@ memvis consists of two cooperating OS processes connected by POSIX shared memory
 
 ```
  +---------------------------+        shared memory        +---------------------------+
- |         TRACER            |  ========================>  |          ENGINE            |
- |  (DynamoRIO client, C)   |   per-thread SPSC rings     |  (Rust consumer + TUI)    |
+ |         TRACER            |  ========================>  |          ENGINE           |
+ |  (DynamoRIO client, C)    |   per-thread SPSC rings     |  (Rust consumer + TUI)    |
  |                           |   control ring              |                           |
  |  - instruments target     |                             |  - DWARF parser           |
  |  - emits 32-byte events   |                             |  - address index          |
@@ -207,6 +207,25 @@ exactly once per process lifetime.
 | Engine | libc | 0.2 | POSIX shared memory |
 
 ## Build
+
+### Docker (recommended)
+
+The multi-stage Dockerfile builds the tracer and engine in an isolated
+environment, then produces a minimal runtime image containing only the compiled
+binaries and the DynamoRIO shared libraries needed for execution:
+
+```
+DOCKER_BUILDKIT=1 docker build -t memvis .
+docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v /path/to/my_program:/app/my_program \
+    memvis /app/my_program
+```
+
+The `--cap-add=SYS_PTRACE` flag is required because DynamoRIO uses `ptrace` for
+process attachment. Mount your `-g` compiled target binary into the container
+with `-v`.
+
+### Manual
 
 The tracer is built with CMake (requires DynamoRIO SDK):
 

@@ -47,6 +47,9 @@ pub struct RingHeader {
 const _: () = assert!(mem::size_of::<RingHeader>() == 3 * CACHE_LINE);
 
 impl RingHeader {
+    /// # Safety
+    /// Caller must ensure `self` points to a valid mapped ring with data region
+    /// immediately following the header.
     pub unsafe fn data(&self) -> *const Event {
         (self as *const Self as *const u8).add(mem::size_of::<Self>()) as *const Event
     }
@@ -61,7 +64,7 @@ struct ThreadEntry {
 }
 
 const THREAD_STATE_EMPTY: u32 = 0;
-const THREAD_STATE_ACTIVE: u32 = 1;
+const _THREAD_STATE_ACTIVE: u32 = 1;
 const THREAD_STATE_DEAD: u32 = 2;
 
 #[repr(C)]
@@ -199,6 +202,7 @@ pub struct RingOrchestrator {
 }
 
 impl RingOrchestrator {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self { ctl: None, rings: Vec::new(), known_count: 0, rr_idx: 0 }
     }

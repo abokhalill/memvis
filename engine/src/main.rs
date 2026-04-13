@@ -21,6 +21,7 @@ const EVENT_MODULE_LOAD: u8  = 7;
 
 // returns true if event was "interesting" (tracked write, or control event)
 #[inline]
+#[allow(clippy::too_many_arguments)]
 fn process_event(
     ev: &Event,
     ring_idx: usize,
@@ -48,7 +49,7 @@ fn process_event(
                 }
                 return true;
             }
-            return false;
+            false
         }
         EVENT_CALL => {
             if let Some(ref info) = dwarf_info {
@@ -287,6 +288,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     tui::restore_terminal(&mut terminal);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_headless(
     orch: &mut RingOrchestrator,
     dwarf_info: &Option<DwarfInfo>,
@@ -439,8 +441,7 @@ fn headless_render(
     let tail_n = 12usize;
     let start = if journal.len() > tail_n { journal.len() - tail_n } else { 0 };
     let _ = writeln!(out, "\nEVENTS (last {})", tail_n);
-    for i in start..journal.len() {
-        let e = &journal[i];
+    for e in journal.iter().skip(start) {
         let kind_str = match e.kind { 0=>"W", 1=>"R", 2=>"CALL", 3=>"RET", 4=>"OVF", 5=>"REG", 6=>"CMIS", 7=>"MLOAD", _=>"?" };
         let _ = writeln!(out, "  {:>8} {:<5} T{:<3} {:>12x}  {:>4}  {:>16x}",
             e.seq, kind_str, e.thread_id, e.addr, e.size, e.value);
@@ -449,7 +450,7 @@ fn headless_render(
 
 fn cleanup_shm() {
     // remove ctl ring
-    unsafe { libc::shm_unlink(b"/memvis_ctl\0".as_ptr() as *const libc::c_char); }
+    unsafe { libc::shm_unlink(c"/memvis_ctl".as_ptr()); }
     // remove per-thread rings (best effort, up to 256)
     for i in 0..256u32 {
         let name = format!("/memvis_ring_{}\0", i);
@@ -516,8 +517,8 @@ extern "C" fn signal_handler(_sig: libc::c_int) {
 
 fn install_signal_handlers() {
     unsafe {
-        libc::signal(libc::SIGINT, signal_handler as libc::sighandler_t);
-        libc::signal(libc::SIGTERM, signal_handler as libc::sighandler_t);
+        libc::signal(libc::SIGINT, signal_handler as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, signal_handler as *const () as libc::sighandler_t);
     }
 }
 
@@ -634,7 +635,7 @@ fn print_usage() {
     eprintln!("  memvis --once <target> [args...]  Headless mode (print to stdout, exit)");
     eprintln!("  memvis --consumer-only [--once] [--min-events N] <target.elf>");
     eprintln!("                                    Consumer-only (tracer started separately)");
-    eprintln!("");
+    eprintln!();
     eprintln!("Environment:");
     eprintln!("  DYNAMORIO_HOME   Path to DynamoRIO installation");
     eprintln!("  MEMVIS_DRRUN     Explicit path to drrun binary");

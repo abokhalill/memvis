@@ -1,0 +1,6 @@
+engine/target/
+build/
+dynamorio-sdk/
+test/
+.git/
+docs/

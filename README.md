@@ -47,6 +47,17 @@ POINTER EDGES
 
 ## Build
 
+### Docker (recommended)
+
+```sh
+DOCKER_BUILDKIT=1 docker build -t memvis .
+docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v /path/to/my_program:/app/my_program \
+    memvis /app/my_program
+```
+
+### Manual
+
 ```sh
 # engine (Rust consumer + TUI)
 cd engine

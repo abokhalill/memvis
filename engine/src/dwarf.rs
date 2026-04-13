@@ -538,7 +538,7 @@ fn decode_location<'a>(
             }
         }
         _ => {
-            if let Ok(Some(offset)) = dwarf.attr_locations_offset(unit, attr.clone()) {
+            if let Ok(Some(offset)) = dwarf.attr_locations_offset(unit, *attr) {
                 if let Ok(mut iter) = dwarf.locations(unit, offset) {
                     let mut entries = Vec::new();
                     while let Ok(Some(entry)) = iter.next() {
@@ -685,7 +685,7 @@ fn extract_locals<'a>(
     let mut fn_depth: isize = 0;
 
     while let Some((delta_depth, entry)) = entries.next_dfs()? {
-        depth += delta_depth as isize;
+        depth += delta_depth;
         if current_fn_pc.is_some() && depth <= fn_depth {
             current_fn_pc = None;
         }

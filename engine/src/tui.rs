@@ -33,6 +33,7 @@ pub struct EventFilter {
 }
 
 impl EventFilter {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self { Self { thread_id: None, hide_reads: false, writes_only: false } }
     pub fn is_active(&self) -> bool { self.thread_id.is_some() || self.hide_reads || self.writes_only }
     pub fn matches(&self, entry: &JournalEntry) -> bool {
@@ -57,6 +58,7 @@ pub struct AppState {
 }
 
 impl AppState {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             mem_scroll: 0, evt_scroll: 0, focus: Panel::Memory,
@@ -110,15 +112,12 @@ pub fn handle_input(state: &mut AppState) {
                 }
                 KeyCode::Right | KeyCode::Char('l') => {
                     let max = state.snap_count.saturating_sub(1);
-                    match state.time_travel_idx {
-                        Some(idx) => {
-                            if idx >= max {
-                                state.time_travel_idx = None; // back to live
-                            } else {
-                                state.time_travel_idx = Some(idx + 1);
-                            }
+                    if let Some(idx) = state.time_travel_idx {
+                        if idx >= max {
+                            state.time_travel_idx = None; // back to live
+                        } else {
+                            state.time_travel_idx = Some(idx + 1);
                         }
-                        None => {} // already live
                     }
                 }
                 KeyCode::End => {
@@ -308,6 +307,7 @@ fn build_event_lines(journal: &VecDeque<JournalEntry>, filter: &EventFilter) -> 
     }).collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     world: &WorldInner,

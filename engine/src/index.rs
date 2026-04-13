@@ -43,6 +43,7 @@ pub struct AddressIndex {
 }
 
 impl AddressIndex {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self { intervals: Vec::with_capacity(2048), needs_sort: false }
     }

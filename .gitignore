@@ -1,4 +1,4 @@
-engine/target/
+target/
 **/*.rs.bk
 build/
 CMakeCache.txt
@@ -8,6 +8,8 @@ Makefile
 *.o
 *.so
 *.dylib
+dynamorio-sdk
+test/
 .vscode/
 .idea/
 *.swp

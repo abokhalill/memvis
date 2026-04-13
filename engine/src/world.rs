@@ -23,6 +23,7 @@ pub struct LiveRegisterFile {
 }
 
 impl LiveRegisterFile {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self { values: [0; REG_COUNT], prev: [0; REG_COUNT], insn: 0 }
     }
@@ -49,6 +50,7 @@ pub struct CacheLineTracker {
 }
 
 impl CacheLineTracker {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self { Self { lines: HashMap::new() } }
 
     pub fn record_write(&mut self, addr: u64, thread_id: u16) {
@@ -100,6 +102,7 @@ pub struct CacheHeatmap {
 }
 
 impl CacheHeatmap {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self { per_node: HashMap::new() }
     }
@@ -145,6 +148,7 @@ pub struct WorldInner {
 }
 
 impl WorldInner {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
             nodes: BTreeMap::new(), edges: BTreeMap::new(), insn_counter: 0,
@@ -159,6 +163,7 @@ pub struct WorldState {
 }
 
 impl WorldState {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self { inner: Arc::new(WorldInner::new()) }
     }
@@ -277,6 +282,7 @@ pub struct ShadowStack {
 }
 
 impl ShadowStack {
+    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self { frames: Vec::with_capacity(64), mismatches: 0, max_depth: 0 }
     }
