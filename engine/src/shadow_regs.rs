@@ -9,7 +9,7 @@ const CALLEE_SAVED: [usize; 6] = [1, 6, 12, 13, 14, 15];
 const CALLER_SAVED: [usize; 9] = [0, 2, 3, 4, 5, 8, 9, 10, 11];
 const ARG_REGS: [usize; 6] = [5, 4, 3, 2, 8, 9]; // rdi,rsi,rdx,rcx,r8,r9
 
-// dwarf reg# → memvis reg_file index. note: dwarf 1=rdx(3), 2=rcx(2), 3=rbx(1)
+// dwarf reg# -> memvis reg_file index. note: dwarf 1=rdx(3), 2=rcx(2), 3=rbx(1)
 const DWARF_TO_IDX: [Option<usize>; 17] = [
     Some(0), Some(3), Some(2), Some(1), Some(4), Some(5), Some(6), Some(7),
     Some(8), Some(9), Some(10), Some(11), Some(12), Some(13), Some(14), Some(15),
@@ -79,6 +79,8 @@ pub struct ShadowReg {
     pub last_pc: u64,
     // memory address this register was loaded from (for coherence checks)
     pub mem_source: Option<u64>,
+    // byte width of the original load (4 for MOV r32; 8 for MOV r64)
+    pub mem_source_size: u32,
 }
 
 impl ShadowReg {
@@ -90,6 +92,7 @@ impl ShadowReg {
             last_seq: 0,
             last_pc: 0,
             mem_source: None,
+            mem_source_size: 0,
         }
     }
 
@@ -101,6 +104,7 @@ impl ShadowReg {
         self.last_pc = pc;
         // clear source unless caller sets it explicitly
         self.mem_source = None;
+        self.mem_source_size = 0;
     }
 }
 
@@ -249,7 +253,7 @@ impl ShadowRegisterFile {
 
     // semantic reload: MOV reg, [mem] captured by tracer's selective instrumenter.
     // ground-truth anchor: we know the register's exact value and source address.
-    pub fn on_reload(&mut self, reg_idx: usize, value: u64, from_addr: u64, seq: u64, pc: u64) {
+    pub fn on_reload(&mut self, reg_idx: usize, value: u64, from_addr: u64, load_size: u32, seq: u64, pc: u64) {
         if reg_idx >= REG_COUNT { return; }
         self.regs[reg_idx].set(
             value,
@@ -259,20 +263,28 @@ impl ShadowRegisterFile {
             pc,
         );
         self.regs[reg_idx].mem_source = Some(from_addr);
+        self.regs[reg_idx].mem_source_size = load_size;
     }
 
     // dirty-shadow coherence check: called on every WRITE event.
-    // if any register's mem_source matches the written address, and the write
-    // came from a *different* thread (foreign_tid != self_tid), mark it Stale.
-    // also marks stale if same thread wrote a different value to the source.
-    pub fn check_coherence(&mut self, written_addr: u64, written_value: u64, _write_seq: u64) {
+    // uses proper interval overlap: write [w, w+ws) ∩ source [s, s+ss) ≠ ∅.
+    // for wide writes (>8 bytes, e.g. SSE/AVX), value comparison is skipped
+    // because the 64-bit event value can't represent the full written data.
+    pub fn check_coherence(&mut self, written_addr: u64, written_value: u64, write_size: u32, _write_seq: u64) {
+        let w_end = written_addr.saturating_add(write_size.max(1) as u64);
         for i in 0..REG_COUNT {
             if let Some(src) = self.regs[i].mem_source {
-                // check if written address overlaps the source (8-byte window)
-                if written_addr <= src && src < written_addr + 8 {
-                    if self.regs[i].value != written_value
-                        && self.regs[i].confidence > Confidence::Stale
-                    {
+                let s_size = self.regs[i].mem_source_size.max(1) as u64;
+                let s_end = src.saturating_add(s_size);
+                // interval overlap: [written_addr, w_end) ∩ [src, s_end)
+                if written_addr < s_end && src < w_end {
+                    // wide writes (>8B): value field is truncated/zero, always stale
+                    let definitely_changed = if write_size > 8 {
+                        true
+                    } else {
+                        self.regs[i].value != written_value
+                    };
+                    if definitely_changed && self.regs[i].confidence > Confidence::Stale {
                         self.regs[i].confidence = Confidence::Stale;
                     }
                 }
@@ -711,7 +723,7 @@ mod tests {
     fn test_reload_sets_observed_and_mem_source() {
         let mut srf = ShadowRegisterFile::new();
         // R12 = idx 12. load from 0x5555_0000_1000
-        srf.on_reload(12, 0xCAFEBABE, 0x5555_0000_1000, 100, 0x4000);
+        srf.on_reload(12, 0xCAFEBABE, 0x5555_0000_1000, 8, 100, 0x4000);
         assert_eq!(srf.regs[12].value, 0xCAFEBABE);
         assert_eq!(srf.regs[12].confidence, Confidence::Observed);
         assert_eq!(srf.regs[12].mem_source, Some(0x5555_0000_1000));
@@ -722,11 +734,11 @@ mod tests {
     fn test_coherence_marks_stale_on_foreign_write() {
         let mut srf = ShadowRegisterFile::new();
         // simulate reload: R12 loaded from 0x5555_0000_1000
-        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 8, 100, 0x4000);
         assert_eq!(srf.regs[12].confidence, Confidence::Observed);
 
         // foreign thread writes a *different* value to the same address
-        srf.check_coherence(0x5555_0000_1000, 0xBBBB, 200);
+        srf.check_coherence(0x5555_0000_1000, 0xBBBB, 8, 200);
         assert_eq!(srf.regs[12].confidence, Confidence::Stale);
         assert!(srf.regs[12].confidence.is_stale());
     }
@@ -734,34 +746,183 @@ mod tests {
     #[test]
     fn test_coherence_no_stale_if_same_value() {
         let mut srf = ShadowRegisterFile::new();
-        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 8, 100, 0x4000);
 
         // write same value: no staleness
-        srf.check_coherence(0x5555_0000_1000, 0xAAAA, 200);
+        srf.check_coherence(0x5555_0000_1000, 0xAAAA, 8, 200);
         assert_eq!(srf.regs[12].confidence, Confidence::Observed);
     }
 
     #[test]
     fn test_coherence_no_stale_if_unrelated_address() {
         let mut srf = ShadowRegisterFile::new();
-        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 8, 100, 0x4000);
 
         // write to unrelated address
-        srf.check_coherence(0x5555_0000_2000, 0xBBBB, 200);
+        srf.check_coherence(0x5555_0000_2000, 0xBBBB, 8, 200);
         assert_eq!(srf.regs[12].confidence, Confidence::Observed);
     }
 
     #[test]
     fn test_reload_clears_stale() {
         let mut srf = ShadowRegisterFile::new();
-        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 100, 0x4000);
-        srf.check_coherence(0x5555_0000_1000, 0xBBBB, 200);
+        srf.on_reload(12, 0xAAAA, 0x5555_0000_1000, 8, 100, 0x4000);
+        srf.check_coherence(0x5555_0000_1000, 0xBBBB, 8, 200);
         assert_eq!(srf.regs[12].confidence, Confidence::Stale);
 
         // fresh reload restores Observed
-        srf.on_reload(12, 0xBBBB, 0x5555_0000_1000, 300, 0x4010);
+        srf.on_reload(12, 0xBBBB, 0x5555_0000_1000, 8, 300, 0x4010);
         assert_eq!(srf.regs[12].confidence, Confidence::Observed);
         assert_eq!(srf.regs[12].value, 0xBBBB);
+    }
+
+    #[test]
+    fn test_adversarial_sse_unaligned_cross_cacheline() {
+        let mut srf = ShadowRegisterFile::new();
+        // R12 loaded 8 bytes from 0x103C (straddles cache-line at 0x1040)
+        srf.on_reload(12, 0xDEAD_BEEF_CAFE_F00D, 0x103C, 8, 100, 0x4000);
+        assert_eq!(srf.regs[12].confidence, Confidence::Observed);
+        assert_eq!(srf.regs[12].mem_source_size, 8);
+
+        // 16-byte SSE movups to 0x1038: covers [0x1038..0x1048)
+        // value is 0 because safe_read_value clamps to 8B for size>8
+        // overlap: [0x1038, 0x1048) ∩ [0x103C, 0x1044) = [0x103C, 0x1044) ≠ ∅
+        srf.check_coherence(0x1038, 0 /* truncated */, 16, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
+            "16B SSE write overlapping upper portion of 8B source must mark Stale");
+    }
+
+    // Sub-case: SSE write where only the FIRST 4 bytes overlap the tail of
+    // a register's source range. Tests the low-end boundary.
+    #[test]
+    fn test_adversarial_sse_partial_low_overlap() {
+        let mut srf = ShadowRegisterFile::new();
+        // R13 loaded 8B from 0x1000. source range: [0x1000..0x1008)
+        srf.on_reload(13, 0x1111_2222_3333_4444, 0x1000, 8, 100, 0x4000);
+
+        // 16-byte write to 0x0FF8: covers [0x0FF8..0x1008)
+        // overlaps the last 8 bytes of the write with source
+        srf.check_coherence(0x0FF8, 0, 16, 200);
+        assert_eq!(srf.regs[13].confidence, Confidence::Stale,
+            "16B write starting below source but overlapping it must trigger Stale");
+    }
+
+    // Sub-case: 16-byte write that is completely BEFORE the source — no overlap.
+    #[test]
+    fn test_adversarial_sse_no_overlap() {
+        let mut srf = ShadowRegisterFile::new();
+        srf.on_reload(12, 0xAAAA, 0x1040, 8, 100, 0x4000);
+
+        // 16-byte write to 0x1020: covers [0x1020..0x1030). No overlap with [0x1040..0x1048).
+        srf.check_coherence(0x1020, 0, 16, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Observed,
+            "16B write entirely before source must NOT trigger Stale");
+    }
+
+    // The tracer-level bug (no RELOAD for atomic RMW) is a separate issue;
+    // this test validates the coherence path works for the WRITE half.
+    #[test]
+    fn test_adversarial_atomic_rmw_write_coherence() {
+        let mut srf_a = ShadowRegisterFile::new();
+        // Thread A: R12 loaded counter value 41 from 0x2000
+        srf_a.on_reload(12, 41, 0x2000, 8, 100, 0x4000);
+        assert_eq!(srf_a.regs[12].confidence, Confidence::Observed);
+
+        // Thread B does `lock xadd [0x2000], rcx` where rcx=1.
+        // Tracer emits WRITE(addr=0x2000, value=42, size=8) — the post-increment value.
+        // Cross-thread coherence check on thread A's SRF:
+        srf_a.check_coherence(0x2000, 42, 8, 200);
+        assert_eq!(srf_a.regs[12].confidence, Confidence::Stale,
+            "lock xadd post-increment write must invalidate stale shadow of pre-increment value");
+        assert_eq!(srf_a.regs[12].value, 41,
+            "Stale register must retain old value (not silently update to new)");
+    }
+
+    // Sub-case: lock cmpxchg that FAILS (old value == expected).
+    // The write still occurs (same value written back), so WRITE event fires
+    // with the same value. coherence should NOT mark stale.
+    #[test]
+    fn test_adversarial_atomic_cmpxchg_fail_no_stale() {
+        let mut srf_a = ShadowRegisterFile::new();
+        srf_a.on_reload(12, 41, 0x2000, 8, 100, 0x4000);
+
+        // lock cmpxchg fails: writes back the same value 41
+        srf_a.check_coherence(0x2000, 41, 8, 200);
+        assert_eq!(srf_a.regs[12].confidence, Confidence::Observed,
+            "Failed cmpxchg (same value written back) must NOT trigger Stale");
+    }
+
+    // Sub-case: ABA problem. lock cmpxchg succeeds, writes new value,
+    // then another cmpxchg writes the ORIGINAL value back.
+    // The register should be marked stale after the first write,
+    // and should NOT be "healed" by the second write without a reload.
+    #[test]
+    fn test_adversarial_atomic_aba_sequence() {
+        let mut srf_a = ShadowRegisterFile::new();
+        srf_a.on_reload(12, 41, 0x2000, 8, 100, 0x4000);
+
+        // step 1: cmpxchg succeeds, writes 42
+        srf_a.check_coherence(0x2000, 42, 8, 200);
+        assert_eq!(srf_a.regs[12].confidence, Confidence::Stale);
+
+        // step 2: another thread writes 41 back (ABA)
+        // BUT: once Stale, same-value writes don't heal it because
+        // Stale <= Stale is false (confidence > Stale check fails).
+        srf_a.check_coherence(0x2000, 41, 8, 300);
+        assert_eq!(srf_a.regs[12].confidence, Confidence::Stale,
+            "ABA write-back must NOT silently heal a stale register — only a RELOAD can");
+    }
+
+    // Scenario: struct { uint64_t lo; uint64_t hi; } at address 0x3000.
+    // DWARF says: lo → R12 (DW_OP_piece 8), hi → R13 (DW_OP_piece 8).
+    // R12 loaded from 0x3000 (8B), R13 loaded from 0x3008 (8B).
+    // Thread B does a 16-byte write to 0x3000 (e.g. SSE store of the whole struct).
+    // BOTH registers must be invalidated.
+    #[test]
+    fn test_adversarial_false_sharing_adjacent_pieces() {
+        let mut srf = ShadowRegisterFile::new();
+        // R12 = lo, loaded from 0x3000, 8 bytes
+        srf.on_reload(12, 0xAAAA_AAAA, 0x3000, 8, 100, 0x4000);
+        // R13 = hi, loaded from 0x3008, 8 bytes
+        srf.on_reload(13, 0xBBBB_BBBB, 0x3008, 8, 101, 0x4004);
+
+        // 16-byte write to 0x3000: covers [0x3000..0x3010)
+        // R12 source [0x3000..0x3008) — fully contained
+        // R13 source [0x3008..0x3010) — fully contained
+        srf.check_coherence(0x3000, 0, 16, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
+            "Wide write covering lo piece must invalidate R12");
+        assert_eq!(srf.regs[13].confidence, Confidence::Stale,
+            "Wide write covering hi piece must invalidate R13");
+    }
+
+    // Sub-case: 8-byte write to 0x3000 should ONLY invalidate R12, not R13.
+    #[test]
+    fn test_adversarial_false_sharing_selective_invalidation() {
+        let mut srf = ShadowRegisterFile::new();
+        srf.on_reload(12, 0xAAAA, 0x3000, 8, 100, 0x4000);
+        srf.on_reload(13, 0xBBBB, 0x3008, 8, 101, 0x4004);
+
+        // 8-byte write to 0x3000: covers [0x3000..0x3008) only
+        srf.check_coherence(0x3000, 0xCCCC, 8, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
+            "8B write to lo must invalidate R12");
+        assert_eq!(srf.regs[13].confidence, Confidence::Observed,
+            "8B write to lo must NOT invalidate R13 (false-sharing boundary)");
+    }
+
+    // Sub-case: 4-byte write at offset +4 within R12's 8-byte source.
+    // Partial overlap within a single register's source.
+    #[test]
+    fn test_adversarial_partial_intra_register_overlap() {
+        let mut srf = ShadowRegisterFile::new();
+        // R12 loaded 8B from 0x3000
+        srf.on_reload(12, 0xDEADBEEF_CAFEBABE, 0x3000, 8, 100, 0x4000);
+
+        // 4-byte write to 0x3004: covers [0x3004..0x3008), overlaps [0x3000..0x3008)
+        srf.check_coherence(0x3004, 0xFFFF_FFFF, 4, 200);
+        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
+            "4B write to upper half of 8B source must still invalidate");
     }
 
     #[test]

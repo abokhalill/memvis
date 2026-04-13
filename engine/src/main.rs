@@ -59,7 +59,7 @@ fn process_event(
             // thread's register that was loaded from this address.
             for (&tid, srf) in shadow_regs.iter_mut() {
                 if tid != ev.thread_id {
-                    srf.check_coherence(ev.addr, ev.value, ev.seq as u64);
+                    srf.check_coherence(ev.addr, ev.value, ev.size, ev.seq as u64);
                 }
             }
             // heap graph: feed writes to heap addresses
@@ -187,7 +187,7 @@ fn process_event(
             let srf = shadow_regs
                 .entry(ev.thread_id)
                 .or_insert_with(ShadowRegisterFile::new);
-            srf.on_reload(reg_idx, ev.value, ev.addr, ev.seq as u64, ev.addr);
+            srf.on_reload(reg_idx, ev.value, ev.addr, ev.size, ev.seq as u64, ev.addr);
             true
         }
         EVENT_MODULE_LOAD => {
