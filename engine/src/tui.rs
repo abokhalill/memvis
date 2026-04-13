@@ -626,6 +626,7 @@ pub fn draw(
                 Confidence::AbiInferred => Color::Cyan,
                 Confidence::WriteBack => Color::Yellow,
                 Confidence::Speculative => Color::Magenta,
+                Confidence::Stale => Color::Red,
                 Confidence::Unknown => Color::DarkGray,
             };
             let matches_addr = val != 0
@@ -655,9 +656,14 @@ pub fn draw(
                     Style::default().fg(conf_color),
                 ),
                 Span::styled(
-                    format!(" {:<4}", conf_label),
+                    format!(" {:<5}", conf_label),
                     Style::default().fg(conf_color),
                 ),
+                if conf.is_stale() {
+                    Span::styled(" !! ", Style::default().fg(Color::White).bg(Color::Red).bold())
+                } else {
+                    Span::raw("")
+                },
             ]));
         }
         let srf_title = if active_srf.is_some() {
