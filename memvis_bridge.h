@@ -34,6 +34,7 @@
 #define MEMVIS_EVENT_ALLOC        9
 #define MEMVIS_EVENT_FREE        10
 #define MEMVIS_EVENT_BB_ENTRY    11
+#define MEMVIS_EVENT_RELOAD      12
 
 #define MEMVIS_REG_SNAPSHOT_SLOTS 7
 
