@@ -13,6 +13,7 @@ use ratatui::prelude::*;
 use ratatui::widgets::*;
 
 use crate::index::NodeId;
+use crate::shadow_regs::{Confidence, ShadowRegisterFile};
 use crate::world::{ShadowStack, WorldInner, REG_COUNT, REG_NAMES};
 
 #[derive(Clone)]
@@ -421,6 +422,7 @@ pub fn draw(
     snap_total: usize,
     stacks: &HashMap<u16, ShadowStack>,
     seq_gaps: u64,
+    shadow_regs: &HashMap<u16, ShadowRegisterFile>,
 ) {
     state.snap_count = snap_total;
     let mem_lines = build_mem_lines(world);
@@ -594,54 +596,76 @@ pub fn draw(
             ])
             .split(body[1]);
 
-        // registers panel
+        // registers panel: shadow register file with confidence
         let reg_border_style = if state.focus == Panel::Registers {
             Style::default().fg(Color::Cyan)
         } else {
             Style::default().fg(Color::DarkGray)
         };
-        let reg_file = &world.reg_file;
         let mut reg_lines: Vec<Line> = Vec::new();
-        for chunk in (0..REG_COUNT).collect::<Vec<_>>().chunks(3) {
-            let mut spans: Vec<Span<'static>> = Vec::new();
-            for &i in chunk {
-                if i >= REG_NAMES.len() {
-                    break;
-                }
-                let val = reg_file.values[i];
-                let changed = val != reg_file.prev[i];
-                let matches_addr = val != 0
-                    && world
-                        .nodes
-                        .values()
-                        .any(|n| val >= n.addr && val < n.addr + n.size.max(1));
-                let vclr = if matches_addr {
-                    Color::Yellow
-                } else if changed {
-                    Color::White
-                } else {
-                    Color::DarkGray
-                };
-                let nclr = if matches_addr {
-                    Color::Yellow
-                } else {
-                    Color::Cyan
-                };
-                spans.push(Span::styled(
+        // pick first active thread's SRF (or fall back to raw reg_file)
+        let active_srf = shadow_regs.values().next();
+        for i in 0..REG_COUNT {
+            if i >= REG_NAMES.len() {
+                break;
+            }
+            let (val, conf, conf_label) = if let Some(srf) = active_srf {
+                let sr = srf.reg(i);
+                (sr.value, sr.confidence, sr.confidence.label())
+            } else {
+                (world.reg_file.values[i], Confidence::Unknown, "???")
+            };
+            let bar_filled = conf.bar_tenths() as usize;
+            let bar_empty = 10 - bar_filled;
+            let bar_str: String = "\u{2588}".repeat(bar_filled)
+                + &"\u{2591}".repeat(bar_empty);
+            let conf_color = match conf {
+                Confidence::Observed => Color::Green,
+                Confidence::AbiInferred => Color::Cyan,
+                Confidence::WriteBack => Color::Yellow,
+                Confidence::Speculative => Color::Magenta,
+                Confidence::Unknown => Color::DarkGray,
+            };
+            let matches_addr = val != 0
+                && world
+                    .nodes
+                    .values()
+                    .any(|n| val >= n.addr && val < n.addr + n.size.max(1));
+            let vclr = if matches_addr {
+                Color::Yellow
+            } else if conf >= Confidence::WriteBack {
+                Color::White
+            } else {
+                Color::DarkGray
+            };
+            reg_lines.push(Line::from(vec![
+                Span::styled(
                     format!("{:>4}", REG_NAMES[i]),
-                    Style::default().fg(nclr),
-                ));
-                spans.push(Span::raw("="));
-                spans.push(Span::styled(
+                    Style::default().fg(if matches_addr { Color::Yellow } else { Color::Cyan }),
+                ),
+                Span::raw("="),
+                Span::styled(
                     format!("{:>16x} ", val),
                     Style::default().fg(vclr),
-                ));
-            }
-            reg_lines.push(Line::from(spans));
+                ),
+                Span::styled(
+                    bar_str,
+                    Style::default().fg(conf_color),
+                ),
+                Span::styled(
+                    format!(" {:<4}", conf_label),
+                    Style::default().fg(conf_color),
+                ),
+            ]));
         }
+        let srf_title = if active_srf.is_some() {
+            " Shadow Registers ".to_string()
+        } else {
+            format!(" Registers (insn {}) ", world.reg_file.insn)
+        };
         let reg_widget = Paragraph::new(reg_lines).block(
             Block::default()
-                .title(format!(" Registers (insn {}) ", reg_file.insn))
+                .title(srf_title)
                 .title_style(Style::default().fg(Color::White).bold())
                 .borders(Borders::ALL)
                 .border_style(reg_border_style),
