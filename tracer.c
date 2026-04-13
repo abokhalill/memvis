@@ -30,6 +30,7 @@ static _Atomic uint64_t g_stat_reg_snaps    = 0;
 static _Atomic uint64_t g_stat_rdbuf_flushes = 0;
 static _Atomic uint64_t g_stat_inline_writes = 0;
 static _Atomic uint64_t g_stat_spill_writes  = 0;
+static _Atomic uint64_t g_stat_reloads       = 0;
 
 static _Atomic uint16_t g_next_thread_id    = 0;
 
@@ -614,6 +615,69 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
 }
 
+// dwarf-mapped register reload: MOV reg, [mem] where reg is callee-saved.
+// event encodes: addr=source mem addr, value=loaded value, size=load width.
+// kind_flags[15:8] = dest register index (MEMVIS_REG_*).
+static void
+at_reload(uint64_t src_addr, uint32_t size, uint32_t dest_reg_idx)
+{
+    void *drcontext = dr_get_current_drcontext();
+    void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
+    if (guard != NULL) return;
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], (void *)(uintptr_t)1);
+
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    uint64_t val = safe_read_value(src_addr, size);
+    // pack dest_reg_idx into flags byte of kind_flags
+    uint8_t kind = MEMVIS_EVENT_RELOAD;
+    uint8_t flags = (uint8_t)(dest_reg_idx & 0xFF);
+    uint64_t kf = (uint64_t)kind | ((uint64_t)flags << 8);
+    memvis_push_ex(ring, src_addr, size, val, kf, tid, seq);
+    atomic_fetch_add_explicit(&g_stat_reloads, 1, memory_order_relaxed);
+
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
+}
+
+// map DR register to MEMVIS_REG_* index. returns -1 if not a tracked register.
+static int
+dr_reg_to_memvis_idx(reg_id_t reg)
+{
+    reg = reg_to_pointer_sized(reg);
+    switch (reg) {
+    case DR_REG_RAX: return MEMVIS_REG_RAX;
+    case DR_REG_RBX: return MEMVIS_REG_RBX;
+    case DR_REG_RCX: return MEMVIS_REG_RCX;
+    case DR_REG_RDX: return MEMVIS_REG_RDX;
+    case DR_REG_RSI: return MEMVIS_REG_RSI;
+    case DR_REG_RDI: return MEMVIS_REG_RDI;
+    case DR_REG_RBP: return MEMVIS_REG_RBP;
+    case DR_REG_RSP: return MEMVIS_REG_RSP;
+    case DR_REG_R8:  return MEMVIS_REG_R8;
+    case DR_REG_R9:  return MEMVIS_REG_R9;
+    case DR_REG_R10: return MEMVIS_REG_R10;
+    case DR_REG_R11: return MEMVIS_REG_R11;
+    case DR_REG_R12: return MEMVIS_REG_R12;
+    case DR_REG_R13: return MEMVIS_REG_R13;
+    case DR_REG_R14: return MEMVIS_REG_R14;
+    case DR_REG_R15: return MEMVIS_REG_R15;
+    default: return -1;
+    }
+}
+
+// callee-saved regs are the ones DWARF promotes variables into at -O3.
+// only instrument reloads into these to stay within 5% overhead budget.
+static bool
+is_dwarf_reload_candidate(reg_id_t reg)
+{
+    reg = reg_to_pointer_sized(reg);
+    return reg == DR_REG_RBX || reg == DR_REG_RBP ||
+           reg == DR_REG_R12 || reg == DR_REG_R13 ||
+           reg == DR_REG_R14 || reg == DR_REG_R15;
+}
+
 static void
 at_return(uint64_t retaddr)
 {
@@ -742,36 +806,76 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     }
 
     if (instr_reads_memory(instr)) {
-        int rd_ops = 0;
-        for (int i = 0; i < instr_num_srcs(instr); i++) {
-            if (opnd_is_memory_reference(instr_get_src(instr, i))) rd_ops++;
-        }
-        if (rd_ops > 0) {
-            dr_insert_clean_call(drcontext, bb, instr,
-                                 (void *)flush_read_buf_if_needed, false, 1,
-                                 OPND_CREATE_INT32(rd_ops));
-        }
-        for (int i = 0; i < instr_num_srcs(instr); i++) {
-            opnd_t src = instr_get_src(instr, i);
-            if (!opnd_is_memory_reference(src))
-                continue;
-            reg_id_t reg1, reg2;
-            if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg1) != DRREG_SUCCESS)
-                continue;
-            if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS) {
-                drreg_unreserve_register(drcontext, bb, instr, reg1);
-                continue;
+        // selective reload detection: MOV reg, [mem] into DWARF-promoted regs.
+        // only fires for callee-saved destinations. <5% overhead uplift.
+        bool reload_handled = false;
+        if (instr_num_dsts(instr) == 1 && opnd_is_reg(instr_get_dst(instr, 0))) {
+            reg_id_t dst_reg = opnd_get_reg(instr_get_dst(instr, 0));
+            if (is_dwarf_reload_candidate(dst_reg)) {
+                for (int i = 0; i < instr_num_srcs(instr); i++) {
+                    opnd_t src = instr_get_src(instr, i);
+                    if (!opnd_is_memory_reference(src)) continue;
+                    reg_id_t reg1, reg2;
+                    if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg1) != DRREG_SUCCESS)
+                        break;
+                    if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS) {
+                        drreg_unreserve_register(drcontext, bb, instr, reg1);
+                        break;
+                    }
+                    bool ok = drutil_insert_get_mem_addr(drcontext, bb, instr, src, reg1, reg2);
+                    uint32_t rd_sz = opnd_size_in_bytes(opnd_get_size(src));
+                    int midx = dr_reg_to_memvis_idx(dst_reg);
+                    if (ok && midx >= 0) {
+                        // emit RELOAD after the load executes
+                        instr_t *next = instr_get_next_app(instr);
+                        instr_t *pt = next ? next : instr;
+                        dr_insert_clean_call(drcontext, bb, pt,
+                                             (void *)at_reload, false, 3,
+                                             opnd_create_reg(reg1),
+                                             OPND_CREATE_INT32((int)rd_sz),
+                                             OPND_CREATE_INT32(midx));
+                        reload_handled = true;
+                    }
+                    drreg_unreserve_register(drcontext, bb, instr, reg2);
+                    drreg_unreserve_register(drcontext, bb, instr, reg1);
+                    break; // one source per reload
+                }
             }
-            bool ok = drutil_insert_get_mem_addr(drcontext, bb, instr, src, reg1, reg2);
-            uint32_t rd_sz = opnd_size_in_bytes(opnd_get_size(src));
-            if (ok) {
+        }
+
+        // standard read buffering (skip if already handled as reload)
+        if (!reload_handled) {
+            int rd_ops = 0;
+            for (int i = 0; i < instr_num_srcs(instr); i++) {
+                if (opnd_is_memory_reference(instr_get_src(instr, i))) rd_ops++;
+            }
+            if (rd_ops > 0) {
                 dr_insert_clean_call(drcontext, bb, instr,
-                                     (void *)at_mem_read_buf, false, 2,
-                                     opnd_create_reg(reg1),
-                                     OPND_CREATE_INT32((int)rd_sz));
+                                     (void *)flush_read_buf_if_needed, false, 1,
+                                     OPND_CREATE_INT32(rd_ops));
             }
-            drreg_unreserve_register(drcontext, bb, instr, reg2);
-            drreg_unreserve_register(drcontext, bb, instr, reg1);
+            for (int i = 0; i < instr_num_srcs(instr); i++) {
+                opnd_t src = instr_get_src(instr, i);
+                if (!opnd_is_memory_reference(src))
+                    continue;
+                reg_id_t reg1, reg2;
+                if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg1) != DRREG_SUCCESS)
+                    continue;
+                if (drreg_reserve_register(drcontext, bb, instr, NULL, &reg2) != DRREG_SUCCESS) {
+                    drreg_unreserve_register(drcontext, bb, instr, reg1);
+                    continue;
+                }
+                bool ok = drutil_insert_get_mem_addr(drcontext, bb, instr, src, reg1, reg2);
+                uint32_t rd_sz = opnd_size_in_bytes(opnd_get_size(src));
+                if (ok) {
+                    dr_insert_clean_call(drcontext, bb, instr,
+                                         (void *)at_mem_read_buf, false, 2,
+                                         opnd_create_reg(reg1),
+                                         OPND_CREATE_INT32((int)rd_sz));
+                }
+                drreg_unreserve_register(drcontext, bb, instr, reg2);
+                drreg_unreserve_register(drcontext, bb, instr, reg1);
+            }
         }
     }
 
@@ -896,6 +1000,7 @@ event_exit(void)
     dr_printf("memvis:   rdflush: %llu\n", (unsigned long long)atomic_load(&g_stat_rdbuf_flushes));
     dr_printf("memvis:   inline:  %llu\n", (unsigned long long)atomic_load(&g_stat_inline_writes));
     dr_printf("memvis:   spill:   %llu\n", (unsigned long long)atomic_load(&g_stat_spill_writes));
+    dr_printf("memvis:   reloads: %llu\n", (unsigned long long)atomic_load(&g_stat_reloads));
     dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
 
     unmap_ctl_ring();
