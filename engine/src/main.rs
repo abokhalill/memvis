@@ -6,6 +6,7 @@ use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
 use std::{env, thread, time};
 
 use memvis::dwarf::{self, DwarfInfo};
+use memvis::heap_graph::{HeapGraph, HeapOracle};
 use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::ring::{Event, RingOrchestrator};
 use memvis::shadow_regs::ShadowRegisterFile;
@@ -34,6 +35,8 @@ fn process_event(
     relocation_delta: &mut Option<u64>,
     returned_frames: &mut VecDeque<FrameId>,
     shadow_regs: &mut HashMap<u16, ShadowRegisterFile>,
+    heap_graph: &mut HeapGraph,
+    heap_oracle: &mut HeapOracle,
 ) -> bool {
     let ev_kind = ev.kind();
     match ev_kind {
@@ -50,6 +53,10 @@ fn process_event(
                     .entry(ev.thread_id)
                     .or_insert_with(ShadowRegisterFile::new);
                 srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
+            }
+            // heap graph: feed writes to heap addresses
+            if heap_oracle.is_heap(ev.addr) {
+                heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
             }
             if let Some(h) = addr_index.lookup(ev.addr) {
                 let nid = h.node_id;
@@ -75,6 +82,8 @@ fn process_event(
                     .or_insert_with(ShadowRegisterFile::new);
                 srf.on_call(ev.addr, ev.value, ev.seq as u64);
             }
+            // heap oracle: update stack bounds from rsp
+            heap_oracle.update_stack(ev.thread_id, ev.value);
             if let Some(ref info) = dwarf_info {
                 let elf_pc = match *relocation_delta {
                     Some(d) => ev.addr.wrapping_sub(d),
@@ -165,6 +174,8 @@ fn process_event(
             true
         }
         EVENT_MODULE_LOAD => {
+            // heap oracle: register module range
+            heap_oracle.add_module(ev.addr, ev.value);
             if relocation_delta.is_none() {
                 if let Some(ref info) = dwarf_info {
                     let runtime_base = ev.addr;
@@ -231,6 +242,8 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let mut expected_seq: HashMap<u16, u16> = HashMap::new();
     let mut seq_gaps: u64 = 0;
     let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
+    let mut heap_graph = HeapGraph::new();
+    let mut heap_oracle = HeapOracle::new();
 
     if let Some(ref info) = dwarf_info {
         populate_globals(info, 0, &mut addr_index, &mut world);
@@ -251,6 +264,8 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             &mut relocation_delta,
             &mut returned_frames,
             &mut shadow_regs,
+            &mut heap_graph,
+            &mut heap_oracle,
         );
         return;
     }
@@ -311,6 +326,8 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                     &mut relocation_delta,
                     &mut returned_frames,
                     &mut shadow_regs,
+                    &mut heap_graph,
+                    &mut heap_oracle,
                 );
                 if interesting {
                     journal.push_back(JournalEntry {
@@ -335,6 +352,15 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             }
             if total & 0xFFF == 0 {
                 world.cache_heat_tick();
+            }
+            // heap graph: periodic type inference + GC
+            if heap_graph.needs_type_inference() {
+                if let Some(ref info) = dwarf_info {
+                    heap_graph.run_type_inference(info);
+                }
+            }
+            if total & 0xFFFF == 0 {
+                heap_graph.gc_stale(total, 500_000);
             }
             orch.update_backpressure();
         }
@@ -369,6 +395,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                 &stacks,
                 seq_gaps,
                 &shadow_regs,
+                &heap_graph,
             );
             last_render = now;
         }
@@ -397,6 +424,8 @@ fn run_headless(
     relocation_delta: &mut Option<u64>,
     returned_frames: &mut VecDeque<FrameId>,
     shadow_regs: &mut HashMap<u16, ShadowRegisterFile>,
+    heap_graph: &mut HeapGraph,
+    heap_oracle: &mut HeapOracle,
 ) {
     use std::io::Write;
     let stdout = io::stdout();
@@ -435,6 +464,8 @@ fn run_headless(
                 relocation_delta,
                 returned_frames,
                 shadow_regs,
+                heap_graph,
+                heap_oracle,
             );
             if interesting {
                 journal.push_back(JournalEntry {
