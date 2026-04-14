@@ -7,6 +7,7 @@ use std::{mem, ptr};
 pub const CACHE_LINE: usize = 64;
 pub const MEMVIS_MAGIC: u64 = 0x4D454D56495342;
 pub const MEMVIS_CTL_MAGIC: u64 = 0x4D56435430303032;
+pub const MEMVIS_PROTO_VERSION: u32 = 3;
 pub const MAX_THREADS: usize = 256;
 pub const RING_NAME_LEN: usize = 48;
 
@@ -47,7 +48,8 @@ pub struct RingHeader {
     pub entry_size: u32,
     pub flags: u64,
     pub backpressure: AtomicU32,
-    _pad0: [u8; CACHE_LINE - 24 - mem::size_of::<AtomicU32>()],
+    pub proto_version: u32,
+    _pad0: [u8; CACHE_LINE - 28 - mem::size_of::<AtomicU32>()],
     pub head: AtomicU64,
     _pad1: [u8; CACHE_LINE - mem::size_of::<AtomicU64>()],
     pub tail: AtomicU64,
@@ -149,6 +151,13 @@ impl ThreadRing {
         if hdr.magic != MEMVIS_MAGIC {
             return None;
         }
+        if hdr.proto_version != MEMVIS_PROTO_VERSION {
+            eprintln!(
+                "memvis: ring proto mismatch: expected {}, got {}",
+                MEMVIS_PROTO_VERSION, hdr.proto_version
+            );
+            return None;
+        }
         Some(Self {
             shm,
             thread_id,
@@ -160,34 +169,6 @@ impl ThreadRing {
         unsafe { &*(self.shm.ptr as *const RingHeader) }
     }
 
-    #[inline(always)]
-    pub fn peek(&self) -> Option<Event> {
-        let hdr = self.header();
-        let mask = (hdr.capacity - 1) as u64;
-        let data = unsafe { hdr.data() };
-        let t = hdr.tail.load(Ordering::Relaxed);
-        let h = hdr.head.load(Ordering::Acquire);
-        if t == h {
-            return None;
-        }
-        Some(unsafe { ptr::read_volatile(data.add((t & mask) as usize)) })
-    }
-
-    #[inline(always)]
-    pub fn pop(&self) -> Option<Event> {
-        let hdr = self.header();
-        let mask = (hdr.capacity - 1) as u64;
-        let data = unsafe { hdr.data() };
-        let t = hdr.tail.load(Ordering::Relaxed);
-        let h = hdr.head.load(Ordering::Acquire);
-        if t == h {
-            return None;
-        }
-        let ev = unsafe { ptr::read_volatile(data.add((t & mask) as usize)) };
-        hdr.tail.store(t + 1, Ordering::Release);
-        Some(ev)
-    }
-
     #[inline]
     pub fn pop_n(&self, n: u64, out: &mut [Event]) -> bool {
         debug_assert!(out.len() >= n as usize, "pop_n: out slice too small");
@@ -196,7 +177,7 @@ impl ThreadRing {
         let data = unsafe { hdr.data() };
         let t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
-        if h - t < n {
+        if h.saturating_sub(t) < n {
             return false;
         }
         for i in 0..n {
@@ -213,7 +194,7 @@ impl ThreadRing {
         let data = unsafe { hdr.data() };
         let t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
-        let avail = h.wrapping_sub(t) as usize;
+        let avail = h.saturating_sub(t).min(hdr.capacity as u64) as usize;
         let n = avail.min(max);
         if n == 0 {
             return 0;
@@ -225,21 +206,13 @@ impl ThreadRing {
         n
     }
 
-    pub fn fill(&self) -> (u64, u32) {
-        let hdr = self.header();
-        let h = hdr.head.load(Ordering::Relaxed);
-        let t = hdr.tail.load(Ordering::Relaxed);
-        let used = h.wrapping_sub(t);
-        let pct = ((used * 100) / hdr.capacity as u64) as u32;
-        (used, pct)
-    }
 }
 
 pub struct RingOrchestrator {
     ctl: Option<MappedShm>,
     pub rings: Vec<ThreadRing>,
     known_count: u32,
-    rr_idx: usize, // round-robin index for merge_pop
+    rr_idx: usize, // round-robin index for batch_drain
 }
 
 impl RingOrchestrator {
@@ -263,6 +236,13 @@ impl RingOrchestrator {
         };
         let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
         if hdr.magic != MEMVIS_CTL_MAGIC {
+            return false;
+        }
+        if hdr.proto_version != MEMVIS_PROTO_VERSION {
+            eprintln!(
+                "memvis: ctl proto mismatch: expected {}, got {}",
+                MEMVIS_PROTO_VERSION, hdr.proto_version
+            );
             return false;
         }
         self.ctl = Some(shm);
@@ -344,7 +324,7 @@ impl RingOrchestrator {
             let hdr = ring.header();
             let h = hdr.head.load(Ordering::Relaxed);
             let t = hdr.tail.load(Ordering::Relaxed);
-            total_used += h.wrapping_sub(t);
+            total_used += h.saturating_sub(t);
             total_cap += hdr.capacity as u64;
         }
         let pct = if total_cap > 0 {
@@ -370,7 +350,7 @@ impl RingOrchestrator {
             let hdr = ring.header();
             let h = hdr.head.load(Ordering::Relaxed);
             let t = hdr.tail.load(Ordering::Relaxed);
-            let fill_eighths = ((h.wrapping_sub(t)) << 3) / hdr.capacity as u64;
+            let fill_eighths = (h.saturating_sub(t) << 3) / hdr.capacity as u64;
             let bp = hdr.backpressure.load(Ordering::Relaxed);
             if fill_eighths >= BP_HIGH as u64 && bp == 0 {
                 hdr.backpressure.store(1, Ordering::Release);
@@ -402,18 +382,4 @@ impl RingOrchestrator {
         total
     }
 
-    pub fn merge_pop(&mut self) -> Option<(usize, Event)> {
-        let n = self.rings.len();
-        if n == 0 {
-            return None;
-        }
-        for _ in 0..n {
-            let i = self.rr_idx % n;
-            self.rr_idx = (self.rr_idx + 1) % n;
-            if let Some(ev) = self.rings[i].pop() {
-                return Some((i, ev));
-            }
-        }
-        None
-    }
 }
