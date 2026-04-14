@@ -318,9 +318,10 @@ static inline void memvis_push_overflow(memvis_ring_header_t *ring,
 #define MEMVIS_THREAD_RING_CAPACITY  (1u << 20)
 _Static_assert(MEMVIS_IS_POW2(MEMVIS_THREAD_RING_CAPACITY), "ring capacity must be power-of-two");
 
-#define MEMVIS_THREAD_STATE_EMPTY    0
-#define MEMVIS_THREAD_STATE_ACTIVE   1
-#define MEMVIS_THREAD_STATE_DEAD     2
+#define MEMVIS_THREAD_STATE_EMPTY        0
+#define MEMVIS_THREAD_STATE_ACTIVE       1
+#define MEMVIS_THREAD_STATE_DEAD         2
+#define MEMVIS_THREAD_STATE_INITIALIZING 3
 
 typedef struct {
     _Atomic uint32_t state;
@@ -357,16 +358,20 @@ static inline int memvis_ctl_register_thread(memvis_ctl_header_t *ctl,
                                                const char *ring_shm_name)
 {
     // first pass: try to reclaim a DEAD slot via CAS (O(max_threads) scan,
-    // amortized over thread lifetime; negligible vs. thread creation cost)
+    // amortized over thread lifetime; negligible vs. thread creation cost).
+    // publish-subscribe pattern: CAS to INITIALIZING, populate data, then
+    // store-release ACTIVE so the consumer never sees partial writes.
     for (uint32_t i = 0; i < ctl->max_threads; i++) {
         uint32_t expected = MEMVIS_THREAD_STATE_DEAD;
         if (atomic_compare_exchange_strong_explicit(
                 &ctl->threads[i].state, &expected,
-                MEMVIS_THREAD_STATE_ACTIVE,
+                MEMVIS_THREAD_STATE_INITIALIZING,
                 memory_order_acq_rel, memory_order_relaxed)) {
             ctl->threads[i].thread_id = thread_id;
             strncpy(ctl->threads[i].shm_name, ring_shm_name, MEMVIS_RING_NAME_LEN - 1);
             ctl->threads[i].shm_name[MEMVIS_RING_NAME_LEN - 1] = '\0';
+            atomic_store_explicit(&ctl->threads[i].state,
+                                  MEMVIS_THREAD_STATE_ACTIVE, memory_order_release);
             return (int)i;
         }
     }

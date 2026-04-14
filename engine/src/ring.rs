@@ -75,8 +75,9 @@ struct ThreadEntry {
 }
 
 const THREAD_STATE_EMPTY: u32 = 0;
-const _THREAD_STATE_ACTIVE: u32 = 1;
+const THREAD_STATE_ACTIVE: u32 = 1;
 const THREAD_STATE_DEAD: u32 = 2;
+const THREAD_STATE_INITIALIZING: u32 = 3;
 
 #[repr(C)]
 struct CtlHeader {
@@ -254,10 +255,15 @@ impl RingOrchestrator {
 
         while self.known_count < count {
             let idx = self.known_count as usize;
-            self.known_count += 1;
 
             let entry = &hdr.threads[idx];
             let state = entry.state.load(Ordering::Acquire);
+            if state == THREAD_STATE_INITIALIZING {
+                // Producer is still writing shm_name/thread_id into this slot.
+                // Don't advance known_count — retry on next poll.
+                break;
+            }
+            self.known_count += 1;
             if state == THREAD_STATE_EMPTY {
                 continue;
             }
@@ -297,16 +303,45 @@ impl RingOrchestrator {
             }
         }
 
-        // check for newly dead threads
+        // re-scan known slots for state transitions:
+        // - DEAD: mark the consumer-side ring as no longer alive
+        // - ACTIVE with unknown thread_id: reclaimed slot, attach new ring
         for entry_idx in 0..count as usize {
             let entry = &hdr.threads[entry_idx];
-            if entry.state.load(Ordering::Relaxed) == THREAD_STATE_DEAD {
+            let state = entry.state.load(Ordering::Acquire);
+            if state == THREAD_STATE_DEAD {
                 if let Some(r) = self
                     .rings
                     .iter_mut()
                     .find(|r| r.thread_id == entry.thread_id && r.alive)
                 {
                     r.alive = false;
+                }
+            } else if state == THREAD_STATE_ACTIVE {
+                // check if we already have a ring for this thread
+                let tid = entry.thread_id;
+                let already_known = self.rings.iter().any(|r| r.thread_id == tid && r.alive);
+                if !already_known {
+                    let name_bytes = &entry.shm_name;
+                    let name_len = name_bytes
+                        .iter()
+                        .position(|&b| b == 0)
+                        .unwrap_or(RING_NAME_LEN);
+                    if name_len > 0 {
+                        let mut shm_name = Vec::with_capacity(name_len + 1);
+                        shm_name.extend_from_slice(&name_bytes[..name_len]);
+                        shm_name.push(0);
+                        if let Some(shm) = MappedShm::open(&shm_name) {
+                            if let Some(ring) = ThreadRing::from_shm(shm, tid) {
+                                eprintln!(
+                                    "memvis: discovered reclaimed ring for thread {} ({})",
+                                    tid,
+                                    std::str::from_utf8(&name_bytes[..name_len]).unwrap_or("?")
+                                );
+                                self.rings.push(ring);
+                            }
+                        }
+                    }
                 }
             }
         }
