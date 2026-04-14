@@ -205,7 +205,6 @@ impl ThreadRing {
         hdr.tail.store(t + n as u64, Ordering::Release);
         n
     }
-
 }
 
 pub struct RingOrchestrator {
@@ -381,5 +380,4 @@ impl RingOrchestrator {
         self.rr_idx = (self.rr_idx + 1) % n.max(1);
         total
     }
-
 }

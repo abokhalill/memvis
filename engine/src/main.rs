@@ -50,9 +50,7 @@ fn process_event(
                     None => ev.addr,
                 };
                 let func = info.func_containing(elf_pc);
-                let srf = shadow_regs
-                    .entry(ev.thread_id)
-                    .or_default();
+                let srf = shadow_regs.entry(ev.thread_id).or_default();
                 srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
             }
             // cross-thread coherence: check if this write invalidates any other
@@ -85,9 +83,7 @@ fn process_event(
         EVENT_CALL => {
             // SRF: push call frame. ev.addr = callee_pc, ev.value = rsp/frame_base
             {
-                let srf = shadow_regs
-                    .entry(ev.thread_id)
-                    .or_default();
+                let srf = shadow_regs.entry(ev.thread_id).or_default();
                 srf.on_call(ev.addr, ev.value, ev.seq as u64);
             }
             // heap oracle: update stack bounds from rsp
@@ -138,9 +134,7 @@ fn process_event(
         EVENT_RETURN => {
             // SRF: pop call frame
             {
-                let srf = shadow_regs
-                    .entry(ev.thread_id)
-                    .or_default();
+                let srf = shadow_regs.entry(ev.thread_id).or_default();
                 srf.on_return(ev.seq as u64, ev.addr);
             }
             let tid = ev.thread_id;
@@ -168,9 +162,7 @@ fn process_event(
                 }
                 world.update_regs(regs, ev.addr);
                 // SRF: ground-truth anchor
-                let srf = shadow_regs
-                    .entry(ev.thread_id)
-                    .or_default();
+                let srf = shadow_regs.entry(ev.thread_id).or_default();
                 srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
             }
             true
@@ -184,9 +176,7 @@ fn process_event(
         EVENT_RELOAD => {
             // semantic reload: MOV reg, [mem]. flags byte = dest register index.
             let reg_idx = ((ev.kind_flags >> 8) & 0xFF) as usize;
-            let srf = shadow_regs
-                .entry(ev.thread_id)
-                .or_default();
+            let srf = shadow_regs.entry(ev.thread_id).or_default();
             srf.on_reload(reg_idx, ev.value, ev.addr, ev.size, ev.seq as u64, ev.addr);
             true
         }
