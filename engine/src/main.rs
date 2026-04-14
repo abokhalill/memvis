@@ -154,16 +154,22 @@ fn process_event(
         EVENT_REG_SNAPSHOT => {
             let mut cont = [Event::zero(); 6];
             if orch.rings[ring_idx].pop_n(6, &mut cont) {
-                let mut regs = [0u64; REG_COUNT];
-                for s in 0..6usize {
-                    regs[s * 3] = cont[s].addr;
-                    regs[s * 3 + 1] = cont[s].size as u64;
-                    regs[s * 3 + 2] = cont[s].value;
+                // validate: all 6 continuation slots must be REG_SNAPSHOT kind.
+                // if any slot has a different kind, the ring may have wrapped or
+                // been corrupted — discard the entire snapshot.
+                let valid = cont.iter().all(|c| c.kind() == EVENT_REG_SNAPSHOT);
+                if valid {
+                    let mut regs = [0u64; REG_COUNT];
+                    for s in 0..6usize {
+                        regs[s * 3] = cont[s].addr;
+                        regs[s * 3 + 1] = cont[s].size as u64;
+                        regs[s * 3 + 2] = cont[s].value;
+                    }
+                    world.update_regs(regs, ev.addr);
+                    // SRF: ground-truth anchor
+                    let srf = shadow_regs.entry(ev.thread_id).or_default();
+                    srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
                 }
-                world.update_regs(regs, ev.addr);
-                // SRF: ground-truth anchor
-                let srf = shadow_regs.entry(ev.thread_id).or_default();
-                srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
             }
             true
         }
