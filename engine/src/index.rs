@@ -37,18 +37,31 @@ pub struct LookupResult<'a> {
     pub offset_in_var: u64,
 }
 
+const MRU_SLOTS: usize = 4;
+
 pub struct AddressIndex {
     intervals: Vec<Interval>,
     needs_sort: bool,
+    // MRU cache: (lo, hi, interval_index). short-circuits binary search
+    // for spatially-local repeated lookups (~90% hit rate in practice).
+    mru: [(u64, u64, usize); MRU_SLOTS],
+    mru_len: usize,
 }
 
-impl AddressIndex {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+impl Default for AddressIndex {
+    fn default() -> Self {
         Self {
             intervals: Vec::with_capacity(2048),
             needs_sort: false,
+            mru: [(0, 0, 0); MRU_SLOTS],
+            mru_len: 0,
         }
+    }
+}
+
+impl AddressIndex {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     pub fn insert_global(
@@ -73,6 +86,7 @@ impl AddressIndex {
             },
         });
         self.needs_sort = true;
+        self.mru_len = 0;
     }
 
     pub fn insert_field(
@@ -98,6 +112,7 @@ impl AddressIndex {
             },
         });
         self.needs_sort = true;
+        self.mru_len = 0;
     }
 
     pub fn insert_frame_locals(
@@ -123,30 +138,78 @@ impl AddressIndex {
             });
         }
         self.needs_sort = true;
+        self.mru_len = 0;
     }
 
     pub fn remove_frame(&mut self, frame_id: FrameId) {
         self.intervals
             .retain(|iv| iv.meta.frame_id != Some(frame_id));
+        self.mru_len = 0;
     }
 
     pub fn finalize(&mut self) {
         if self.needs_sort {
             self.intervals.sort_unstable_by_key(|iv| iv.lo);
             self.needs_sort = false;
+            self.mru_len = 0;
         }
     }
 
     // binary search for rightmost interval where lo <= addr, check hi.
     // on overlap (local shadows global), prefer dynamic entry.
+    // uses a 4-slot MRU cache to skip the binary search for hot addresses.
     #[inline(always)]
-    pub fn lookup(&self, addr: u64) -> Option<LookupResult<'_>> {
+    pub fn lookup(&mut self, addr: u64) -> Option<LookupResult<'_>> {
+        // MRU probe: check cached intervals first
+        for slot in 0..self.mru_len {
+            let (lo, hi, iv_idx) = self.mru[slot];
+            if addr >= lo && addr < hi {
+                // promote to MRU[0]
+                if slot > 0 {
+                    self.mru.copy_within(0..slot, 1);
+                    self.mru[0] = (lo, hi, iv_idx);
+                }
+                let iv = &self.intervals[iv_idx];
+                return Some(LookupResult {
+                    name: &iv.meta.name,
+                    type_info: &iv.meta.type_info,
+                    node_id: iv.meta.node_id,
+                    offset_in_var: addr - iv.lo,
+                });
+            }
+        }
+
+        // MRU miss: fall through to binary search
+        let result = self.lookup_slow(addr);
+
+        // populate cache on hit
+        if let Some((iv_idx, lo, hi)) = result {
+            let entry = (lo, hi, iv_idx);
+            let len = self.mru_len.min(MRU_SLOTS - 1);
+            self.mru.copy_within(0..len, 1);
+            self.mru[0] = entry;
+            self.mru_len = (self.mru_len + 1).min(MRU_SLOTS);
+
+            let iv = &self.intervals[iv_idx];
+            Some(LookupResult {
+                name: &iv.meta.name,
+                type_info: &iv.meta.type_info,
+                node_id: iv.meta.node_id,
+                offset_in_var: addr - iv.lo,
+            })
+        } else {
+            None
+        }
+    }
+
+    // cold path: full binary search
+    fn lookup_slow(&self, addr: u64) -> Option<(usize, u64, u64)> {
         let idx = self.intervals.partition_point(|iv| iv.lo <= addr);
         if idx == 0 {
             return None;
         }
 
-        let mut best: Option<&Interval> = None;
+        let mut best: Option<(usize, &Interval)> = None;
         let mut i = idx - 1;
         loop {
             let iv = &self.intervals[i];
@@ -156,7 +219,7 @@ impl AddressIndex {
             if addr < iv.hi {
                 let dominated = match best {
                     None => true,
-                    Some(prev) => {
+                    Some((_, prev)) => {
                         // prefer: locals > fields > globals; narrower > wider on tie
                         let iv_rank = match iv.meta.node_id {
                             NodeId::Local(..) => 2,
@@ -173,7 +236,7 @@ impl AddressIndex {
                     }
                 };
                 if dominated {
-                    best = Some(iv);
+                    best = Some((i, iv));
                 }
             }
             if i == 0 || self.intervals[i - 1].lo < iv.lo {
@@ -182,12 +245,7 @@ impl AddressIndex {
             i -= 1;
         }
 
-        best.map(|iv| LookupResult {
-            name: &iv.meta.name,
-            type_info: &iv.meta.type_info,
-            node_id: iv.meta.node_id,
-            offset_in_var: addr - iv.lo,
-        })
+        best.map(|(iv_idx, iv)| (iv_idx, iv.lo, iv.hi))
     }
 }
 
