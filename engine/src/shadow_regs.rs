@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: MIT
-// shadow register file + DW_OP_piece assembler. 
+// shadow register file + DW_OP_piece assembler.
 
 use crate::dwarf::{ExprStep, FunctionMeta, LocationPiece};
 use crate::world::REG_COUNT;
@@ -11,8 +11,22 @@ const ARG_REGS: [usize; 6] = [5, 4, 3, 2, 8, 9]; // rdi,rsi,rdx,rcx,r8,r9
 
 // dwarf reg# -> memvis reg_file index. note: dwarf 1=rdx(3), 2=rcx(2), 3=rbx(1)
 const DWARF_TO_IDX: [Option<usize>; 17] = [
-    Some(0), Some(3), Some(2), Some(1), Some(4), Some(5), Some(6), Some(7),
-    Some(8), Some(9), Some(10), Some(11), Some(12), Some(13), Some(14), Some(15),
+    Some(0),
+    Some(3),
+    Some(2),
+    Some(1),
+    Some(4),
+    Some(5),
+    Some(6),
+    Some(7),
+    Some(8),
+    Some(9),
+    Some(10),
+    Some(11),
+    Some(12),
+    Some(13),
+    Some(14),
+    Some(15),
     Some(16),
 ];
 
@@ -120,6 +134,12 @@ pub struct ShadowRegisterFile {
     call_stack: Vec<ShadowFrame>,
 }
 
+impl Default for ShadowRegisterFile {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl ShadowRegisterFile {
     pub fn new() -> Self {
         Self {
@@ -133,9 +153,9 @@ impl ShadowRegisterFile {
     }
 
     pub fn apply_snapshot(&mut self, values: &[u64; REG_COUNT], seq: u64, pc: u64) {
-        for i in 0..REG_COUNT {
+        for (i, &val) in values.iter().enumerate().take(REG_COUNT) {
             self.regs[i].set(
-                values[i],
+                val,
                 Provenance::Observed { event_seq: seq },
                 Confidence::Observed,
                 seq,
@@ -159,22 +179,19 @@ impl ShadowRegisterFile {
             let Some(piece) = local.location.lookup(pc) else {
                 continue;
             };
-            match piece {
-                LocationPiece::Register(dwarf_reg) => {
-                    if let Some(idx) = dwarf_reg_to_idx(*dwarf_reg) {
-                        self.regs[idx].set(
-                            value,
-                            Provenance::WriteBack {
-                                write_seq: seq,
-                                retroactive_pc: pc,
-                            },
-                            Confidence::WriteBack,
-                            seq,
-                            pc,
-                        );
-                    }
+            if let LocationPiece::Register(dwarf_reg) = piece {
+                if let Some(idx) = dwarf_reg_to_idx(*dwarf_reg) {
+                    self.regs[idx].set(
+                        value,
+                        Provenance::WriteBack {
+                            write_seq: seq,
+                            retroactive_pc: pc,
+                        },
+                        Confidence::WriteBack,
+                        seq,
+                        pc,
+                    );
                 }
-                _ => {}
             }
         }
     }
@@ -212,10 +229,7 @@ impl ShadowRegisterFile {
                 self.regs[idx].value,
                 Provenance::AbiArg {
                     callee_pc,
-                    arg_index: ARG_REGS
-                        .iter()
-                        .position(|&r| r == idx)
-                        .unwrap_or(0xff) as u8,
+                    arg_index: ARG_REGS.iter().position(|&r| r == idx).unwrap_or(0xff) as u8,
                 },
                 Confidence::Speculative,
                 seq,
@@ -246,18 +260,33 @@ impl ShadowRegisterFile {
         );
 
         for &idx in &CALLER_SAVED {
-            if idx == 0 { continue; }
+            if idx == 0 {
+                continue;
+            }
             self.regs[idx] = frame.saved_regs[idx].clone();
         }
     }
 
     // semantic reload: MOV reg, [mem] captured by tracer's selective instrumenter.
     // ground-truth anchor: we know the register's exact value and source address.
-    pub fn on_reload(&mut self, reg_idx: usize, value: u64, from_addr: u64, load_size: u32, seq: u64, pc: u64) {
-        if reg_idx >= REG_COUNT { return; }
+    pub fn on_reload(
+        &mut self,
+        reg_idx: usize,
+        value: u64,
+        from_addr: u64,
+        load_size: u32,
+        seq: u64,
+        pc: u64,
+    ) {
+        if reg_idx >= REG_COUNT {
+            return;
+        }
         self.regs[reg_idx].set(
             value,
-            Provenance::Reload { from_addr, reload_seq: seq },
+            Provenance::Reload {
+                from_addr,
+                reload_seq: seq,
+            },
             Confidence::Observed,
             seq,
             pc,
@@ -270,7 +299,13 @@ impl ShadowRegisterFile {
     // uses proper interval overlap: write [w, w+ws) ∩ source [s, s+ss) ≠ ∅.
     // for wide writes (>8 bytes, e.g. SSE/AVX), value comparison is skipped
     // because the 64-bit event value can't represent the full written data.
-    pub fn check_coherence(&mut self, written_addr: u64, written_value: u64, write_size: u32, _write_seq: u64) {
+    pub fn check_coherence(
+        &mut self,
+        written_addr: u64,
+        written_value: u64,
+        write_size: u32,
+        _write_seq: u64,
+    ) {
         let w_end = written_addr.saturating_add(write_size.max(1) as u64);
         for i in 0..REG_COUNT {
             if let Some(src) = self.regs[i].mem_source {
@@ -291,7 +326,6 @@ impl ShadowRegisterFile {
             }
         }
     }
-
 }
 
 // piece assembler: reconstructs DW_OP_piece-fragmented variables on demand.
@@ -346,8 +380,7 @@ impl PieceAssembler {
                     pending_source = Some(PieceSource::Register(*dwarf_reg));
                 }
                 ExprStep::BReg(dwarf_reg, offset) => {
-                    pending_source =
-                        Some(PieceSource::RegisterOffset(*dwarf_reg, *offset));
+                    pending_source = Some(PieceSource::RegisterOffset(*dwarf_reg, *offset));
                 }
                 ExprStep::Addr(a) => {
                     pending_source = Some(PieceSource::Memory(*a));
@@ -408,27 +441,21 @@ impl PieceAssembler {
             }
 
             let (frag_bytes, frag_conf) = match &frag.source {
-                PieceSource::Register(dwarf_reg) => {
-                    match dwarf_reg_to_idx(*dwarf_reg) {
-                        Some(idx) => {
-                            let sr = &srf.regs[idx];
-                            let val_bytes = sr.value.to_le_bytes();
-                            let take = sz.min(8);
-                            (
-                                val_bytes[..take].to_vec(),
-                                sr.confidence,
-                            )
-                        }
-                        None => (vec![0u8; sz], Confidence::Unknown),
+                PieceSource::Register(dwarf_reg) => match dwarf_reg_to_idx(*dwarf_reg) {
+                    Some(idx) => {
+                        let sr = &srf.regs[idx];
+                        let val_bytes = sr.value.to_le_bytes();
+                        let take = sz.min(8);
+                        (val_bytes[..take].to_vec(), sr.confidence)
                     }
-                }
+                    None => (vec![0u8; sz], Confidence::Unknown),
+                },
 
                 PieceSource::RegisterOffset(dwarf_reg, offset) => {
                     match dwarf_reg_to_idx(*dwarf_reg) {
                         Some(idx) => {
                             let sr = &srf.regs[idx];
-                            let addr =
-                                (sr.value as i64).wrapping_add(*offset) as u64;
+                            let addr = (sr.value as i64).wrapping_add(*offset) as u64;
                             match read_mem(addr, sz as u64) {
                                 Some(mem_bytes) => (mem_bytes, sr.confidence),
                                 None => (vec![0u8; sz], Confidence::Unknown),
@@ -438,12 +465,10 @@ impl PieceAssembler {
                     }
                 }
 
-                PieceSource::Memory(addr) => {
-                    match read_mem(*addr, sz as u64) {
-                        Some(mem_bytes) => (mem_bytes, Confidence::Observed),
-                        None => (vec![0u8; sz], Confidence::Unknown),
-                    }
-                }
+                PieceSource::Memory(addr) => match read_mem(*addr, sz as u64) {
+                    Some(mem_bytes) => (mem_bytes, Confidence::Observed),
+                    None => (vec![0u8; sz], Confidence::Unknown),
+                },
 
                 PieceSource::FrameBaseOffset(offset) => {
                     let addr = (frame_base as i64).wrapping_add(*offset) as u64;
@@ -459,15 +484,13 @@ impl PieceAssembler {
                     (val_bytes[..take].to_vec(), Confidence::Observed)
                 }
 
-                PieceSource::Unknown => {
-                    (vec![0u8; sz], Confidence::Unknown)
-                }
+                PieceSource::Unknown => (vec![0u8; sz], Confidence::Unknown),
             };
 
             let copy_len = frag_bytes.len().min(sz);
             bytes[off..off + copy_len].copy_from_slice(&frag_bytes[..copy_len]);
-            for i in off..off + copy_len {
-                confidence[i] = frag_conf;
+            for c in confidence.iter_mut().skip(off).take(copy_len) {
+                *c = frag_conf;
             }
 
             if frag_conf > Confidence::Unknown {
@@ -495,8 +518,10 @@ mod tests {
     #[test]
     fn test_parse_two_register_pieces() {
         let steps = vec![
-            ExprStep::Reg(3), ExprStep::Piece(4),
-            ExprStep::Reg(12), ExprStep::Piece(4),
+            ExprStep::Reg(3),
+            ExprStep::Piece(4),
+            ExprStep::Reg(12),
+            ExprStep::Piece(4),
         ];
         let frags = PieceAssembler::parse_pieces(&steps);
         assert_eq!(frags.len(), 2);
@@ -556,13 +581,7 @@ mod tests {
             },
         ];
 
-        let result = PieceAssembler::resolve_pieces(
-            &frags,
-            8,
-            &srf,
-            0,
-            &|_addr, _sz| None,
-        );
+        let result = PieceAssembler::resolve_pieces(&frags, 8, &srf, 0, &|_addr, _sz| None);
 
         assert_eq!(result.bytes.len(), 8);
         assert_eq!(result.resolved_count, 2);
@@ -605,13 +624,7 @@ mod tests {
             },
         ];
 
-        let result = PieceAssembler::resolve_pieces(
-            &frags,
-            8,
-            &srf,
-            0,
-            &|_addr, _sz| None,
-        );
+        let result = PieceAssembler::resolve_pieces(&frags, 8, &srf, 0, &|_addr, _sz| None);
 
         assert_eq!(result.min_confidence, Confidence::Speculative);
         assert_eq!(result.confidence[0], Confidence::Observed);
@@ -714,8 +727,11 @@ mod tests {
         // value is 0 because safe_read_value clamps to 8B for size>8
         // overlap: [0x1038, 0x1048) ∩ [0x103C, 0x1044) = [0x103C, 0x1044) ≠ ∅
         srf.check_coherence(0x1038, 0 /* truncated */, 16, 200);
-        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
-            "16B SSE write overlapping upper portion of 8B source must mark Stale");
+        assert_eq!(
+            srf.regs[12].confidence,
+            Confidence::Stale,
+            "16B SSE write overlapping upper portion of 8B source must mark Stale"
+        );
     }
 
     // Sub-case: SSE write where only the FIRST 4 bytes overlap the tail of
@@ -729,8 +745,11 @@ mod tests {
         // 16-byte write to 0x0FF8: covers [0x0FF8..0x1008)
         // overlaps the last 8 bytes of the write with source
         srf.check_coherence(0x0FF8, 0, 16, 200);
-        assert_eq!(srf.regs[13].confidence, Confidence::Stale,
-            "16B write starting below source but overlapping it must trigger Stale");
+        assert_eq!(
+            srf.regs[13].confidence,
+            Confidence::Stale,
+            "16B write starting below source but overlapping it must trigger Stale"
+        );
     }
 
     // Sub-case: 16-byte write that is completely BEFORE the source — no overlap.
@@ -741,8 +760,11 @@ mod tests {
 
         // 16-byte write to 0x1020: covers [0x1020..0x1030). No overlap with [0x1040..0x1048).
         srf.check_coherence(0x1020, 0, 16, 200);
-        assert_eq!(srf.regs[12].confidence, Confidence::Observed,
-            "16B write entirely before source must NOT trigger Stale");
+        assert_eq!(
+            srf.regs[12].confidence,
+            Confidence::Observed,
+            "16B write entirely before source must NOT trigger Stale"
+        );
     }
 
     // The tracer-level bug (no RELOAD for atomic RMW) is a separate issue;
@@ -758,10 +780,15 @@ mod tests {
         // Tracer emits WRITE(addr=0x2000, value=42, size=8) — the post-increment value.
         // Cross-thread coherence check on thread A's SRF:
         srf_a.check_coherence(0x2000, 42, 8, 200);
-        assert_eq!(srf_a.regs[12].confidence, Confidence::Stale,
-            "lock xadd post-increment write must invalidate stale shadow of pre-increment value");
-        assert_eq!(srf_a.regs[12].value, 41,
-            "Stale register must retain old value (not silently update to new)");
+        assert_eq!(
+            srf_a.regs[12].confidence,
+            Confidence::Stale,
+            "lock xadd post-increment write must invalidate stale shadow of pre-increment value"
+        );
+        assert_eq!(
+            srf_a.regs[12].value, 41,
+            "Stale register must retain old value (not silently update to new)"
+        );
     }
 
     // Sub-case: lock cmpxchg that FAILS (old value == expected).
@@ -774,8 +801,11 @@ mod tests {
 
         // lock cmpxchg fails: writes back the same value 41
         srf_a.check_coherence(0x2000, 41, 8, 200);
-        assert_eq!(srf_a.regs[12].confidence, Confidence::Observed,
-            "Failed cmpxchg (same value written back) must NOT trigger Stale");
+        assert_eq!(
+            srf_a.regs[12].confidence,
+            Confidence::Observed,
+            "Failed cmpxchg (same value written back) must NOT trigger Stale"
+        );
     }
 
     // Sub-case: ABA problem. lock cmpxchg succeeds, writes new value,
@@ -795,8 +825,11 @@ mod tests {
         // BUT: once Stale, same-value writes don't heal it because
         // Stale <= Stale is false (confidence > Stale check fails).
         srf_a.check_coherence(0x2000, 41, 8, 300);
-        assert_eq!(srf_a.regs[12].confidence, Confidence::Stale,
-            "ABA write-back must NOT silently heal a stale register — only a RELOAD can");
+        assert_eq!(
+            srf_a.regs[12].confidence,
+            Confidence::Stale,
+            "ABA write-back must NOT silently heal a stale register — only a RELOAD can"
+        );
     }
 
     // Scenario: struct { uint64_t lo; uint64_t hi; } at address 0x3000.
@@ -816,10 +849,16 @@ mod tests {
         // R12 source [0x3000..0x3008) — fully contained
         // R13 source [0x3008..0x3010) — fully contained
         srf.check_coherence(0x3000, 0, 16, 200);
-        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
-            "Wide write covering lo piece must invalidate R12");
-        assert_eq!(srf.regs[13].confidence, Confidence::Stale,
-            "Wide write covering hi piece must invalidate R13");
+        assert_eq!(
+            srf.regs[12].confidence,
+            Confidence::Stale,
+            "Wide write covering lo piece must invalidate R12"
+        );
+        assert_eq!(
+            srf.regs[13].confidence,
+            Confidence::Stale,
+            "Wide write covering hi piece must invalidate R13"
+        );
     }
 
     // Sub-case: 8-byte write to 0x3000 should ONLY invalidate R12, not R13.
@@ -831,10 +870,16 @@ mod tests {
 
         // 8-byte write to 0x3000: covers [0x3000..0x3008) only
         srf.check_coherence(0x3000, 0xCCCC, 8, 200);
-        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
-            "8B write to lo must invalidate R12");
-        assert_eq!(srf.regs[13].confidence, Confidence::Observed,
-            "8B write to lo must NOT invalidate R13 (false-sharing boundary)");
+        assert_eq!(
+            srf.regs[12].confidence,
+            Confidence::Stale,
+            "8B write to lo must invalidate R12"
+        );
+        assert_eq!(
+            srf.regs[13].confidence,
+            Confidence::Observed,
+            "8B write to lo must NOT invalidate R13 (false-sharing boundary)"
+        );
     }
 
     // Sub-case: 4-byte write at offset +4 within R12's 8-byte source.
@@ -847,8 +892,11 @@ mod tests {
 
         // 4-byte write to 0x3004: covers [0x3004..0x3008), overlaps [0x3000..0x3008)
         srf.check_coherence(0x3004, 0xFFFF_FFFF, 4, 200);
-        assert_eq!(srf.regs[12].confidence, Confidence::Stale,
-            "4B write to upper half of 8B source must still invalidate");
+        assert_eq!(
+            srf.regs[12].confidence,
+            Confidence::Stale,
+            "4B write to upper half of 8B source must still invalidate"
+        );
     }
 
     #[test]

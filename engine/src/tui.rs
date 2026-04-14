@@ -609,10 +609,7 @@ pub fn draw(
         let mut reg_lines: Vec<Line> = Vec::new();
         // pick first active thread's SRF (or fall back to raw reg_file)
         let active_srf = shadow_regs.values().next();
-        for i in 0..REG_COUNT {
-            if i >= REG_NAMES.len() {
-                break;
-            }
+        for (i, reg_name) in REG_NAMES.iter().enumerate().take(REG_COUNT) {
             let (val, conf, conf_label) = if let Some(srf) = active_srf {
                 let sr = srf.reg(i);
                 (sr.value, sr.confidence, sr.confidence.label())
@@ -621,8 +618,7 @@ pub fn draw(
             };
             let bar_filled = conf.bar_tenths() as usize;
             let bar_empty = 10 - bar_filled;
-            let bar_str: String = "\u{2588}".repeat(bar_filled)
-                + &"\u{2591}".repeat(bar_empty);
+            let bar_str: String = "\u{2588}".repeat(bar_filled) + &"\u{2591}".repeat(bar_empty);
             let conf_color = match conf {
                 Confidence::Observed => Color::Green,
                 Confidence::AbiInferred => Color::Cyan,
@@ -645,24 +641,25 @@ pub fn draw(
             };
             reg_lines.push(Line::from(vec![
                 Span::styled(
-                    format!("{:>4}", REG_NAMES[i]),
-                    Style::default().fg(if matches_addr { Color::Yellow } else { Color::Cyan }),
+                    format!("{:>4}", reg_name),
+                    Style::default().fg(if matches_addr {
+                        Color::Yellow
+                    } else {
+                        Color::Cyan
+                    }),
                 ),
                 Span::raw("="),
-                Span::styled(
-                    format!("{:>16x} ", val),
-                    Style::default().fg(vclr),
-                ),
-                Span::styled(
-                    bar_str,
-                    Style::default().fg(conf_color),
-                ),
+                Span::styled(format!("{:>16x} ", val), Style::default().fg(vclr)),
+                Span::styled(bar_str, Style::default().fg(conf_color)),
                 Span::styled(
                     format!(" {:<5}", conf_label),
                     Style::default().fg(conf_color),
                 ),
                 if conf.is_stale() {
-                    Span::styled(" !! ", Style::default().fg(Color::White).bg(Color::Red).bold())
+                    Span::styled(
+                        " !! ",
+                        Style::default().fg(Color::White).bg(Color::Red).bold(),
+                    )
                 } else {
                     Span::raw("")
                 },
@@ -769,10 +766,7 @@ pub fn draw(
                         format!(" {:<16}", type_str),
                         Style::default().fg(Color::Cyan),
                     ),
-                    Span::styled(
-                        format!(" {}%", conf_pct),
-                        Style::default().fg(conf_color),
-                    ),
+                    Span::styled(format!(" {}%", conf_pct), Style::default().fg(conf_color)),
                     Span::styled(
                         format!(" {}F", obj.fields.len()),
                         Style::default().fg(Color::DarkGray),

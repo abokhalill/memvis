@@ -12,6 +12,12 @@ pub struct HeapOracle {
     stack_bounds: HashMap<u16, (u64, u64)>,
 }
 
+impl Default for HeapOracle {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeapOracle {
     pub fn new() -> Self {
         Self {
@@ -21,7 +27,9 @@ impl HeapOracle {
     }
 
     pub fn add_module(&mut self, base: u64, size: u64) {
-        if size == 0 { return; }
+        if size == 0 {
+            return;
+        }
         let hi = base.saturating_add(size);
         // merge overlapping
         if let Some(last) = self.module_ranges.last_mut() {
@@ -43,23 +51,35 @@ impl HeapOracle {
 
     pub fn is_heap(&self, addr: u64) -> bool {
         // not in any module
-        if self.module_ranges.binary_search_by(|&(lo, hi)| {
-            if addr < lo { std::cmp::Ordering::Greater }
-            else if addr >= hi { std::cmp::Ordering::Less }
-            else { std::cmp::Ordering::Equal }
-        }).is_ok() {
+        if self
+            .module_ranges
+            .binary_search_by(|&(lo, hi)| {
+                if addr < lo {
+                    std::cmp::Ordering::Greater
+                } else if addr >= hi {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Equal
+                }
+            })
+            .is_ok()
+        {
             return false;
         }
         // not on any thread's stack
-        if self.stack_bounds.values().any(|&(lo, hi)| addr >= lo && addr < hi) {
+        if self
+            .stack_bounds
+            .values()
+            .any(|&(lo, hi)| addr >= lo && addr < hi)
+        {
             return false;
         }
         // plausible userspace pointer (above 0x1000, below kernel space)
-        addr >= 0x1000 && addr < 0x0000_8000_0000_0000
+        (0x1000..0x0000_8000_0000_0000).contains(&addr)
     }
 
     fn is_plausible_ptr(&self, val: u64) -> bool {
-        val >= 0x1000 && val < 0x0000_8000_0000_0000
+        (0x1000..0x0000_8000_0000_0000).contains(&val)
     }
 }
 
@@ -118,6 +138,12 @@ pub struct HeapGraph {
     total_events: u64,
 }
 
+impl Default for HeapGraph {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HeapGraph {
     pub fn new() -> Self {
         Self {
@@ -157,12 +183,24 @@ impl HeapGraph {
     }
 
     // process a single heap write event
-    pub fn process_write(&mut self, addr: u64, size: u32, value: u64, seq: u64, oracle: &HeapOracle) {
+    pub fn process_write(
+        &mut self,
+        addr: u64,
+        size: u32,
+        value: u64,
+        seq: u64,
+        oracle: &HeapOracle,
+    ) {
         self.total_events += 1;
         self.events_since_inference += 1;
 
         // record for clustering
-        self.recent_writes.push_back(RecentWrite { addr, size, value, seq });
+        self.recent_writes.push_back(RecentWrite {
+            addr,
+            size,
+            value,
+            seq,
+        });
         if self.recent_writes.len() > CLUSTER_WINDOW {
             self.recent_writes.pop_front();
         }
@@ -192,9 +230,11 @@ impl HeapGraph {
         }
 
         // clustering: check if nearby writes suggest a new object
-        let nearby: Vec<&RecentWrite> = self.recent_writes.iter()
+        let nearby: Vec<&RecentWrite> = self
+            .recent_writes
+            .iter()
             .filter(|w| {
-                let d = if w.addr >= addr { w.addr - addr } else { addr - w.addr };
+                let d = w.addr.abs_diff(addr);
                 d <= CLUSTER_RADIUS
             })
             .collect();
@@ -258,7 +298,11 @@ impl HeapGraph {
             None => return,
         };
         // update existing edge or insert new
-        if let Some(edge) = obj.outgoing_edges.iter_mut().find(|e| e.field_offset == offset) {
+        if let Some(edge) = obj
+            .outgoing_edges
+            .iter_mut()
+            .find(|e| e.field_offset == offset)
+        {
             edge.target_addr = target;
             edge.last_seq = seq;
             edge.write_count += 1;
@@ -281,10 +325,14 @@ impl HeapGraph {
     pub fn run_type_inference(&mut self, dwarf: &DwarfInfo) {
         self.events_since_inference = 0;
         let candidates = collect_struct_types(dwarf);
-        if candidates.is_empty() { return; }
+        if candidates.is_empty() {
+            return;
+        }
 
         for obj in self.objects.values_mut() {
-            if obj.fields.is_empty() { continue; }
+            if obj.fields.is_empty() {
+                continue;
+            }
             let (best_name, best_score) = match_struct_type(obj, &candidates);
             if best_score >= 0.5 {
                 obj.inferred_type = Some(best_name);
@@ -296,7 +344,9 @@ impl HeapGraph {
     // GC: remove stale objects not written in a long time
     pub fn gc_stale(&mut self, current_seq: u64, max_age: u64) {
         let threshold = current_seq.saturating_sub(max_age);
-        let stale: Vec<u64> = self.objects.iter()
+        let stale: Vec<u64> = self
+            .objects
+            .iter()
             .filter(|(_, o)| o.last_seq < threshold)
             .map(|(&base, _)| base)
             .collect();
@@ -323,14 +373,20 @@ fn collect_struct_types(dwarf: &DwarfInfo) -> Vec<StructCandidate> {
     let mut candidates = Vec::new();
 
     let mut collect_from_type = |ti: &TypeInfo| {
-        if ti.fields.is_empty() || ti.byte_size == 0 { return; }
-        if !seen.insert(ti.name.clone()) { return; }
+        if ti.fields.is_empty() || ti.byte_size == 0 {
+            return;
+        }
+        if !seen.insert(ti.name.clone()) {
+            return;
+        }
         candidates.push(StructCandidate {
             name: ti.name.clone(),
             byte_size: ti.byte_size,
-            fields: ti.fields.iter().map(|f| {
-                (f.byte_offset, f.byte_size, f.type_info.is_pointer)
-            }).collect(),
+            fields: ti
+                .fields
+                .iter()
+                .map(|f| (f.byte_offset, f.byte_size, f.type_info.is_pointer))
+                .collect(),
         });
     };
 
@@ -356,15 +412,15 @@ fn match_struct_type(obj: &HeapObject, candidates: &[StructCandidate]) -> (Strin
     let mut best_score: f32 = 0.0;
 
     for c in candidates {
-        if c.fields.is_empty() { continue; }
+        if c.fields.is_empty() {
+            continue;
+        }
         let mut matches = 0usize;
         let total = c.fields.len();
 
         for &(c_off, c_size, c_is_ptr) in &c.fields {
             if let Some(observed) = obj.fields.get(&c_off) {
-                if observed.size as u64 == c_size
-                    || (c_is_ptr && observed.is_pointer)
-                {
+                if observed.size as u64 == c_size || (c_is_ptr && observed.is_pointer) {
                     matches += 1;
                 }
             }
@@ -372,7 +428,11 @@ fn match_struct_type(obj: &HeapObject, candidates: &[StructCandidate]) -> (Strin
 
         let score = matches as f32 / total as f32;
         // bonus for size match
-        let size_bonus = if obj.inferred_size == c.byte_size { 0.1 } else { 0.0 };
+        let size_bonus = if obj.inferred_size == c.byte_size {
+            0.1
+        } else {
+            0.0
+        };
         let final_score = (score + size_bonus).min(1.0);
 
         if final_score > best_score {
