@@ -156,7 +156,7 @@ fn process_event(
             if orch.rings[ring_idx].pop_n(6, &mut cont) {
                 // validate: all 6 continuation slots must be REG_SNAPSHOT kind.
                 // if any slot has a different kind, the ring may have wrapped or
-                // been corrupted — discard the entire snapshot.
+                // been corrupted; discard the entire snapshot.
                 let valid = cont.iter().all(|c| c.kind() == EVENT_REG_SNAPSHOT);
                 if valid {
                     let mut regs = [0u64; REG_COUNT];
