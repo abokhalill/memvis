@@ -1,6 +1,6 @@
 engine/target/
 build/
 dynamorio-sdk/
-test/
+tests/
 .git/
 docs/

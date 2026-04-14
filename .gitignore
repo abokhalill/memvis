@@ -8,8 +8,8 @@ Makefile
 *.o
 *.so
 *.dylib
-dynamorio-sdk
-test/
+dynamorio-sdk/
+tests/
 .vscode/
 .idea/
 *.swp
