@@ -292,23 +292,6 @@ impl ShadowRegisterFile {
         }
     }
 
-    pub fn resolve_simple(
-        &self,
-        piece: &LocationPiece,
-    ) -> Option<(u64, Confidence)> {
-        match piece {
-            LocationPiece::Register(dwarf_reg) => {
-                let idx = dwarf_reg_to_idx(*dwarf_reg)?;
-                Some((self.regs[idx].value, self.regs[idx].confidence))
-            }
-            LocationPiece::RegisterOffset(dwarf_reg, off) => {
-                let idx = dwarf_reg_to_idx(*dwarf_reg)?;
-                let addr = (self.regs[idx].value as i64).wrapping_add(*off) as u64;
-                Some((addr, self.regs[idx].confidence))
-            }
-            _ => None,
-        }
-    }
 }
 
 // piece assembler: reconstructs DW_OP_piece-fragmented variables on demand.
@@ -501,63 +484,6 @@ impl PieceAssembler {
             min_confidence: min_conf,
             resolved_count: resolved,
             total_count: fragments.len(),
-        }
-    }
-}
-
-pub struct ShadowRegisterBank {
-    threads: std::collections::HashMap<u16, ShadowRegisterFile>,
-}
-
-impl ShadowRegisterBank {
-    pub fn new() -> Self {
-        Self {
-            threads: std::collections::HashMap::new(),
-        }
-    }
-
-    pub fn get_or_create(&mut self, tid: u16) -> &mut ShadowRegisterFile {
-        self.threads
-            .entry(tid)
-            .or_insert_with(ShadowRegisterFile::new)
-    }
-
-    pub fn get(&self, tid: u16) -> Option<&ShadowRegisterFile> {
-        self.threads.get(&tid)
-    }
-}
-
-#[derive(Debug, Clone)]
-pub struct PiecedLocation {
-    pub simple: Option<LocationPiece>,
-    pub fragments: Vec<PieceFragment>,
-    pub is_pieced: bool,
-}
-
-impl PiecedLocation {
-    pub fn from_expr_steps(steps: &[ExprStep]) -> Self {
-        let has_piece = steps.iter().any(|s| matches!(s, ExprStep::Piece(_)));
-        if has_piece {
-            let fragments = PieceAssembler::parse_pieces(steps);
-            Self {
-                simple: None,
-                fragments,
-                is_pieced: true,
-            }
-        } else {
-            Self {
-                simple: None,
-                fragments: Vec::new(),
-                is_pieced: false,
-            }
-        }
-    }
-
-    pub fn from_simple(piece: LocationPiece) -> Self {
-        Self {
-            simple: Some(piece),
-            fragments: Vec::new(),
-            is_pieced: false,
         }
     }
 }

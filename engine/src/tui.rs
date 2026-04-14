@@ -381,6 +381,8 @@ fn build_event_lines(journal: &VecDeque<JournalEntry>, filter: &EventFilter) -> 
                 5 => ("REG ", Color::Cyan),
                 6 => ("CMIS", Color::Magenta),
                 7 => ("MLOAD", Color::Yellow),
+                8 => ("TCAL", Color::Blue),
+                12 => ("RLOD", Color::Green),
                 _ => ("?   ", Color::DarkGray),
             };
             Line::from(vec![

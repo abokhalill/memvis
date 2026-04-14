@@ -72,14 +72,6 @@ impl CacheLineTracker {
         e.last_writer = thread_id;
     }
 
-    // cache line is false-shared if >1 thread has written to it
-    pub fn is_false_shared(&self, addr: u64) -> bool {
-        self.lines
-            .get(&(addr >> CACHE_LINE_SHIFT))
-            .map(|e| e.writers.len() > 1)
-            .unwrap_or(false)
-    }
-
     pub fn contention_score(&self, addr: u64) -> u32 {
         self.lines
             .get(&(addr >> CACHE_LINE_SHIFT))
@@ -229,12 +221,6 @@ impl WorldState {
             },
         );
         true
-    }
-
-    pub fn update_node_addr(&mut self, id: NodeId, addr: u64) {
-        if let Some(node) = self.cow().nodes.get_mut(&id) {
-            node.addr = addr;
-        }
     }
 
     pub fn remove_node(&mut self, id: NodeId) {
