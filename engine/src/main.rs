@@ -369,6 +369,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             }
             if total & 0xFFF == 0 {
                 world.cache_heat_tick();
+                world.cl_tracker_tick();
             }
             // heap graph: periodic type inference + GC
             if heap_graph.needs_type_inference() {
@@ -431,7 +432,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
 fn run_headless(
     orch: &mut RingOrchestrator,
     dwarf_info: &Option<DwarfInfo>,
-    min_events: u64,
+    _min_events: u64,
     addr_index: &mut AddressIndex,
     world: &mut WorldState,
     stacks: &mut HashMap<u16, ShadowStack>,
@@ -447,11 +448,9 @@ fn run_headless(
     use std::io::Write;
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    let refresh = time::Duration::from_millis(100);
-    let mut last_render = time::Instant::now();
-    let mut rendered_once = false;
     let mut last_discovery = time::Instant::now();
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
+    let mut idle_rounds: u32 = 0;
 
     loop {
         let now_disc = time::Instant::now();
@@ -506,27 +505,31 @@ fn run_headless(
             addr_index.finalize();
         }
 
-        let now = time::Instant::now();
-        if now.duration_since(last_render) >= refresh || (!rendered_once && *total > 0) {
-            let snap = world.snapshot();
-            headless_render(&mut out, &snap, journal, *total, orch);
-            let _ = out.flush();
-            last_render = now;
-            rendered_once = true;
-
-            if *total >= min_events {
+        if drained == 0 {
+            idle_rounds += 1;
+            // after seeing events, if the ring stays empty for 50 consecutive
+            // rounds (~500ms), the target has finished. render final snapshot.
+            if *total > 0 && idle_rounds >= 50 {
+                let snap = world.snapshot();
+                headless_render(&mut out, &snap, journal, *total, orch);
+                let _ = out.flush();
                 return;
             }
-        }
-
-        if drained == 0 {
             thread::sleep(time::Duration::from_millis(10));
+        } else {
+            idle_rounds = 0;
         }
 
         orch.update_backpressure();
 
         if *total & 0xFFF == 0 {
             world.cache_heat_tick();
+            world.cl_tracker_tick();
+        }
+
+        // safety valve: if we've been running a long time with no tracer, bail
+        if GOT_SIGNAL.load(AtomicOrdering::Relaxed) {
+            break;
         }
     }
 }
@@ -661,6 +664,8 @@ fn headless_render(
             5 => "REG",
             6 => "CMIS",
             7 => "MLOAD",
+            8 => "TCALL",
+            12 => "RLOAD",
             _ => "?",
         };
         let _ = writeln!(
