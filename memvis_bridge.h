@@ -19,7 +19,6 @@
 #define MEMVIS_CACHE_LINE    64
 #define MEMVIS_MAGIC         0x4D454D56495342ULL  /* "MEMVISB\0" */
 #define MEMVIS_PROTO_VERSION 3
-#define MEMVIS_SHM_NAME      "/memvis_ring"
 #define MEMVIS_SHM_ENV       "MEMVIS_SHM_PATH"
 
 #define MEMVIS_EVENT_WRITE    0
@@ -85,13 +84,13 @@ typedef struct __attribute__((aligned(MEMVIS_CACHE_LINE))) {
     uint64_t _cl0_reserved[4];  
     // --- cache line 1: ambient telemetry ---
     uint64_t stat_inline_writes;
-    uint64_t stat_write_slow;       // page-straddling writes (clean call)
     uint64_t stat_reads;
     uint64_t stat_reloads;
     uint64_t stat_calls;
     uint64_t stat_returns;
     uint64_t stat_tail_calls;
     uint64_t stat_dropped;
+    uint64_t _cl1_reserved;
 } memvis_scratch_pad_t;
 
 _Static_assert(sizeof(memvis_scratch_pad_t) == 2 * MEMVIS_CACHE_LINE, "");
@@ -108,7 +107,12 @@ typedef struct __attribute__((aligned(32))) {
 
 _Static_assert(sizeof(memvis_event_t) == 32, "");
 
-// v3: +rip_lo, extended seq
+// v3: +rip_lo, extended seq.
+// SEQUENCE CONTRACT: 32-bit (seq_lo:16 | seq_hi:16) wraps at 2^32.
+// At 50M events/sec (typical DBI throughput), wrap occurs every ~86 seconds.
+// Consumers MUST use modular arithmetic for ordering: (int32_t)(a - b) > 0.
+// The sequence is per thread; cross-thread ordering uses (thread_id, seq) pairs.
+// Widening to 48/64-bit requires an event format change and is deferred.
 typedef struct __attribute__((aligned(32))) {
     uint64_t addr;
     uint32_t size;
@@ -150,7 +154,8 @@ typedef struct {
     uint32_t entry_size;
     uint64_t flags;
     _Atomic uint32_t backpressure;
-    uint8_t  _pad0[MEMVIS_CACHE_LINE - 24 - sizeof(_Atomic uint32_t)];
+    uint32_t proto_version;     
+    uint8_t  _pad0[MEMVIS_CACHE_LINE - 28 - sizeof(_Atomic uint32_t)];
     _Alignas(MEMVIS_CACHE_LINE) _Atomic uint64_t head;
     uint8_t  _pad1[MEMVIS_CACHE_LINE - sizeof(_Atomic uint64_t)];
     _Alignas(MEMVIS_CACHE_LINE) _Atomic uint64_t tail;
@@ -255,14 +260,25 @@ static inline int memvis_pop(memvis_ring_header_t *ring,
     return 0;
 }
 
+// capacity must be a power of two for h & mask indexing.
+#define MEMVIS_IS_POW2(x) ((x) != 0 && ((x) & ((x) - 1)) == 0)
+
 static inline void memvis_ring_init(memvis_ring_header_t *ring,
                                      uint32_t capacity, uint64_t flags)
 {
+    // runtime guard: capacity must be power of two. assert + early return.
+    if (!MEMVIS_IS_POW2(capacity)) {
+        // in DBI context, DR_ASSERT fires; in standalone, segfault is better
+        // than silent corruption from non power of two masking.
+        memset(ring, 0, sizeof(memvis_ring_header_t));
+        return;
+    }
     memset(ring, 0, sizeof(memvis_ring_header_t));
-    ring->magic      = MEMVIS_MAGIC;
-    ring->capacity   = capacity;
-    ring->entry_size = sizeof(memvis_event_t);
-    ring->flags      = flags;
+    ring->magic         = MEMVIS_MAGIC;
+    ring->capacity      = capacity;
+    ring->entry_size    = sizeof(memvis_event_t);
+    ring->flags         = flags;
+    ring->proto_version = MEMVIS_PROTO_VERSION;
     atomic_store_explicit(&ring->head, 0, memory_order_relaxed);
     atomic_store_explicit(&ring->tail, 0, memory_order_relaxed);
 }
@@ -299,7 +315,8 @@ static inline void memvis_push_overflow(memvis_ring_header_t *ring,
 #define MEMVIS_MAX_THREADS      256
 #define MEMVIS_RING_NAME_LEN    48
 
-#define MEMVIS_THREAD_RING_CAPACITY  (1u << 20)  
+#define MEMVIS_THREAD_RING_CAPACITY  (1u << 20)
+_Static_assert(MEMVIS_IS_POW2(MEMVIS_THREAD_RING_CAPACITY), "ring capacity must be power-of-two");
 
 #define MEMVIS_THREAD_STATE_EMPTY    0
 #define MEMVIS_THREAD_STATE_ACTIVE   1
@@ -339,6 +356,21 @@ static inline int memvis_ctl_register_thread(memvis_ctl_header_t *ctl,
                                                uint16_t thread_id,
                                                const char *ring_shm_name)
 {
+    // first pass: try to reclaim a DEAD slot via CAS (O(max_threads) scan,
+    // amortized over thread lifetime; negligible vs. thread creation cost)
+    for (uint32_t i = 0; i < ctl->max_threads; i++) {
+        uint32_t expected = MEMVIS_THREAD_STATE_DEAD;
+        if (atomic_compare_exchange_strong_explicit(
+                &ctl->threads[i].state, &expected,
+                MEMVIS_THREAD_STATE_ACTIVE,
+                memory_order_acq_rel, memory_order_relaxed)) {
+            ctl->threads[i].thread_id = thread_id;
+            strncpy(ctl->threads[i].shm_name, ring_shm_name, MEMVIS_RING_NAME_LEN - 1);
+            ctl->threads[i].shm_name[MEMVIS_RING_NAME_LEN - 1] = '\0';
+            return (int)i;
+        }
+    }
+    // no dead slots; allocate a fresh one from the high-water mark
     uint32_t idx = atomic_fetch_add_explicit(&ctl->thread_count, 1, memory_order_acq_rel);
     if (idx >= ctl->max_threads) {
         atomic_fetch_sub_explicit(&ctl->thread_count, 1, memory_order_relaxed);

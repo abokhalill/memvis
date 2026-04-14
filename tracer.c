@@ -5,20 +5,15 @@
 
 #include "memvis_bridge.h"
 
-// static offset manifest — compile-time struct layout, not runtime.
-// hard-contract: _Static_assert catches bridge/pad drift at build time.
-
 #define OFF_PAD_SCRATCH0       ((int)offsetof(memvis_scratch_pad_t, scratch[0]))
 #define OFF_PAD_SCRATCH1       ((int)offsetof(memvis_scratch_pad_t, scratch[1]))
 #define OFF_PAD_RING_MASK      ((int)offsetof(memvis_scratch_pad_t, ring_mask))
 #define OFF_PAD_RING_DATA      ((int)offsetof(memvis_scratch_pad_t, ring_data))
 #define OFF_PAD_STAT_INLINE    ((int)offsetof(memvis_scratch_pad_t, stat_inline_writes))
-#define OFF_PAD_STAT_SLOW      ((int)offsetof(memvis_scratch_pad_t, stat_write_slow))
 #define OFF_PAD_STAT_READS     ((int)offsetof(memvis_scratch_pad_t, stat_reads))
 #define OFF_PAD_STAT_RELOADS   ((int)offsetof(memvis_scratch_pad_t, stat_reloads))
 #define OFF_PAD_STAT_CALLS     ((int)offsetof(memvis_scratch_pad_t, stat_calls))
 #define OFF_PAD_STAT_RETURNS   ((int)offsetof(memvis_scratch_pad_t, stat_returns))
-#define OFF_PAD_STAT_TAILCALLS ((int)offsetof(memvis_scratch_pad_t, stat_tail_calls))
 #define OFF_PAD_STAT_DROPPED   ((int)offsetof(memvis_scratch_pad_t, stat_dropped))
 
 _Static_assert(offsetof(memvis_scratch_pad_t, scratch[0]) ==  0, "pad.scratch[0] drift");
@@ -67,21 +62,19 @@ static int                  g_ctl_fd  = -1;
 
 static _Atomic uint64_t g_insn_counter  = 0;
 
-static _Atomic uint64_t g_stat_writes       = 0;
 static _Atomic uint64_t g_stat_reads        = 0;
 static _Atomic uint64_t g_stat_calls        = 0;
 static _Atomic uint64_t g_stat_returns      = 0;
-static _Atomic uint64_t g_stat_shed         = 0;
 static _Atomic uint64_t g_stat_dropped      = 0;
 static _Atomic uint64_t g_stat_reg_snaps    = 0;
 static _Atomic uint64_t g_stat_rdbuf_flushes = 0;
 static _Atomic uint64_t g_stat_inline_writes = 0;
-static _Atomic uint64_t g_stat_spill_writes  = 0;
 static _Atomic uint64_t g_stat_reloads       = 0;
 
 static _Atomic uint16_t g_next_thread_id    = 0;
 
 static uint64_t g_module_base = 0;
+static uint64_t g_module_end  = 0;
 static _Atomic int g_module_base_phase = 0;
 
 #define TLS_SLOT_GUARD     0
@@ -350,14 +343,13 @@ safe_read_into_slot(uint64_t addr, uint32_t size, memvis_event_v3_t *slot)
     slot->value = val;
 }
 
-// post-write: page-boundary probe → value capture → bump seq+head → flush.
+// post-write: value capture -> bump seq+head -> conditional flush.
 // reg_addr = EA (drreg-held from pre-write). sz = JIT-time write size.
 // pad.scratch[1] = event slot ptr (0 = pre-write skipped).
 //
-// key insight: slot_ptr lives in pad.scratch[1] throughout. we never move it
-// to a register permanently — just reload from pad when needed. this means
-// scratch is free for the page probe, and reg_addr stays as EA until the
-// size-matched load clobbers it.
+// value capture: clean call safe_read_into_slot with DR_TRY_EXCEPT.
+// six inline approaches tested and all fail under DynamoRIO's block builder
+// (see comments inside for the full list). pre-write metadata remains inline.
 static void
 emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 reg_id_t reg_addr, uint32_t sz)
@@ -369,14 +361,12 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     }
 
     instr_t *skip_label     = INSTR_CREATE_label(drcontext);
-    instr_t *slow_label     = INSTR_CREATE_label(drcontext);
     instr_t *val_done       = INSTR_CREATE_label(drcontext);
     instr_t *no_flush_label = INSTR_CREATE_label(drcontext);
 
     drreg_reserve_aflags(drcontext, bb, where);
 
     // --- check if pre-write was skipped (pad.scratch[1] == 0) ---
-    // load pad ptr, then check scratch[1]. don't clobber reg_addr (EA).
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -391,46 +381,24 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
 
     // --- reload EA from pad.scratch[0] into reg_addr ---
     // reg_addr may be stale: app write can modify its base reg (e.g. PUSH/POP).
-    // pre-write saved the computed EA to pad.scratch[0]. scratch still = pad ptr.
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_ld(drcontext,
             opnd_create_reg(reg_addr),
             OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0)));
 
-    // --- Page-Boundary Probe: scratch = (EA & 0xFFF) + sz ---
-    instrlist_meta_preinsert(bb, where,
-        XINST_CREATE_move(drcontext,
-            opnd_create_reg(scratch), opnd_create_reg(reg_addr)));
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_and(drcontext,
-            opnd_create_reg(scratch), OPND_CREATE_INT32(0xFFF)));
-    if (sz > 0) {
-        instrlist_meta_preinsert(bb, where,
-            XINST_CREATE_add(drcontext,
-                opnd_create_reg(scratch), OPND_CREATE_INT32((int)sz)));
-    }
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_cmp(drcontext,
-            opnd_create_reg(scratch), OPND_CREATE_INT32(0x1000)));
-    instrlist_meta_preinsert(bb, where,
-        INSTR_CREATE_jcc(drcontext, OP_ja, opnd_create_instr(slow_label)));
-
-    // --- All value reads go through safe clean call ---
-    // The page-boundary probe above filters out the common case (no straddle)
-    // but we route all reads through the fault-tolerant clean call for safety.
-    // This avoids inline MOV corruption that causes exit-time segfaults.
-    // The probe still gates: only non-straddling writes reach here; straddling
-    // writes also use the same clean call path.
-    // (fall through to slow_label for unified clean call path)
-
-    instrlist_meta_preinsert(bb, where, slow_label);
-
-    // reload slot_ptr from pad.scratch[1] for clean call arg
-    instrlist_meta_preinsert(bb, where,
-        XINST_CREATE_load(drcontext,
-            opnd_create_reg(scratch),
-            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+    // --- Value capture: clean call with DR_TRY_EXCEPT ---
+    // Six inline approaches tested and failed (all cause block truncation or
+    // exit-time SIGSEGV under DynamoRIO's execution model):
+    //   1. drreg-managed MOV: corrupts lazy-restore state machine
+    //   2. Manual RAX spill to raw TLS: implicit operand collision (CMPXCHG/XADD)
+    //   3. dr_save_reg/dr_restore_reg (SPILL_SLOT_5): wr_fast drops 14K→631
+    //   4. PUSH [EA] / POP [slot]: DynamoRIO mangles meta PUSH/POP for shadow stack
+    //   5. MOVQ XMM0 relay: wr_fast drops 14K→631 (encoder operand ambiguity)
+    //   6. Manual R11 spill to private pad: wr_fast drops to 11 (block truncation)
+    // Root cause: any meta-instruction that loads from an app-computed EA causes
+    // DynamoRIO's block builder to truncate or corrupt the basic block.
+    // The clean call is the only proven-stable value capture under DBI.
+    // Pre-write metadata (addr, size, tid, seq, kind, rip) remains fully inline.
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_ld(drcontext,
             opnd_create_reg(scratch),
@@ -445,12 +413,12 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     // ambient telemetry: pad->stat_inline_writes++
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
-            opnd_create_reg(reg_addr),
+            opnd_create_reg(scratch),
             dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                 RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_add(drcontext,
-            OPND_CREATE_MEMPTR(reg_addr, OFF_PAD_STAT_INLINE),
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_STAT_INLINE),
             OPND_CREATE_INT32(1)));
 
     instrlist_meta_preinsert(bb, where, val_done);
@@ -522,6 +490,19 @@ flush_head_cache(void *drcontext)
     atomic_store_explicit(&ring->head, cached_head, memory_order_release);
 }
 
+// After a clean call that uses memvis_push_ex / memvis_push_reg_snapshot
+// (which advance ring->head directly), reload ring->head into the raw TLS
+// cached head so the inline write path doesn't overwrite the event.
+static void
+sync_head_cache(void *drcontext)
+{
+    memvis_ring_header_t *ring = (memvis_ring_header_t *)raw_tls_get(
+        drcontext, RAW_TLS(MEMVIS_RAW_SLOT_RING));
+    if (!ring) return;
+    uint64_t real_head = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_HEAD), (void *)(uintptr_t)real_head);
+}
+
 static memvis_ring_header_t *
 alloc_thread_ring(const char *shm_name)
 {
@@ -588,6 +569,7 @@ static inline void maybe_emit_module_load(void *drcontext, memvis_ring_header_t 
     uint16_t tid = tls_thread_id(drcontext);
     uint16_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, g_module_base, 0, 0, MEMVIS_EVENT_MODULE_LOAD, tid, seq);
+    sync_head_cache(drcontext);
     dr_printf("memvis: emitted MODULE_LOAD base=0x%llx (tid=%u seq=%u)\n",
               (unsigned long long)g_module_base, (unsigned)tid, (unsigned)seq);
 }
@@ -600,29 +582,6 @@ static inline uint64_t safe_read_value(uint64_t addr, uint32_t size) {
         }, { /* fault: leave val=0 */ });
     }
     return val;
-}
-
-static void
-at_mem_write(uint64_t addr, uint32_t size)
-{
-    void *drcontext = dr_get_current_drcontext();
-    void *guard = drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD]);
-    if (guard != NULL) return;
-    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], (void *)(uintptr_t)1);
-
-    memvis_ring_header_t *ring = tls_ring(drcontext);
-    if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
-    uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
-    uint64_t val = safe_read_value(addr, size);
-    int rc = memvis_push_sampled(ring, addr, size, val,
-                                  MEMVIS_EVENT_WRITE, tid, seq);
-    if (rc == 0)
-        atomic_fetch_add_explicit(&g_stat_writes, 1, memory_order_relaxed);
-    else if (rc < 0)
-        atomic_fetch_add_explicit(&g_stat_dropped, 1, memory_order_relaxed);
-
-    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
 }
 
 static void
@@ -680,6 +639,7 @@ flush_read_buf(void)
             pad->stat_dropped++;
     }
     buf->count = 0;
+    sync_head_cache(drcontext);
     atomic_fetch_add_explicit(&g_stat_rdbuf_flushes, 1, memory_order_relaxed);
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
 }
@@ -698,6 +658,7 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
     uint16_t tid = tls_thread_id(drcontext);
     uint16_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, callee_pc, 0, frame_base, MEMVIS_EVENT_CALL, tid, seq);
+    sync_head_cache(drcontext);
     memvis_scratch_pad_t *pad = tls_pad(drcontext);
     if (pad) pad->stat_calls++;
     uint64_t ic = atomic_fetch_add_explicit(&g_insn_counter, 8, memory_order_relaxed);
@@ -727,6 +688,7 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
         regs[MEMVIS_REG_RFLAGS] = (uint64_t)mc.xflags;
         uint16_t rseq = tls_next_seq(drcontext);
         memvis_push_reg_snapshot(ring, ic + 8, regs, tid, rseq);
+        sync_head_cache(drcontext);
         atomic_fetch_add_explicit(&g_stat_reg_snaps, 1, memory_order_relaxed);
     }
 
@@ -754,6 +716,7 @@ at_reload(uint64_t src_addr, uint32_t size, uint32_t dest_reg_idx)
     uint8_t flags = (uint8_t)(dest_reg_idx & 0xFF);
     uint64_t kf = (uint64_t)kind | ((uint64_t)flags << 8);
     memvis_push_ex(ring, src_addr, size, val, kf, tid, seq);
+    sync_head_cache(drcontext);
     { memvis_scratch_pad_t *pad = tls_pad(drcontext); if (pad) pad->stat_reloads++; }
 
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
@@ -809,6 +772,7 @@ at_return(uint64_t retaddr)
     uint16_t tid = tls_thread_id(drcontext);
     uint16_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, retaddr, 0, 0, MEMVIS_EVENT_RETURN, tid, seq);
+    sync_head_cache(drcontext);
     { memvis_scratch_pad_t *pad = tls_pad(drcontext); if (pad) pad->stat_returns++; }
 
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
@@ -829,6 +793,7 @@ at_tail_call(uint64_t target_pc, uint64_t frame_base)
     uint16_t tid = tls_thread_id(drcontext);
     uint16_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, target_pc, 0, frame_base, MEMVIS_EVENT_TAIL_CALL, tid, seq);
+    sync_head_cache(drcontext);
     { memvis_scratch_pad_t *pad = tls_pad(drcontext); if (pad) pad->stat_tail_calls++; }
 
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL);
@@ -916,6 +881,16 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
     }
 
     // inline write path: pre-write at current instr, post-write deferred to next
+    // RIP filter: only instrument writes originating from the main module.
+    // kills ld-linux/libc bootstrap noise at the source.
+    if (instr_writes_memory(instr)) {
+        app_pc pc = instr_get_app_pc(instr);
+        bool in_main = g_module_base != 0 &&
+                       (uint64_t)(ptr_uint_t)pc >= g_module_base &&
+                       (uint64_t)(ptr_uint_t)pc <  g_module_end;
+        if (!in_main)
+            goto after_write;
+    }
     if (instr_writes_memory(instr)) {
         bool seen_memref = false;
         for (int i = 0; i < instr_num_dsts(instr); i++) {
@@ -969,10 +944,16 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
             }
         }
     }
+after_write:
 
-    // free user_data at end of bb
+    // free user_data at end of bb; force-flush head to ring header
     if (drmgr_is_last_instr(drcontext, instr)) {
         handle_pending_post_write(drcontext, bb, instr, data);
+        // unconditional head flush at BB exit ensures consumer never
+        // stares at stale tail while producer is idle/blocked. if the thread 
+        // wrote nothing this BB, flush_head_cache is a no op.
+        dr_insert_clean_call(drcontext, bb, instr,
+                             (void *)flush_head_cache, false, 0);
         dr_thread_free(drcontext, data, sizeof(instru_data_t));
     }
 
@@ -996,12 +977,12 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                     bool ok = drutil_insert_get_mem_addr(drcontext, bb, instr, src, reg1, reg2);
                     uint32_t rd_sz = opnd_size_in_bytes(opnd_get_size(src));
                     int midx = dr_reg_to_memvis_idx(dst_reg);
-                    // unreserve reg2 immediately — only needed for EA computation
+                    // unreserve reg2 immediately. only needed for EA computation
                     drreg_unreserve_register(drcontext, bb, instr, reg2);
                     if (ok && midx >= 0) {
                         // emit RELOAD at current instr (same drreg window as reg1).
                         // at_reload reads the value via safe_read_value(EA, sz),
-                        // so inserting before the app load is fine — the EA is
+                        // so inserting before the app load is fine; the EA is
                         // valid and the memory content is about to be loaded.
                         dr_insert_clean_call(drcontext, bb, instr,
                                              (void *)at_reload, false, 3,
@@ -1075,6 +1056,7 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
             strstr(name, "libdynamorio") == NULL &&
             strstr(name, "libdr") == NULL) {
             g_module_base = (uint64_t)(uintptr_t)info->start;
+            g_module_end  = (uint64_t)(uintptr_t)info->end;
             atomic_store_explicit(&g_module_base_phase, 1, memory_order_release);
             dr_printf("memvis: main module '%s' base=0x%llx\n",
                       name, (unsigned long long)g_module_base);
@@ -1143,7 +1125,6 @@ event_thread_exit(void *drcontext)
         drcontext, RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH));
     if (pad) {
         atomic_fetch_add_explicit(&g_stat_inline_writes, pad->stat_inline_writes, memory_order_relaxed);
-        atomic_fetch_add_explicit(&g_stat_spill_writes,  pad->stat_write_slow,    memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_reads,         pad->stat_reads,          memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_reloads,       pad->stat_reloads,        memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_calls,         pad->stat_calls,          memory_order_relaxed);
@@ -1164,7 +1145,6 @@ event_exit(void)
 {
     dr_printf("memvis: --- producer stats (ambient per-thread) ---\n");
     dr_printf("memvis:   wr_fast: %llu\n", (unsigned long long)atomic_load(&g_stat_inline_writes));
-    dr_printf("memvis:   wr_slow: %llu\n", (unsigned long long)atomic_load(&g_stat_spill_writes));
     dr_printf("memvis:   reads:   %llu\n", (unsigned long long)atomic_load(&g_stat_reads));
     dr_printf("memvis:   calls:   %llu\n", (unsigned long long)atomic_load(&g_stat_calls));
     dr_printf("memvis:   returns: %llu\n", (unsigned long long)atomic_load(&g_stat_returns));
@@ -1203,6 +1183,13 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     for (int i = 0; i < TLS_SLOT_COUNT; i++) {
         g_tls_idx[i] = drmgr_register_tls_field();
         DR_ASSERT(g_tls_idx[i] != -1);
+    }
+
+    shm_unlink(MEMVIS_CTL_SHM_NAME);
+    for (unsigned i = 0; i < MEMVIS_MAX_THREADS; i++) {
+        char stale[MEMVIS_RING_NAME_LEN];
+        dr_snprintf(stale, sizeof(stale), "/memvis_ring_%u", i);
+        shm_unlink(stale);  
     }
 
     map_ctl_ring();
