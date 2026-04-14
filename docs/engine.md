@@ -5,16 +5,16 @@ attaches to the tracer's shared memory rings, drains events, correlates them
 with DWARF debug information, and renders a live view of the target program's
 memory state.
 
-This document covers each subsystem of the engine: DWARF parsing, ring
-orchestration, address indexing, world state management, and rendering.
+This document covers each subsystem: DWARF parsing, ring orchestration,
+address indexing, shadow register file, heap graph, world state management,
+and rendering. All claims are derived from the current `engine/src/` source.
 
 ## Subsystems
 
 ```
                        +------------------+
                        |    DWARF parser  |  (startup, one-shot)
-                       |  engine/src/     |
-                       |  dwarf.rs        |
+                       |    dwarf.rs      |
                        +--------+---------+
                                 |
                          DwarfInfo (globals, functions, locals, types)
@@ -22,15 +22,15 @@ orchestration, address indexing, world state management, and rendering.
                                 v
 +------------------+   +------------------+   +------------------+
 |  Ring            |-->|  Event processor |-->|  World state     |
-|  orchestrator    |   |  main.rs         |   |  world.rs        |
-|  ring.rs         |   |  process_event() |   |  Arc<WorldInner> |
-+------------------+   +--------+---------+   +--------+---------+
-                                |                       |
-                         AddressIndex            CoW snapshot
-                         index.rs                       |
-                                                        v
-                                               +------------------+
-                                               |  Renderer        |
+|  orchestrator    |   |     main.rs      |   |    world.rs      |
+|  ring.rs         |   |                  |   |  Arc<WorldInner> |
++------------------+   +---+---------+----+   +--------+---------+
+                            |         |                 |
+                     AddressIndex  ShadowRegs    CoW snapshot
+                     index.rs     shadow_regs.rs        |
+                            |         |                 v
+                     HeapGraph    HeapOracle   +------------------+
+                     heap_graph.rs             |  Renderer        |
                                                |  tui.rs (TUI)    |
                                                |  main.rs (text)  |
                                                +------------------+
@@ -39,61 +39,41 @@ orchestration, address indexing, world state management, and rendering.
 ## DWARF parser (`dwarf.rs`)
 
 The DWARF parser runs once at startup. It reads the target ELF binary and
-extracts three categories of information:
+extracts three categories of information.
 
 ### Globals
 
-A global variable is a `DW_TAG_variable` with a `DW_AT_location` attribute that
-resolves to a fixed address (`DW_OP_addr`). The parser extracts:
-
-- **Name** from `DW_AT_name`.
-- **Address** from the location expression.
-- **Type information** via recursive `DW_AT_type` resolution. This includes
-  the type name, byte size, whether it is a pointer, and (for structs) a list
-  of fields with their byte offsets and sizes.
-
-Struct fields are decomposed up to 2 levels of nesting. This means a global
-`struct rq` will have its direct fields extracted (e.g., `rq.nr_running`), and
-those fields' own fields extracted one level deeper, but no further. This depth
-limit prevents stack overflow on deeply nested types (e.g., Linux kernel
-scheduler structs).
+A global variable is a `DW_TAG_variable` with a `DW_AT_location` attribute
+that resolves to a fixed address (`DW_OP_addr`). The parser extracts name,
+address, and type information via recursive `DW_AT_type` resolution (including
+struct field decomposition, depth-limited to 2 levels).
 
 ### Functions
 
 A function is a `DW_TAG_subprogram` or `DW_TAG_inlined_subroutine` with
-`DW_AT_low_pc` and `DW_AT_high_pc` attributes. The parser extracts:
-
-- **Name** from `DW_AT_name` (or the abstract origin for inlined subroutines).
-- **PC range** from `DW_AT_low_pc` and `DW_AT_high_pc`.
-- **Frame base convention.** Whether the frame base is the CFA
-  (`DW_OP_call_frame_cfa`) or a register value.
-- **Local variables.** Extracted in a second pass over the compilation unit.
-  Each local has a name, frame offset, size, type info, and a location table
-  (for PC-qualified locations).
+`DW_AT_low_pc` and `DW_AT_high_pc`. The parser extracts name, PC range,
+frame base convention (CFA or register), and local variables with location
+tables.
 
 ### Type resolution
 
-The `resolve_type_at` function follows `DW_AT_type` references through
-typedefs, const/volatile qualifiers, pointers, structs, unions, and arrays.
-It peels up to 8 levels of typedef/qualifier indirection and caps struct field
-extraction at depth 2.
-
-Type resolution produces a `TypeInfo` struct:
+`resolve_type_at` follows `DW_AT_type` through typedefs, const/volatile
+qualifiers, pointers, structs, unions, and arrays. Peels up to 8 levels of
+indirection. Caps struct field extraction at depth 2.
 
 ```rust
 pub struct TypeInfo {
-    pub name: String,       // e.g. "int", "*task_t", "cfs_rq"
-    pub byte_size: u64,     // sizeof the type
-    pub is_pointer: bool,   // true for pointer types
-    pub fields: Vec<FieldInfo>,  // struct/union fields (empty for non-aggregates)
+    pub name: String,
+    pub byte_size: u64,
+    pub is_pointer: bool,
+    pub fields: Vec<FieldInfo>,
 }
 ```
 
 ### Location tables
 
-DWARF location descriptions can be simple (a single expression valid for the
-entire scope) or PC-qualified (different expressions for different PC ranges).
-The parser supports both via `LocationTable`:
+DWARF location descriptions can be simple or PC-qualified. The parser supports
+both via `LocationTable`:
 
 ```rust
 pub struct LocationTable {
@@ -101,8 +81,7 @@ pub struct LocationTable {
 }
 ```
 
-The `lookup(pc)` method returns the `LocationPiece` whose range contains the
-given program counter. Supported location pieces:
+Supported `LocationPiece` variants:
 
 | Variant | DWARF equivalent | Meaning |
 |---|---|---|
@@ -112,13 +91,22 @@ given program counter. Supported location pieces:
 | `RegisterOffset(u16, i64)` | `DW_OP_breg*` | Register + offset |
 | `ImplicitValue(u64)` | `DW_OP_implicit_value` | Compile-time constant |
 | `CFA` | `DW_OP_call_frame_cfa` | Canonical frame address |
-| `Expr(DwarfExprOp)` | Complex expression | Evaluated by stack machine |
+| `Expr(DwarfExprOp)` | Complex expression | Stack machine or pattern match |
 
-The stack machine evaluator (`eval_stack_machine`) supports the full set of
-DWARF expression operations: arithmetic, bitwise, stack manipulation, and
-`DW_OP_piece`. It cannot dereference target memory (the engine runs in a
-separate address space), so `DW_OP_deref` is a no-op that preserves the
-address on the stack.
+### Expression evaluator
+
+`DwarfExprOp` has three fast-path patterns plus a general stack machine:
+
+- **`DerefRegOffset`**: `DW_OP_breg + DW_OP_deref` (returns pre-deref addr).
+- **`RegPlusReg`**: Two register+offset values added.
+- **`StackMachine`**: Full evaluator supporting arithmetic, bitwise, stack
+  manipulation (`Drop`, `Pick`, `Swap`, `Rot`), `DW_OP_piece`, and
+  `DW_OP_stack_value`. Cannot dereference target memory (separate address
+  space), so `DW_OP_deref` preserves the address on the stack.
+
+DWARF-to-memvis register mapping is defined in `DWARF_TO_REGFILE[17]`,
+translating DWARF register numbers (0=RAX, 1=RDX, 2=RCX, 3=RBX, ...) to
+memvis indices (0=RAX, 1=RBX, 2=RCX, 3=RDX, ...).
 
 ## Ring orchestrator (`ring.rs`)
 
@@ -126,174 +114,202 @@ The orchestrator manages all shared memory connections to the tracer.
 
 ### Structures
 
-- **`MappedShm`**: RAII wrapper around `mmap`/`munmap` for a POSIX shared
-  memory object.
-- **`ThreadRing`**: A single thread's ring buffer. Wraps a `MappedShm` and
-  provides `pop`, `pop_n`, `peek`, `batch_pop`, and `fill` methods.
+- **`MappedShm`**: RAII wrapper around `shm_open` + `mmap`/`munmap`.
+- **`ThreadRing`**: A single thread's ring buffer. Provides `pop`, `pop_n`,
+  `peek`, `batch_pop`, and `fill` methods.
 - **`RingOrchestrator`**: Manages the control ring and a vector of
-  `ThreadRing`s. Provides `poll_new_rings`, `batch_drain`, `merge_pop`,
-  `total_fill`, and `update_backpressure`.
+  `ThreadRing`s. Provides `try_attach_ctl`, `poll_new_rings`,
+  `batch_drain`, `merge_pop`, `total_fill`, and `update_backpressure`.
 
-### Discovery
+### Protocol version handshake
 
-The orchestrator opens `/memvis_ctl` via `try_attach_ctl()`. On success, it
-polls the control ring for new thread entries via `poll_new_rings()`, which
-runs every 200 ms in the main loop.
+On attach, both `try_attach_ctl` and `ThreadRing::from_shm` validate:
+1. `magic` matches the expected constant.
+2. `proto_version == MEMVIS_PROTO_VERSION` (currently 3).
+
+Mismatches are rejected with a diagnostic message to stderr.
 
 ### Batch drain
 
 The primary drain method is `batch_drain(per_ring, buf)`:
 
-1. Iterates all rings starting from the current round-robin index.
-2. For each ring, calls `batch_pop(per_ring)` which:
-   - Loads `tail` (relaxed) and `head` (acquire) once.
-   - Reads up to `per_ring` events via `read_volatile`.
-   - Stores `tail + n` (release) once.
+1. Iterates all rings from the current round-robin index.
+2. Per ring: loads `tail` (relaxed) and `head` (acquire) once, reads up
+   to `per_ring` events via `read_volatile`, stores `tail + n` (release).
 3. Appends `(ring_index, event)` pairs to the output buffer.
-4. Advances the round-robin index.
 
-With the default `per_ring = 20,000` and up to 6 rings, a single
-`batch_drain` call can return up to 120,000 events with only 12 atomic
-operations total (2 per ring).
+With `per_ring = 20,000` and 6 rings, a single call can return up to
+120,000 events with 12 atomic operations total.
 
 ### Backpressure
 
-After each drain cycle, the orchestrator calls `update_backpressure()`:
-
-- For each ring, computes fill level in eighths: `(head - tail) << 3 / capacity`.
-- If fill >= 6/8 and backpressure is not set: stores `backpressure = 1`
-  (release).
-- If fill < 3/8 and backpressure is set: stores `backpressure = 0` (release).
-
-This is a consumer-to-producer signal. The tracer reads the flag with relaxed
-ordering and sheds `READ` events when it is set.
+After each drain: computes fill in eighths per ring. Sets `backpressure = 1`
+(release) when fill ≥ 6/8, clears when fill < 3/8. The tracer reads this
+with relaxed ordering and sheds `READ` events.
 
 ## Address index (`index.rs`)
 
-The address index is a sorted interval map that resolves memory addresses to
-named variables in O(log N) time.
-
-### Structure
-
-```rust
-pub struct AddressIndex {
-    intervals: Vec<Interval>,   // sorted by lo address
-    needs_sort: bool,
-}
-
-struct Interval {
-    lo: u64,                    // start address (inclusive)
-    hi: u64,                    // end address (exclusive)
-    meta: VarMeta,              // name, type, node ID, frame ID
-}
-```
+Sorted interval map resolving addresses to named variables in O(log N).
 
 ### Two-tier design
 
-The index supports two tiers of entries:
-
 1. **Static globals.** Inserted once after DWARF parsing and relocation.
-   Include global variables and their struct fields. Never removed.
-2. **Dynamic locals.** Inserted on `CALL` events and removed on `RETURN`
-   events. Each local is tagged with a `frame_id` so that all locals from a
-   single stack frame can be removed in one operation.
+   Never removed.
+2. **Dynamic locals.** Inserted on CALL, removed on RETURN. Tagged with
+   `frame_id` for batch removal.
 
-### Lookup
+### Lookup priority
 
-The `lookup(addr)` method performs a binary search (`partition_point`) to find
-the rightmost interval where `lo <= addr`, then checks `addr < hi`. On
-overlapping intervals (e.g., a local variable at the same address as a global
-struct), the lookup prefers:
-
+On overlapping intervals, `lookup(addr)` prefers:
 1. Locals over fields over globals.
 2. Narrower intervals over wider intervals (within the same tier).
 
-This ensures that stack-allocated locals shadow heap or global allocations when
-their address ranges overlap.
-
 ### Finalization
 
-After inserting new entries, `finalize()` must be called to re-sort the
-interval vector. The engine defers finalization to the end of each batch drain
-cycle (not per-event) to amortize the sorting cost.
+`finalize()` re-sorts the interval vector. Deferred to end of each batch
+drain cycle (not per-event) to amortize sorting cost.
+
+## Shadow Register File (`shadow_regs.rs`)
+
+Per-thread register tracking with provenance and coherence.
+
+### Confidence tiers
+
+Each of the 18 tracked registers carries a `Confidence` level:
+
+| Tier | Label | Source |
+|---|---|---|
+| `Observed` | `OBS` | Direct `REG_SNAPSHOT` from tracer |
+| `AbiInferred` | `ABI` | ABI convention (e.g., return value in RAX) |
+| `WriteBack` | `WB` | Value written back to known memory source |
+| `Speculative` | `SPEC` | Heuristic inference |
+| `Stale` | `STALE` | Invalidated by a memory write to the source |
+| `Unknown` | `???` | No information |
+
+The TUI renders a 10-segment confidence bar per register with color coding.
+
+### Coherence checking
+
+On every write event, `check_coherence(addr, value, size, seq)` scans all
+registers. For each register with a known memory source (`src_addr`,
+`src_size`), it checks for interval overlap:
+
+```
+overlap = addr < (src_addr + src_size) && (addr + write_size) > src_addr
+```
+
+If the write overlaps the register's source and the value differs, the
+register is marked `Stale`. This detects cross-thread coherence violations
+and same-thread overwrites of spilled register values.
+
+### Event handlers
+
+- **`on_snapshot(regs)`**: Sets all 18 registers to `Observed` confidence.
+- **`on_call()`**: Marks caller-saved registers (RAX, RCX, RDX, RSI, RDI,
+  R8-R11) as `Unknown`. Callee-saved registers retain their confidence.
+- **`on_return()`**: Marks RAX as `AbiInferred` (return value). Callee-saved
+  registers retain confidence. Others become `Unknown`.
+- **`on_reload(reg, value, src_addr, src_size, seq, rip)`**: Sets register
+  to `Observed` with known memory source for future coherence checking.
+
+### Piece assembler
+
+`PieceAssembler` reconstructs `DW_OP_piece`-fragmented variables. It parses
+a sequence of `ExprStep`s into `PieceFragment`s, each with a byte offset,
+size, and source (`Register`, `Memory`, or `Implicit`). The `assemble`
+method reads fragment values from the SRF and produces an `AssembledValue`
+with per-fragment confidence tracking.
+
+## Heap graph (`heap_graph.rs`)
+
+Autonomous heap object discovery from the write event stream.
+
+### HeapOracle
+
+Classifies addresses as heap, stack, or module:
+- **Module**: Falls within any `(base, base+size)` range from loaded modules.
+- **Stack**: Falls within any thread's `(min_rsp, max_rsp + 128KB)` range.
+- **Heap**: Plausible userspace pointer (≥0x1000, <0x0000_8000_0000_0000)
+  that is neither module nor stack.
+
+### Object discovery via clustering
+
+`process_write` maintains a sliding window of recent writes
+(`CLUSTER_WINDOW = 64`). When ≥3 writes fall within `CLUSTER_RADIUS = 256`
+bytes of each other and target heap addresses, a new `HeapObject` is created
+with the minimum address as base and the span as inferred size.
+
+### Pointer edge tracking
+
+Fields where `size == 8` and the value is a plausible pointer are tagged as
+pointer fields. `HeapEdge`s track source→target relationships with write
+counts.
+
+### Type inference
+
+Periodically (`TYPE_INFERENCE_INTERVAL = 10,000` events), `run_type_inference`
+matches observed field layouts against DWARF struct definitions. Each
+candidate is scored by field-offset/size match ratio with a 10% bonus for
+exact size match. Objects with score ≥0.5 get a type annotation.
+
+### Garbage collection
+
+`gc_stale(current_seq, max_age)` evicts objects not written within `max_age`
+sequence numbers. Called every 65,536 events with `max_age = 500,000`.
 
 ## World state (`world.rs`)
 
-The world state is the engine's in-memory model of the target program's
-observable state.
+The engine's in-memory model of the target program's observable state.
 
 ### WorldInner
 
-The core data structure:
-
 ```rust
 pub struct WorldInner {
-    pub nodes: BTreeMap<NodeId, Node>,          // tracked variables
-    pub edges: BTreeMap<NodeId, PointerEdge>,   // pointer relationships
-    pub insn_counter: u64,                      // logical clock
-    pub reg_file: LiveRegisterFile,             // 18 x86-64 registers
-    pub cache_heat: CacheHeatmap,               // per-node miss tracking
-    pub cl_tracker: CacheLineTracker,           // per-cacheline contention
+    pub nodes: BTreeMap<NodeId, Node>,
+    pub edges: BTreeMap<NodeId, PointerEdge>,
+    pub insn_counter: u64,
+    pub reg_file: LiveRegisterFile,
+    pub cache_heat: CacheHeatmap,
+    pub cl_tracker: CacheLineTracker,
 }
 ```
 
 ### Node IDs
 
-Every tracked variable has a unique `NodeId`:
-
 ```rust
 pub enum NodeId {
-    Global(u32),              // index into DwarfInfo.globals
-    Field(u32, u16),          // (global_idx, field_idx)
-    Local(FrameId, u16),      // (stack frame, local index)
+    Global(u32),
+    Field(u32, u16),
+    Local(FrameId, u16),
 }
 ```
 
 ### Copy-on-write snapshots
 
-`WorldState` wraps `WorldInner` in an `Arc`:
-
-```rust
-pub struct WorldState {
-    inner: Arc<WorldInner>,
-}
-```
-
-- **`snapshot()`** returns `Arc::clone(&self.inner)`. This is a reference count
-  increment (one atomic instruction). No data is copied.
-- **`cow()`** (called before any mutation) invokes `Arc::make_mut`. If the
-  `Arc` has a reference count of 1, this is a no-op. If the count is > 1
-  (a snapshot is held by the TUI renderer), it clones the inner data.
-
-This design allows the rendering thread to hold an immutable snapshot while the
-event processing thread continues mutating the world state.
+`WorldState` wraps `WorldInner` in an `Arc`. `snapshot()` is a ref-count
+bump (1 atomic). `cow()` calls `Arc::make_mut` — no-op if refcount is 1,
+clones if a snapshot is held by the renderer.
 
 ### Pointer edge tracking
 
 When a tracked pointer variable is written:
-
-1. `process_event` reads the new pointer value from the event.
-2. It calls `addr_index.lookup(pointer_value)` to resolve the pointee.
-3. If the pointee maps to a tracked variable, a `PointerEdge` is created
-   linking source to target.
-4. If the pointee does not map to any tracked variable, the edge is marked
-   as `is_dangling = true`.
-5. If the pointer is set to NULL, the edge is removed.
+1. `addr_index.lookup(pointer_value)` resolves the pointee.
+2. If tracked: `PointerEdge` links source to target.
+3. If untracked: edge marked `is_dangling = true`.
+4. If NULL: edge removed.
 
 ### Cache-line contention tracking
 
-The `CacheLineTracker` monitors which threads write to each 64-byte cache
-line. A cache line is considered "false-shared" if more than one thread has
-written to it. The TUI displays false-sharing annotations on affected cache
-line headers.
+`CacheLineTracker` monitors which threads write to each 64-byte cache line.
+`contention_score(addr)` returns the number of distinct writer threads. The
+TUI annotates cache lines with `FALSE_SHARE T=N` when N > 1.
 
-Write counts decay by half on each `tick()` call (approximately every 4096
-events), preventing stale contention data from persisting.
+`tick()` decays write counts by half and evicts dead entries. Called every
+4,096 events alongside `cache_heat_tick()`.
 
 ### Shadow stacks
 
-The engine maintains a per-thread shadow stack that mirrors the target's call
-stack:
+Per-thread shadow stacks mirror the target's call stack:
 
 ```rust
 pub struct ShadowStack {
@@ -303,131 +319,139 @@ pub struct ShadowStack {
 }
 ```
 
-On `CALL`: a new `ShadowFrame` is pushed with the frame ID, callee PC, and
-function name.
-
-On `RETURN`: the top frame is popped. Its locals are removed from the address
-index and its nodes are queued for removal from the world state (deferred by
-32 frames to allow the renderer to display the most recently returned frame).
-
-If a `RETURN` occurs with an empty shadow stack, the mismatch counter is
-incremented. This can happen when the tracer misses a CALL (e.g., indirect
-calls) or when the target uses `longjmp`.
+- **CALL**: Push frame with ID, callee PC, function name.
+- **RETURN**: Pop frame. Remove locals from index. Queue nodes for deferred
+  removal (32-frame delay for renderer visibility).
+- **Mismatch**: Incremented when RETURN has empty stack (missed CALL,
+  indirect calls, `longjmp`).
 
 ### Snapshot ring
 
-The `SnapshotRing` is a circular buffer of `Arc<WorldInner>` snapshots, used
-for time-travel in the TUI:
+Circular buffer of 512 `Arc<WorldInner>` snapshots for time-travel:
 
 ```rust
 pub struct SnapshotRing {
-    buf: Vec<SnapEntry>,   // capacity: 512
+    buf: Vec<SnapEntry>,
     cap: usize,
     write_pos: usize,
     len: usize,
 }
 ```
 
-Each entry stores the snapshot, the instruction counter, the render tick, and
-the event sequence number. Binary search methods (`find_by_insn`,
-`find_by_tick`, `find_by_seq`) allow O(log N) scrubbing to any point in the
-buffered history.
+Each entry: snapshot + instruction counter + render tick + event sequence.
 
 ## Event processing (`main.rs`)
 
-The `process_event` function is the central dispatch for all event types:
+Central dispatch for all event types:
 
 | Event | Action |
 |---|---|
-| `WRITE` | Record cache-line write. Lookup address in index. If tracked: update node value, resolve pointer edges. |
-| `CALL` | Look up callee PC in DWARF function map (after relocation). Push shadow frame. Insert locals into address index. |
-| `RETURN` | Pop shadow frame. Remove locals from address index. Queue frame nodes for removal. |
-| `REG_SNAPSHOT` | Pop 6 continuation events. Unpack 18 register values. Update world's register file. |
-| `CACHE_MISS` | Lookup miss address. Record miss in cache heatmap. |
-| `MODULE_LOAD` | Compute relocation delta. Re-populate globals with relocated addresses. |
+| `WRITE` (0) | `shadow_regs.check_coherence`. `heap_oracle.update_stack` (if stack addr). `heap_graph.process_write` (if heap addr). `addr_index.lookup` → `world.update_value` + `world.update_edge`. `cl_tracker.record_write`. |
+| `READ` (1) | Journal only (no state mutation). |
+| `CALL` (2) | DWARF function lookup (relocated PC). Push shadow frame. Insert locals into index. |
+| `RETURN` (3) | Pop shadow frame. Remove locals. Queue deferred node removal. |
+| `REG_SNAPSHOT` (5) | Pop 6 continuation events. Unpack 18 registers. `shadow_regs.on_snapshot`. `world.reg_file` update. |
+| `CACHE_MISS` (6) | `addr_index.lookup`. Record miss in `cache_heat`. |
+| `MODULE_LOAD` (7) | Compute relocation delta. Re-populate globals with relocated addresses. |
+| `TAIL_CALL` (8) | Like CALL but does not push a new shadow frame (replaces current). |
+| `RELOAD` (12) | `shadow_regs.on_reload(reg, value, src_addr, size, seq, rip)`. |
 
-The function returns `true` if the event was "interesting" (a tracked write or
-any control event). The caller uses this to decide whether to add the event to
-the journal. Untracked writes (addresses that do not map to any known variable)
-return `false` and are not journaled, which eliminates approximately 90% of
-journal overhead under heavy write workloads.
+Returns `true` if the event was "interesting" (tracked write or control
+event). Untracked writes return `false` and are not journaled (~90% of
+writes in typical workloads).
 
-### Batch processing
+### Periodic maintenance
 
-The main loop uses `batch_drain` to pop up to 20,000 events per ring per cycle.
-All events in the batch are processed sequentially. `addr_index.finalize()` is
-called once at the end of the batch (not per-CALL event), amortizing the sort
-cost.
+Every 4,096 events (`total & 0xFFF == 0`):
+- `world.cache_heat_tick()` — decay cache miss counts.
+- `world.cl_tracker_tick()` — decay contention tracking, evict dead entries.
+
+Every 65,536 events (`total & 0xFFFF == 0`):
+- `heap_graph.gc_stale(total, 500_000)` — evict old heap objects.
+
+Heap type inference runs when `heap_graph.needs_type_inference()` returns
+true (every 10,000 heap events with objects present).
 
 ### Sequence tracking
 
-Each event carries a per-thread 16-bit sequence number. The engine tracks the
-expected next sequence number per thread and increments a `seq_gaps` counter
-on mismatches. Gaps indicate dropped events (ring overflow) and are displayed
-in the TUI.
+Each event carries a per-thread 16-bit sequence number. The engine tracks
+the expected next sequence per thread and increments `seq_gaps` on
+mismatches. Gaps indicate dropped events (ring overflow) and are displayed
+in the TUI header.
 
 ## Rendering
 
-### Interactive mode (TUI)
+### Interactive mode (TUI, `tui.rs`)
 
-The interactive renderer uses `ratatui` with a `crossterm` backend. It renders
-at 20 Hz (50 ms refresh interval) and displays:
+ratatui with crossterm backend. 20 Hz refresh. Six panels:
 
-- **Header bar.** Instruction counter, event count, node count, edge count,
-  active ring count, LAG (total events buffered across all rings).
-- **Memory map.** All tracked variables grouped by cache line, with addresses,
-  sizes, type names, and current values. Pointer values show the name of the
-  pointee (or the raw address if the pointee is untracked). Cache lines with
-  false sharing are annotated.
-- **Pointer edges.** A list of all active pointer relationships.
-- **Event journal.** The most recent 12 events with kind, thread ID, address,
-  size, and value.
-- **Register file.** Current values of all 18 registers, with highlighting for
-  registers that changed since the last snapshot.
+1. **Header bar.** Instruction counter, event count, node count, edge count,
+   ring count, LAG metric, time-travel indicator, pause indicator, gap
+   warnings.
+2. **Memory map** (top-left, 55%). Variables grouped by cache line. Addresses,
+   sizes, type names, values with recency coloring (red <100 events, yellow
+   <1K, white <10K, gray older). Pointer values show pointee name. Struct
+   fields indented under parent. `FALSE_SHARE T=N` on multi-writer cache
+   lines.
+3. **Events** (bottom-left, 45%). Filterable journal. Kind labels: W, R,
+   CALL, RET, OVF, REG, CMIS, MLOAD, TCAL, RLOD. Thread ID. Address, size,
+   value. Auto-scrolls to bottom unless user has scrolled.
+4. **Shadow Registers** (top-right, 40%). 18 registers with hex values,
+   10-segment confidence bar (color-coded by tier), stale warnings.
+5. **Call Stacks** (mid-right, 30%). Per-thread shadow stacks. Top 4 frames
+   shown (newest first). Idle threads show max depth.
+6. **Heap Objects** (bottom-right, 30%). Object count, edge count. Top 8 by
+   recency: base address, inferred size, type name, confidence %, field
+   count, edge count.
 
-The TUI supports:
-- **Pause/resume** (space bar).
-- **Time-travel scrubbing** through the snapshot ring.
-- **Quit** (q or Ctrl+C).
+### Event filters
 
-### Headless mode
+Active when Events panel is focused:
 
-In headless mode (`--once`), the engine writes the same information to stdout
-as plain text. It prints a status line every 100 ms and exits after reaching
-the `--min-events` threshold. This mode is used for end-to-end testing and
-scripting.
+| Key | Filter |
+|---|---|
+| `w` | Writes only (kind 0) |
+| `r` | Hide reads (kind 1) |
+| `0-9` | Filter by thread ID (toggle) |
+| `x` | Clear all filters |
+
+Filter state shown in panel title: `Events [W only, T3]`.
+
+### Time travel
+
+- `←`/`h`: Step backward through snapshot ring. Auto-pauses.
+- `→`/`l`: Step forward. Returns to live when past latest snapshot.
+- `End`: Jump to live (exit time-travel).
+
+### Headless mode (`--once`)
+
+Plain-text output to stdout. Prints status line every 100 ms. Exits after
+`--min-events` threshold. Used for end-to-end testing and scripting.
 
 ### LAG metric
 
-The LAG metric replaces the traditional "fill %" display. It shows the total
-number of events currently buffered across all rings (head - tail, summed).
-This directly represents how far behind the consumer is from the producer.
-
 | LAG | Color | Meaning |
 |---|---|---|
-| 0 to 1,000 | Green | Consumer is keeping up |
-| 1,001 to 50,000 | Yellow | Consumer is falling behind |
-| > 50,000 | Red | Significant consumer lag |
+| 0–1,000 | Green | Consumer keeping up |
+| 1,001–50,000 | Yellow | Falling behind |
+| >50,000 | Red | Significant lag |
 
-Values are displayed with K (thousands) or M (millions) suffixes for
-readability.
+Displayed with K/M suffixes.
 
 ## Startup sequence
 
-The full startup sequence when the user runs `memvis <target>`:
+Full startup when the user runs `memvis <target>`:
 
-1. Engine parses command-line arguments.
-2. Engine locates `drrun` (via `DYNAMORIO_HOME`, `MEMVIS_DRRUN`, or PATH).
-3. Engine locates `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to
-   the engine binary).
-4. Engine cleans up stale `/dev/shm/memvis_*` files from previous runs.
-5. Engine installs signal handlers (SIGINT, SIGTERM) to forward to the tracer.
-6. Engine spawns the tracer: `drrun -c libmemvis_tracer.so -- <target>`.
-7. Engine parses DWARF from the target ELF binary.
-8. Engine polls for `/memvis_ctl` (up to 30 seconds).
-9. Engine discovers the first thread ring and attaches.
-10. Engine spawns the consumer on a 64 MB stack thread (required for deep
-    DWARF type resolution on complex programs).
+1. Parse command-line arguments (`--once`, `--min-events`, `--consumer-only`).
+2. Locate `drrun` (via `DYNAMORIO_HOME`, `MEMVIS_DRRUN`, or PATH).
+3. Locate `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
+4. Clean up stale `/dev/shm/memvis_*` from previous runs.
+5. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.
+6. Spawn the tracer: `drrun -c libmemvis_tracer.so -- <target> [args]`.
+7. Parse DWARF from the target ELF binary (globals, functions, locals, types).
+8. Poll for `/memvis_ctl` (up to 30 seconds, validating magic + proto).
+9. Discover the first thread ring and attach (validating magic + proto).
+10. Spawn the consumer on a 64 MB stack thread (required for deep DWARF
+    type resolution on complex programs).
 11. Consumer enters the main event loop (TUI or headless).
-12. On exit: engine sends SIGTERM to the tracer, reaps the child process,
-    and cleans up shared memory.
+12. On exit: send SIGTERM to tracer, reap child process, unmap all rings.
