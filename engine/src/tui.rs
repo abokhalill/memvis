@@ -34,6 +34,7 @@ pub enum Panel {
     Registers,
 }
 
+#[derive(Default)]
 pub struct EventFilter {
     pub thread_id: Option<u16>, // None = all threads
     pub hide_reads: bool,
@@ -41,13 +42,8 @@ pub struct EventFilter {
 }
 
 impl EventFilter {
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self {
-            thread_id: None,
-            hide_reads: false,
-            writes_only: false,
-        }
+        Self::default()
     }
     pub fn is_active(&self) -> bool {
         self.thread_id.is_some() || self.hide_reads || self.writes_only
@@ -79,9 +75,8 @@ pub struct AppState {
     pub filter: EventFilter,
 }
 
-impl AppState {
-    #[allow(clippy::new_without_default)]
-    pub fn new() -> Self {
+impl Default for AppState {
+    fn default() -> Self {
         Self {
             mem_scroll: 0,
             evt_scroll: 0,
@@ -90,8 +85,14 @@ impl AppState {
             paused: false,
             time_travel_idx: None,
             snap_count: 0,
-            filter: EventFilter::new(),
+            filter: EventFilter::default(),
         }
+    }
+}
+
+impl AppState {
+    pub fn new() -> Self {
+        Self::default()
     }
 }
 

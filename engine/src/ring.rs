@@ -207,24 +207,18 @@ impl ThreadRing {
     }
 }
 
+#[derive(Default)]
 pub struct RingOrchestrator {
     ctl: Option<MappedShm>,
     pub rings: Vec<ThreadRing>,
     known_count: u32,
-    rr_idx: usize, // round-robin index for batch_drain
+    rr_idx: usize,         // round-robin index for batch_drain
     drain_tmp: Vec<Event>, // reusable scratch buffer for batch_drain
 }
 
 impl RingOrchestrator {
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
-        Self {
-            ctl: None,
-            rings: Vec::new(),
-            known_count: 0,
-            rr_idx: 0,
-            drain_tmp: Vec::new(),
-        }
+        Self::default()
     }
 
     pub fn try_attach_ctl(&mut self) -> bool {
