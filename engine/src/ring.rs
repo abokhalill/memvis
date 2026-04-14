@@ -19,7 +19,8 @@ pub struct Event {
     pub thread_id: u16,
     pub seq: u16,
     pub value: u64,
-    pub kind_flags: u64,
+    pub kind_flags: u32, // kind:8 | flags:8 | seq_hi:16
+    pub rip_lo: u32,     // app PC offset from module base
 }
 const _: () = assert!(mem::size_of::<Event>() == 32);
 
@@ -37,6 +38,7 @@ impl Event {
             seq: 0,
             value: 0,
             kind_flags: 0,
+            rip_lo: 0,
         }
     }
 }
