@@ -212,6 +212,7 @@ pub struct RingOrchestrator {
     pub rings: Vec<ThreadRing>,
     known_count: u32,
     rr_idx: usize, // round-robin index for batch_drain
+    drain_tmp: Vec<Event>, // reusable scratch buffer for batch_drain
 }
 
 impl RingOrchestrator {
@@ -222,6 +223,7 @@ impl RingOrchestrator {
             rings: Vec::new(),
             known_count: 0,
             rr_idx: 0,
+            drain_tmp: Vec::new(),
         }
     }
 
@@ -366,13 +368,14 @@ impl RingOrchestrator {
         if n == 0 {
             return 0;
         }
-        let mut tmp: Vec<Event> = Vec::with_capacity(per_ring);
+        self.drain_tmp.clear();
+        self.drain_tmp.reserve(per_ring);
         let mut total = 0;
         for offset in 0..n {
             let i = (self.rr_idx + offset) % n;
-            tmp.clear();
-            let got = self.rings[i].batch_pop(per_ring, &mut tmp);
-            for ev in tmp.drain(..) {
+            self.drain_tmp.clear();
+            let got = self.rings[i].batch_pop(per_ring, &mut self.drain_tmp);
+            for ev in self.drain_tmp.drain(..) {
                 buf.push((i, ev));
             }
             total += got;
