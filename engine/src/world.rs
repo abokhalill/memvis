@@ -2,7 +2,7 @@
 // world state: variables, pointer edges, register file, cache miss tracking.
 // arc-wrapped inner for cow snapshotting - mutation clones only when shared.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
 use crate::dwarf::TypeInfo;
@@ -264,6 +264,67 @@ impl ShadowTypeMap {
         self.map.retain(|_, p| p.base_addr < addr || p.base_addr >= hi);
         before - self.map.len()
     }
+
+    /// bounded BFS from a freshly stamped address. reads last known pointer
+    /// values from HeapGraph fields to discover reachable typed structs.
+    pub fn retrospective_scan(
+        &mut self,
+        seed_addr: u64,
+        heap_graph: &crate::heap_graph::HeapGraph,
+        allocs: &HeapAllocTracker,
+        type_registry: &HashMap<String, TypeInfo>,
+        seq: u64,
+    ) -> usize {
+        const FUEL: usize = 64;
+        let mut queue: VecDeque<u64> = VecDeque::with_capacity(16);
+        queue.push_back(seed_addr);
+        let mut stamped = 0usize;
+
+        while let Some(base) = queue.pop_front() {
+            if stamped >= FUEL { break; }
+
+            let proj = match self.map.get(&base) {
+                Some(p) => p.type_info.clone(),
+                None => continue,
+            };
+
+            let hg_base = match heap_graph.find_object_base(base) {
+                Some(b) => b,
+                None => continue,
+            };
+            let obj = match heap_graph.objects().get(&hg_base) {
+                Some(o) => o,
+                None => continue,
+            };
+            let delta = base.wrapping_sub(hg_base);
+
+            for f in &proj.fields {
+                if !f.type_info.is_pointer || f.byte_size != 8 {
+                    continue;
+                }
+                let hg_offset = delta + f.byte_offset;
+                let field_val = match obj.fields.get(&hg_offset) {
+                    Some(fi) if fi.last_value != 0 => fi.last_value,
+                    _ => continue,
+                };
+                if self.map.contains_key(&field_val) {
+                    continue;
+                }
+                if allocs.alloc_size(field_val).is_none() {
+                    continue;
+                }
+                let pointee_name = f.type_info.name.strip_prefix('*').unwrap_or("");
+                let pointee_ti = match type_registry.get(pointee_name) {
+                    Some(ti) => ti,
+                    None => continue,
+                };
+                self.stamp_type(field_val, pointee_ti, &f.name, seq);
+                stamped += 1;
+                queue.push_back(field_val);
+            }
+        }
+        stamped
+    }
 }
 
 pub struct HeapAllocTracker {
@@ -303,6 +364,10 @@ impl HeapAllocTracker {
 
     pub fn alloc_size(&self, addr: u64) -> Option<u64> {
         self.allocs.get(&addr).copied()
+    }
+
+    pub fn allocs_iter(&self) -> impl Iterator<Item = (&u64, &u64)> {
+        self.allocs.iter()
     }
 
     pub fn live_count(&self) -> usize {

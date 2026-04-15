@@ -164,7 +164,7 @@ impl HeapGraph {
         self.objects.values().map(|o| o.outgoing_edges.len()).sum()
     }
 
-    fn find_object_base(&self, addr: u64) -> Option<u64> {
+    pub fn find_object_base(&self, addr: u64) -> Option<u64> {
         if let Some(&base) = self.addr_to_base.get(&addr) {
             return Some(base);
         }

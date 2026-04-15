@@ -65,7 +65,11 @@ fn process_event(
             if heap_oracle.is_heap(ev.addr) {
                 heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
                 if let Some(ref info) = dwarf_info {
+                    let before = world.stm.len();
                     world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq as u64, &info.type_registry);
+                    if world.stm.len() > before {
+                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
+                    }
                 }
             }
             if let Some(h) = addr_index.lookup(ev.addr) {
@@ -89,7 +93,9 @@ fn process_event(
                                 let pointee_name = h_type.name.strip_prefix('*').unwrap_or("");
                                 if let Some(pointee_ti) = info.type_registry.get(pointee_name) {
                                     world.heap_allocs.check_size(ev.value, pointee_ti);
-                                    world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq as u64);
+                                    if world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq as u64) {
+                                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
+                                    }
                                 }
                             }
                         }
@@ -199,7 +205,7 @@ fn process_event(
         }
         EVENT_ALLOC => {
             let ptr = ev.addr;
-            let size = ev.value;
+            let size = ev.size as u64;
             world.heap_allocs.on_alloc(ptr, size);
             true
         }
