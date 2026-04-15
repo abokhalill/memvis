@@ -331,6 +331,7 @@ pub struct HeapAllocTracker {
     allocs: HashMap<u64, u64>,
     pub total_allocs: u64,
     pub total_frees: u64,
+    pub orphan_frees: u64,
     pub size_mismatches: Vec<SizeMismatch>,
 }
 
@@ -348,6 +349,7 @@ impl HeapAllocTracker {
             allocs: HashMap::with_capacity(256),
             total_allocs: 0,
             total_frees: 0,
+            orphan_frees: 0,
             size_mismatches: Vec::new(),
         }
     }
@@ -359,7 +361,9 @@ impl HeapAllocTracker {
 
     pub fn on_free(&mut self, addr: u64) -> Option<u64> {
         self.total_frees += 1;
-        self.allocs.remove(&addr)
+        let r = self.allocs.remove(&addr);
+        if r.is_none() { self.orphan_frees += 1; }
+        r
     }
 
     pub fn alloc_size(&self, addr: u64) -> Option<u64> {

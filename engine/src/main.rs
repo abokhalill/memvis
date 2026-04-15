@@ -214,9 +214,8 @@ fn process_event(
             if let Some(old_size) = world.heap_allocs.on_free(ptr) {
                 world.stm.purge_range(ptr, old_size);
                 heap_graph.on_free(ptr, old_size);
-            } else {
-                world.stm.purge_range(ptr, 1);
             }
+            // orphan free (no matching ALLOC): keep STM projections
             true
         }
         EVENT_MODULE_LOAD => {
@@ -596,7 +595,7 @@ fn headless_render(
     };
     let _ = writeln!(
         out,
-        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ LAG {} │ allocs {}/{} live {}",
+        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ LAG {} │ allocs {}/{} live {}{}",
         world.insn_counter,
         total,
         world.nodes.len(),
@@ -606,6 +605,11 @@ fn headless_render(
         heap_allocs.total_allocs,
         heap_allocs.total_frees,
         heap_allocs.live_count(),
+        if heap_allocs.orphan_frees > 0 {
+            format!(" orphan_free={}", heap_allocs.orphan_frees)
+        } else {
+            String::new()
+        },
     );
     let _ = writeln!(out, "{}", "─".repeat(100));
     let _ = writeln!(out, "MEMORY MAP");
