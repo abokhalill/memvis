@@ -4,10 +4,8 @@
  * Copyright (c) 2026 Yousef Mahmoud
  * <yosefkhalil610@gmail.com>
  *
- * SPSC lock free ring buffer over mmap'd shm.
- * producer: dynamorio client. consumer: rust engine.
- * head/tail on separate cache lines.
- */
+ * SPSC ring over mmap'd shm. producer: DR client, consumer: rust engine.
+ * head/tail on separate cache lines. 32 byte v3 events. */
 
 #ifndef MEMVIS_BRIDGE_H
 #define MEMVIS_BRIDGE_H
@@ -20,6 +18,17 @@
 #define MEMVIS_MAGIC         0x4D454D56495342ULL  /* "MEMVISB\0" */
 #define MEMVIS_PROTO_VERSION 3
 #define MEMVIS_SHM_ENV       "MEMVIS_SHM_PATH"
+
+/* hash me baby; detects C<->Rust header mismatch */
+static inline uint32_t memvis_build_hash_compute(void) {
+    const char stamp[] = __DATE__ " " __TIME__;
+    uint32_t h = 0x811c9dc5u;
+    for (int i = 0; stamp[i]; i++) {
+        h ^= (uint8_t)stamp[i];
+        h *= 0x01000193u;
+    }
+    return h;
+}
 
 #define MEMVIS_EVENT_WRITE    0
 #define MEMVIS_EVENT_READ     1
@@ -57,7 +66,7 @@
 #define MEMVIS_REG_RFLAGS 17
 #define MEMVIS_REG_COUNT 18
 
-#define MEMVIS_BP_HIGH_WATER  6  // 6/8 capacity
+#define MEMVIS_BP_HIGH_WATER  6  /* 6/8 capacity */
 #define MEMVIS_BP_LOW_WATER   3
 
 #define MEMVIS_RAW_TLS_SLOTS     8
@@ -72,17 +81,15 @@
 
 #define MEMVIS_HEAD_FLUSH_MASK  0x3F
 
-// predictable spill pad + ambient per-thread stats. two cache lines per thread.
-// line 0: scratch, ring_data, ring_mask (hot — touched every inline write)
-// line 1: per-thread stat counters (warm — incremented inline, read at exit)
+/* two cache lines per thread: hot path + ambient stats */
 typedef struct __attribute__((aligned(MEMVIS_CACHE_LINE))) {
-    // --- cache line 0: hot path ---
-    uint64_t scratch[2];       
-    uint64_t ring_data;        
-    uint32_t ring_mask;         
-    uint32_t _pad0;             
-    uint64_t _cl0_reserved[4];  
-    // --- cache line 1: ambient telemetry ---
+    /* cl0: hot */
+    uint64_t scratch[2];
+    uint64_t ring_data;
+    uint32_t ring_mask;
+    uint32_t _pad0;
+    uint64_t _cl0_reserved[4];
+    /* cl1: stats */
     uint64_t stat_inline_writes;
     uint64_t stat_reads;
     uint64_t stat_reloads;
@@ -90,12 +97,12 @@ typedef struct __attribute__((aligned(MEMVIS_CACHE_LINE))) {
     uint64_t stat_returns;
     uint64_t stat_tail_calls;
     uint64_t stat_dropped;
-    uint64_t _cl1_reserved;
+    uint64_t ccc_audit_ctr;
 } memvis_scratch_pad_t;
 
 _Static_assert(sizeof(memvis_scratch_pad_t) == 2 * MEMVIS_CACHE_LINE, "");
 
-// v2 layout (compat)
+/* v2 event (compat) */
 typedef struct __attribute__((aligned(32))) {
     uint64_t addr;
     uint32_t size;
@@ -107,20 +114,15 @@ typedef struct __attribute__((aligned(32))) {
 
 _Static_assert(sizeof(memvis_event_t) == 32, "");
 
-// v3: +rip_lo, extended seq.
-// SEQUENCE CONTRACT: 32-bit (seq_lo:16 | seq_hi:16) wraps at 2^32.
-// At 50M events/sec (typical DBI throughput), wrap occurs every ~86 seconds.
-// Consumers MUST use modular arithmetic for ordering: (int32_t)(a - b) > 0.
-// The sequence is per thread; cross-thread ordering uses (thread_id, seq) pairs.
-// Widening to 48/64-bit requires an event format change and is deferred.
+/* v3 event. 32 bit seq wraps ~86s at 50M ev/s; use modular arithmetic. */
 typedef struct __attribute__((aligned(32))) {
     uint64_t addr;
     uint32_t size;
     uint16_t thread_id;
     uint16_t seq_lo;
     uint64_t value;
-    uint32_t kind_flags;  // kind:8 | flags:8 | seq_hi:16
-    uint32_t rip_lo;      // app PC offset from module base
+    uint32_t kind_flags;  /* kind:8 | flags:8 | seq_hi:16 */
+    uint32_t rip_lo;      /* app PC offset from module base */
 } memvis_event_v3_t;
 
 _Static_assert(sizeof(memvis_event_v3_t) == 32, "");
@@ -264,16 +266,12 @@ static inline int memvis_pop(memvis_ring_header_t *ring,
     return 0;
 }
 
-// capacity must be a power of two for h & mask indexing.
 #define MEMVIS_IS_POW2(x) ((x) != 0 && ((x) & ((x) - 1)) == 0)
 
 static inline void memvis_ring_init(memvis_ring_header_t *ring,
                                      uint32_t capacity, uint64_t flags)
 {
-    // runtime guard: capacity must be power of two. assert + early return.
     if (!MEMVIS_IS_POW2(capacity)) {
-        // in DBI context, DR_ASSERT fires; in standalone, segfault is better
-        // than silent corruption from non power of two masking.
         memset(ring, 0, sizeof(memvis_ring_header_t));
         return;
     }
@@ -312,7 +310,7 @@ static inline void memvis_push_overflow(memvis_ring_header_t *ring,
     memvis_push_ex(ring, insn_counter, 0, 0, MEMVIS_EVENT_OVERFLOW, thread_id, seq);
 }
 
-// ctl ring: thread discovery
+/* ctl ring: thread discovery */
 
 #define MEMVIS_CTL_SHM_NAME     "/memvis_ctl"
 #define MEMVIS_CTL_MAGIC        0x4D56435430303032ULL  /* "MVCTL002" */
@@ -341,7 +339,7 @@ typedef struct {
     uint32_t proto_version;
     _Atomic uint32_t thread_count;
     uint32_t max_threads;
-    uint32_t _pad0;
+    uint32_t build_hash;
     memvis_thread_entry_t threads[MEMVIS_MAX_THREADS];
 } memvis_ctl_header_t;
 
@@ -353,6 +351,7 @@ static inline void memvis_ctl_init(memvis_ctl_header_t *ctl) {
     memset(ctl, 0, sizeof(memvis_ctl_header_t));
     ctl->magic = MEMVIS_CTL_MAGIC;
     ctl->proto_version = MEMVIS_PROTO_VERSION;
+    ctl->build_hash = memvis_build_hash_compute();
     ctl->max_threads = MEMVIS_MAX_THREADS;
     atomic_store_explicit(&ctl->thread_count, 0, memory_order_relaxed);
 }
@@ -361,10 +360,7 @@ static inline int memvis_ctl_register_thread(memvis_ctl_header_t *ctl,
                                                uint16_t thread_id,
                                                const char *ring_shm_name)
 {
-    // first pass: try to reclaim a DEAD slot via CAS (O(max_threads) scan,
-    // amortized over thread lifetime; negligible vs. thread creation cost).
-    // publish-subscribe pattern: CAS to INITIALIZING, populate data, then
-    // store-release ACTIVE so the consumer never sees partial writes.
+    /* reclaim DEAD slot via CAS -> INITIALIZING -> populate -> ACTIVE */
     for (uint32_t i = 0; i < ctl->max_threads; i++) {
         uint32_t expected = MEMVIS_THREAD_STATE_DEAD;
         if (atomic_compare_exchange_strong_explicit(
@@ -379,7 +375,6 @@ static inline int memvis_ctl_register_thread(memvis_ctl_header_t *ctl,
             return (int)i;
         }
     }
-    // no dead slots; allocate a fresh one from the high-water mark
     uint32_t idx = atomic_fetch_add_explicit(&ctl->thread_count, 1, memory_order_acq_rel);
     if (idx >= ctl->max_threads) {
         atomic_fetch_sub_explicit(&ctl->thread_count, 1, memory_order_relaxed);
