@@ -1,9 +1,12 @@
 // SPDX-License-Identifier: MIT
-// flat sorted interval map. O(log N) point queries via partition_point.
-// two tiers: static globals (inserted once) + dynamic stack locals (per frame).
-// locals shadow globals on overlap. re-sorted after each call/return.
+// two-tier address→variable index.
+// tier 1: static globals/fields — sorted Vec, O(log N) binary search, finalized once.
+// tier 2: dynamic stack locals — HashMap<FrameId, Vec<Interval>>, O(1) frame removal.
+// 8-slot MRU cache shared across both tiers (~90%+ hit rate in practice).
+// locals shadow globals/fields on overlap (higher rank wins; narrower wins on tie).
 
 use crate::dwarf::TypeInfo;
+use std::collections::HashMap;
 
 pub type FrameId = u64;
 
@@ -19,7 +22,6 @@ struct VarMeta {
     name: String,
     type_info: TypeInfo,
     node_id: NodeId,
-    frame_id: Option<FrameId>,
 }
 
 #[derive(Debug, Clone)]
@@ -37,25 +39,58 @@ pub struct LookupResult<'a> {
     pub offset_in_var: u64,
 }
 
-const MRU_SLOTS: usize = 4;
+const MRU_SLOTS: usize = 8;
+
+// MRU entry: tier tag + coordinates for reconstructing a LookupResult.
+// Static: (lo, hi, index into self.statics)
+// Dynamic: (lo, hi, frame_id, local_index) — packed into u64s.
+#[derive(Clone, Copy)]
+enum MruEntry {
+    Static { lo: u64, hi: u64, idx: usize },
+    Dynamic { lo: u64, hi: u64, frame_id: FrameId, local_idx: usize },
+}
+
+impl MruEntry {
+    fn contains(&self, addr: u64) -> bool {
+        let (lo, hi) = match self {
+            MruEntry::Static { lo, hi, .. } => (*lo, *hi),
+            MruEntry::Dynamic { lo, hi, .. } => (*lo, *hi),
+        };
+        addr >= lo && addr < hi
+    }
+    fn lo(&self) -> u64 {
+        match self { MruEntry::Static { lo, .. } | MruEntry::Dynamic { lo, .. } => *lo }
+    }
+}
 
 pub struct AddressIndex {
-    intervals: Vec<Interval>,
-    needs_sort: bool,
-    // MRU cache: (lo, hi, interval_index). short-circuits binary search
-    // for spatially-local repeated lookups (~90% hit rate in practice).
-    mru: [(u64, u64, usize); MRU_SLOTS],
+    // tier 1: static (globals + fields). sorted by lo after finalize().
+    statics: Vec<Interval>,
+    statics_sorted: bool,
+    // tier 2: dynamic (stack locals). keyed by frame_id for O(1) removal.
+    dynamics: HashMap<FrameId, Vec<Interval>>,
+    // 8-slot MRU cache, shared across both tiers.
+    mru: [Option<MruEntry>; MRU_SLOTS],
     mru_len: usize,
 }
 
 impl Default for AddressIndex {
     fn default() -> Self {
         Self {
-            intervals: Vec::with_capacity(2048),
-            needs_sort: false,
-            mru: [(0, 0, 0); MRU_SLOTS],
+            statics: Vec::with_capacity(2048),
+            statics_sorted: true,
+            dynamics: HashMap::with_capacity(64),
+            mru: [None; MRU_SLOTS],
             mru_len: 0,
         }
+    }
+}
+
+fn node_rank(nid: &NodeId) -> u8 {
+    match nid {
+        NodeId::Local(..) => 2,
+        NodeId::Field(..) => 1,
+        NodeId::Global(..) => 0,
     }
 }
 
@@ -75,17 +110,16 @@ impl AddressIndex {
         if size == 0 {
             return;
         }
-        self.intervals.push(Interval {
+        self.statics.push(Interval {
             lo: addr,
             hi: addr + size,
             meta: VarMeta {
                 name,
                 type_info,
                 node_id: NodeId::Global(global_idx),
-                frame_id: None,
             },
         });
-        self.needs_sort = true;
+        self.statics_sorted = false;
         self.mru_len = 0;
     }
 
@@ -101,17 +135,16 @@ impl AddressIndex {
         if size == 0 {
             return;
         }
-        self.intervals.push(Interval {
+        self.statics.push(Interval {
             lo: addr,
             hi: addr + size,
             meta: VarMeta {
                 name,
                 type_info,
                 node_id: NodeId::Field(global_idx, field_idx),
-                frame_id: None,
             },
         });
-        self.needs_sort = true;
+        self.statics_sorted = false;
         self.mru_len = 0;
     }
 
@@ -121,90 +154,147 @@ impl AddressIndex {
         frame_base: u64,
         locals: &[(i64, u64, String, TypeInfo)],
     ) {
+        let mut frame_ivs = Vec::with_capacity(locals.len());
         for (li, (offset, size, name, type_info)) in locals.iter().enumerate() {
             if *size == 0 {
                 continue;
             }
             let addr = (frame_base as i64 + offset) as u64;
-            self.intervals.push(Interval {
+            frame_ivs.push(Interval {
                 lo: addr,
                 hi: addr + size,
                 meta: VarMeta {
                     name: name.clone(),
                     type_info: type_info.clone(),
                     node_id: NodeId::Local(frame_id, li as u16),
-                    frame_id: Some(frame_id),
                 },
             });
         }
-        self.needs_sort = true;
+        if !frame_ivs.is_empty() {
+            self.dynamics.insert(frame_id, frame_ivs);
+        }
+        // no sort needed — dynamics are scanned linearly (typically <10 frames)
         self.mru_len = 0;
     }
 
     pub fn remove_frame(&mut self, frame_id: FrameId) {
-        self.intervals
-            .retain(|iv| iv.meta.frame_id != Some(frame_id));
-        self.mru_len = 0;
+        self.dynamics.remove(&frame_id);
+        self.mru_len = 0; // invalidate — cached entries may reference this frame
     }
 
     pub fn finalize(&mut self) {
-        if self.needs_sort {
-            self.intervals.sort_unstable_by_key(|iv| iv.lo);
-            self.needs_sort = false;
+        if !self.statics_sorted {
+            self.statics.sort_unstable_by_key(|iv| iv.lo);
+            self.statics_sorted = true;
             self.mru_len = 0;
         }
     }
 
-    // binary search for rightmost interval where lo <= addr, check hi.
-    // on overlap (local shadows global), prefer dynamic entry.
-    // uses a 4-slot MRU cache to skip the binary search for hot addresses.
+    // primary lookup: MRU → dynamics (locals shadow) → statics (binary search).
+    // 8-slot MRU cache with LRU promotion eliminates ~90% of binary searches.
     #[inline(always)]
     pub fn lookup(&mut self, addr: u64) -> Option<LookupResult<'_>> {
-        // MRU probe: check cached intervals first
+        // MRU probe
         for slot in 0..self.mru_len {
-            let (lo, hi, iv_idx) = self.mru[slot];
-            if addr >= lo && addr < hi {
-                // promote to MRU[0]
-                if slot > 0 {
-                    self.mru.copy_within(0..slot, 1);
-                    self.mru[0] = (lo, hi, iv_idx);
+            if let Some(ref entry) = self.mru[slot] {
+                if entry.contains(addr) {
+                    let lo = entry.lo();
+                    // promote to MRU[0]
+                    if slot > 0 {
+                        let e = self.mru[slot].take().unwrap();
+                        self.mru.copy_within(0..slot, 1);
+                        self.mru[0] = Some(e);
+                    }
+                    // resolve the entry to a LookupResult
+                    return self.resolve_mru(0, addr, lo);
                 }
-                let iv = &self.intervals[iv_idx];
-                return Some(LookupResult {
-                    name: &iv.meta.name,
-                    type_info: &iv.meta.type_info,
-                    node_id: iv.meta.node_id,
-                    offset_in_var: addr - iv.lo,
-                });
             }
         }
 
-        // MRU miss: fall through to binary search
-        let result = self.lookup_slow(addr);
-
-        // populate cache on hit
-        if let Some((iv_idx, lo, hi)) = result {
-            let entry = (lo, hi, iv_idx);
-            let len = self.mru_len.min(MRU_SLOTS - 1);
-            self.mru.copy_within(0..len, 1);
-            self.mru[0] = entry;
-            self.mru_len = (self.mru_len + 1).min(MRU_SLOTS);
-
-            let iv = &self.intervals[iv_idx];
-            Some(LookupResult {
+        // MRU miss: search dynamics first (locals shadow globals)
+        let dyn_hit = self.lookup_dynamics(addr);
+        if let Some((frame_id, local_idx, lo, hi)) = dyn_hit {
+            self.push_mru(MruEntry::Dynamic { lo, hi, frame_id, local_idx });
+            let iv = &self.dynamics[&frame_id][local_idx];
+            return Some(LookupResult {
                 name: &iv.meta.name,
                 type_info: &iv.meta.type_info,
                 node_id: iv.meta.node_id,
                 offset_in_var: addr - iv.lo,
-            })
-        } else {
-            None
+            });
+        }
+
+        // static tier: binary search
+        let stat_hit = self.lookup_statics(addr);
+        if let Some((idx, lo, hi)) = stat_hit {
+            self.push_mru(MruEntry::Static { lo, hi, idx });
+            let iv = &self.statics[idx];
+            return Some(LookupResult {
+                name: &iv.meta.name,
+                type_info: &iv.meta.type_info,
+                node_id: iv.meta.node_id,
+                offset_in_var: addr - iv.lo,
+            });
+        }
+
+        None
+    }
+
+    fn resolve_mru(&self, slot: usize, addr: u64, lo: u64) -> Option<LookupResult<'_>> {
+        match self.mru[slot].as_ref()? {
+            MruEntry::Static { idx, .. } => {
+                let iv = self.statics.get(*idx)?;
+                Some(LookupResult {
+                    name: &iv.meta.name,
+                    type_info: &iv.meta.type_info,
+                    node_id: iv.meta.node_id,
+                    offset_in_var: addr - lo,
+                })
+            }
+            MruEntry::Dynamic { frame_id, local_idx, .. } => {
+                let frame = self.dynamics.get(frame_id)?;
+                let iv = frame.get(*local_idx)?;
+                Some(LookupResult {
+                    name: &iv.meta.name,
+                    type_info: &iv.meta.type_info,
+                    node_id: iv.meta.node_id,
+                    offset_in_var: addr - lo,
+                })
+            }
         }
     }
 
-    // cold path: full binary search
-    fn lookup_slow(&self, addr: u64) -> Option<(usize, u64, u64)> {
-        let idx = self.intervals.partition_point(|iv| iv.lo <= addr);
+    fn push_mru(&mut self, entry: MruEntry) {
+        let len = self.mru_len.min(MRU_SLOTS - 1);
+        self.mru.copy_within(0..len, 1);
+        self.mru[0] = Some(entry);
+        self.mru_len = (self.mru_len + 1).min(MRU_SLOTS);
+    }
+
+    // scan all active frames for a matching local. returns best match
+    // (highest rank, narrowest). typically <10 frames, <5 locals each.
+    fn lookup_dynamics(&self, addr: u64) -> Option<(FrameId, usize, u64, u64)> {
+        let mut best: Option<(FrameId, usize, u64, u64, u64)> = None; // (fid, li, lo, hi, span)
+        for (&fid, frame_ivs) in &self.dynamics {
+            for (li, iv) in frame_ivs.iter().enumerate() {
+                if addr >= iv.lo && addr < iv.hi {
+                    let span = iv.hi - iv.lo;
+                    let dominated = match best {
+                        None => true,
+                        Some((_, _, _, _, prev_span)) => span < prev_span,
+                    };
+                    if dominated {
+                        best = Some((fid, li, iv.lo, iv.hi, span));
+                    }
+                }
+            }
+        }
+        best.map(|(fid, li, lo, hi, _)| (fid, li, lo, hi))
+    }
+
+    // binary search on sorted statics. same logic as before but cleaner.
+    fn lookup_statics(&self, addr: u64) -> Option<(usize, u64, u64)> {
+        let idx = self.statics.partition_point(|iv| iv.lo <= addr);
         if idx == 0 {
             return None;
         }
@@ -212,7 +302,7 @@ impl AddressIndex {
         let mut best: Option<(usize, &Interval)> = None;
         let mut i = idx - 1;
         loop {
-            let iv = &self.intervals[i];
+            let iv = &self.statics[i];
             if iv.lo > addr {
                 break;
             }
@@ -220,26 +310,17 @@ impl AddressIndex {
                 let dominated = match best {
                     None => true,
                     Some((_, prev)) => {
-                        // prefer: locals > fields > globals; narrower > wider on tie
-                        let iv_rank = match iv.meta.node_id {
-                            NodeId::Local(..) => 2,
-                            NodeId::Field(..) => 1,
-                            NodeId::Global(..) => 0,
-                        };
-                        let prev_rank = match prev.meta.node_id {
-                            NodeId::Local(..) => 2,
-                            NodeId::Field(..) => 1,
-                            NodeId::Global(..) => 0,
-                        };
-                        iv_rank > prev_rank
-                            || (iv_rank == prev_rank && (iv.hi - iv.lo) < (prev.hi - prev.lo))
+                        let iv_r = node_rank(&iv.meta.node_id);
+                        let prev_r = node_rank(&prev.meta.node_id);
+                        iv_r > prev_r
+                            || (iv_r == prev_r && (iv.hi - iv.lo) < (prev.hi - prev.lo))
                     }
                 };
                 if dominated {
                     best = Some((i, iv));
                 }
             }
-            if i == 0 || self.intervals[i - 1].lo < iv.lo {
+            if i == 0 || self.statics[i - 1].lo < iv.lo {
                 break;
             }
             i -= 1;
@@ -299,5 +380,33 @@ mod tests {
         idx.finalize();
         assert_eq!(idx.lookup(0x5000).unwrap().name, "loc");
         assert_eq!(idx.lookup(0x5008).unwrap().name, "glob");
+    }
+
+    #[test]
+    fn test_mru_hit() {
+        let mut idx = AddressIndex::new();
+        idx.insert_global(0x1000, 4, "x".into(), ti("int", 4), 0);
+        idx.finalize();
+        // first lookup populates MRU
+        assert_eq!(idx.lookup(0x1000).unwrap().name, "x");
+        // second should hit MRU
+        assert_eq!(idx.lookup(0x1002).unwrap().name, "x");
+        assert_eq!(idx.lookup(0x1002).unwrap().offset_in_var, 2);
+    }
+
+    #[test]
+    fn test_dynamic_frame_removal_o1() {
+        let mut idx = AddressIndex::new();
+        // insert 100 frames
+        for fid in 0..100u64 {
+            let base = 0x7fff0000 + fid * 0x100;
+            let locals = vec![(0i64, 8u64, format!("v{}", fid), ti("long", 8))];
+            idx.insert_frame_locals(fid, base, &locals);
+        }
+        // remove one — should be O(1), not O(N)
+        idx.remove_frame(50);
+        assert!(idx.lookup(0x7fff0000 + 50 * 0x100).is_none());
+        // others still present
+        assert_eq!(idx.lookup(0x7fff0000 + 49 * 0x100).unwrap().name, "v49");
     }
 }
