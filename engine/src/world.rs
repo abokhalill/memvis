@@ -372,9 +372,11 @@ impl HeapAllocTracker {
         }
     }
 
-    pub fn on_alloc(&mut self, addr: u64, size: u64) {
-        self.allocs.insert(addr, size);
+    /// returns Some(old_size) if the address was already tracked (allocator reuse)
+    pub fn on_alloc(&mut self, addr: u64, size: u64) -> Option<u64> {
+        let old = self.allocs.insert(addr, size);
         self.total_allocs += 1;
+        old
     }
 
     pub fn on_free(&mut self, addr: u64) -> Option<u64> {

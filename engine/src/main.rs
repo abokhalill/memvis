@@ -214,7 +214,11 @@ fn process_event(
         EVENT_ALLOC => {
             let ptr = ev.addr;
             let size = ev.size as u64;
-            world.heap_allocs.on_alloc(ptr, size);
+            if let Some(old_size) = world.heap_allocs.on_alloc(ptr, size) {
+                // address reuse: force-purge stale type projections
+                world.stm.purge_range(ptr, old_size);
+                heap_graph.on_free(ptr, old_size);
+            }
             true
         }
         EVENT_FREE => {

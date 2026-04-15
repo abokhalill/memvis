@@ -1199,24 +1199,59 @@ wrap_free_pre(void *wrapctx, void **user_data)
     *user_data = NULL;
 }
 
+/* kind: 0=malloc, 1=free, 2=calloc, 3=realloc */
+static void
+try_wrap_one(const module_data_t *mod, const char *sym, int kind)
+{
+    size_t offset;
+    drsym_error_t err = drsym_lookup_symbol(
+        mod->full_path, sym, &offset, DRSYM_DEFAULT_FLAGS);
+    if (err != DRSYM_SUCCESS) return;
+    app_pc func_pc = mod->start + offset;
+    switch (kind) {
+    case 0: drwrap_wrap(func_pc, wrap_malloc_pre, wrap_malloc_post); break;
+    case 1: drwrap_wrap(func_pc, wrap_free_pre, NULL); break;
+    case 2: drwrap_wrap(func_pc, wrap_calloc_pre, wrap_malloc_post); break;
+    case 3: drwrap_wrap(func_pc, wrap_realloc_pre, wrap_realloc_post); break;
+    }
+    dr_printf("memvis: wrapped %s @ %p\n", sym, (void *)func_pc);
+}
+
+/* tier 1: canonical libc names */
 static void
 wrap_alloc_funcs(const module_data_t *mod)
 {
-    const char *names[] = { "malloc", "free", "calloc", "realloc" };
-    for (int i = 0; i < 4; i++) {
-        size_t offset;
-        drsym_error_t err = drsym_lookup_symbol(
-            mod->full_path, names[i], &offset, DRSYM_DEFAULT_FLAGS);
-        if (err != DRSYM_SUCCESS) continue;
-        app_pc func_pc = mod->start + offset;
-        switch (i) {
-        case 0: drwrap_wrap(func_pc, wrap_malloc_pre, wrap_malloc_post); break;
-        case 1: drwrap_wrap(func_pc, wrap_free_pre, NULL); break;
-        case 2: drwrap_wrap(func_pc, wrap_calloc_pre, wrap_malloc_post); break;
-        case 3: drwrap_wrap(func_pc, wrap_realloc_pre, wrap_realloc_post); break;
-        }
-        dr_printf("memvis: wrapped %s @ %p\n", names[i], (void *)func_pc);
-    }
+    try_wrap_one(mod, "malloc",  0);
+    try_wrap_one(mod, "free",    1);
+    try_wrap_one(mod, "calloc",  2);
+    try_wrap_one(mod, "realloc", 3);
+}
+
+/* tier 2: known foreign allocator prefixes (same ABI: size in RDI, ret in RAX) */
+static void
+wrap_alloc_funcs_foreign(const module_data_t *mod, const char *tag)
+{
+    /* jemalloc */
+    try_wrap_one(mod, "je_malloc",  0);
+    try_wrap_one(mod, "je_free",    1);
+    try_wrap_one(mod, "je_calloc",  2);
+    try_wrap_one(mod, "je_realloc", 3);
+    /* tcmalloc */
+    try_wrap_one(mod, "tc_malloc",  0);
+    try_wrap_one(mod, "tc_free",    1);
+    try_wrap_one(mod, "tc_calloc",  2);
+    try_wrap_one(mod, "tc_realloc", 3);
+    /* mimalloc */
+    try_wrap_one(mod, "mi_malloc",  0);
+    try_wrap_one(mod, "mi_free",    1);
+    try_wrap_one(mod, "mi_calloc",  2);
+    try_wrap_one(mod, "mi_realloc", 3);
+    /* also try the standard names — foreign allocators often alias them */
+    try_wrap_one(mod, "malloc",  0);
+    try_wrap_one(mod, "free",    1);
+    try_wrap_one(mod, "calloc",  2);
+    try_wrap_one(mod, "realloc", 3);
+    dr_printf("memvis: scanned foreign allocator module '%s'\n", tag);
 }
 
 static void
@@ -1227,6 +1262,10 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 
     if (name && (strstr(name, "libc") != NULL)) {
         wrap_alloc_funcs(info);
+    } else if (name && (strstr(name, "jemalloc") != NULL ||
+                        strstr(name, "tcmalloc") != NULL ||
+                        strstr(name, "mimalloc") != NULL)) {
+        wrap_alloc_funcs_foreign(info, name);
     }
 
     if (atomic_load_explicit(&g_module_base_phase, memory_order_relaxed) == 0 &&
