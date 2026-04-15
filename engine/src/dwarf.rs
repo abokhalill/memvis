@@ -1136,15 +1136,66 @@ fn resolve_type_at<'a>(
         }
         Some(resolved)
     } else if tag == gimli::DW_TAG_array_type {
-        let byte_size = entry
+        let mut byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
             .ok()
             .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
+        // resolve element type for name and size
+        let elem_type = entry
+            .attr_value(gimli::DW_AT_type)
+            .ok()
+            .flatten()
+            .and_then(|v| match v {
+                AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1),
+                _ => None,
+            });
+        let elem_name = elem_type
+            .as_ref()
+            .map(|t| t.name.clone())
+            .unwrap_or_else(|| "?".into());
+        let elem_size = elem_type.as_ref().map(|t| t.byte_size).unwrap_or(0);
+
+        // GCC often omits DW_AT_byte_size on arrays; compute from subrange children
+        if byte_size == 0 && elem_size > 0 {
+            let mut tree = unit.entries_tree(Some(offset)).ok();
+            if let Some(ref mut tree) = tree {
+                if let Ok(root) = tree.root() {
+                    let mut children = root.children();
+                    while let Ok(Some(child)) = children.next() {
+                        if child.entry().tag() == gimli::DW_TAG_subrange_type {
+                            let count = child
+                                .entry()
+                                .attr_value(gimli::DW_AT_count)
+                                .ok()
+                                .flatten()
+                                .and_then(|v| v.udata_value());
+                            let upper = child
+                                .entry()
+                                .attr_value(gimli::DW_AT_upper_bound)
+                                .ok()
+                                .flatten()
+                                .and_then(|v| v.udata_value());
+                            let n = count.or_else(|| upper.map(|u| u + 1)).unwrap_or(0);
+                            if n > 0 {
+                                byte_size = n * elem_size;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        let arr_name = if byte_size > 0 && elem_size > 0 {
+            format!("{}[{}]", elem_name, byte_size / elem_size)
+        } else {
+            format!("{}[]", elem_name)
+        };
+
         Some(TypeInfo {
-            name: "[]".into(),
+            name: arr_name,
             byte_size,
             is_pointer: false,
             fields: Vec::new(),
