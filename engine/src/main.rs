@@ -71,6 +71,14 @@ fn process_event(
                         world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
                     }
                 }
+                if world.hazards.len() < 64 {
+                    if let Some(h) = world.heap_allocs.check_write_bounds(ev.addr, ev.size, &world.stm) {
+                        let dominated = world.hazards.iter().any(|prev| prev.write_addr == h.write_addr);
+                        if !dominated {
+                            world.hazards.push(h);
+                        }
+                    }
+                }
             }
             if let Some(h) = addr_index.lookup(ev.addr) {
                 let nid = h.node_id;
@@ -552,7 +560,7 @@ fn run_headless(
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && idle_rounds >= 50 {
                 let snap = world.snapshot();
-                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, journal, *total, orch);
+                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, journal, *total, orch);
                 let _ = out.flush();
                 return;
             }
@@ -581,6 +589,7 @@ fn headless_render(
     cl_tracker: &memvis::world::CacheLineTracker,
     stm: &memvis::world::ShadowTypeMap,
     heap_allocs: &memvis::world::HeapAllocTracker,
+    hazards: &[memvis::world::HeapHazard],
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -730,6 +739,39 @@ fn headless_render(
                 "  0x{:x}: type {} needs {}B but alloc only {}B",
                 m.addr, m.type_name, m.type_size, m.alloc_size
             );
+        }
+    }
+
+    if !hazards.is_empty() {
+        use memvis::world::HazardKind;
+        let oob = hazards.iter().filter(|h| matches!(h.kind, HazardKind::OutOfBounds)).count();
+        let hole = hazards.len() - oob;
+        let _ = writeln!(out, "\n🛑 HEAP HAZARDS ({} OOB, {} heap-hole)", oob, hole);
+        for h in hazards {
+            match h.kind {
+                HazardKind::OutOfBounds => {
+                    let sym = match (&h.type_name, &h.field_name) {
+                        (Some(t), Some(f)) => format!(" (intended for {}.{})", t, f),
+                        (Some(t), None) => format!(" (within {})", t),
+                        _ => String::new(),
+                    };
+                    let _ = writeln!(
+                        out,
+                        "  OOB  0x{:x} +{}B exceeds alloc [0x{:x}..+{}] by {}B{}",
+                        h.write_addr, h.write_size, h.alloc_base, h.alloc_size, h.overflow_bytes, sym
+                    );
+                }
+                HazardKind::HeapHole => {
+                    let sym = h.type_name.as_ref()
+                        .map(|t| format!(" (stale {} projection)", t))
+                        .unwrap_or_default();
+                    let _ = writeln!(
+                        out,
+                        "  HOLE 0x{:x} +{}B not in any live allocation{}",
+                        h.write_addr, h.write_size, sym
+                    );
+                }
+            }
         }
     }
 

@@ -327,8 +327,26 @@ impl ShadowTypeMap {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum HazardKind {
+    OutOfBounds,
+    HeapHole,
+}
+
+#[derive(Debug, Clone)]
+pub struct HeapHazard {
+    pub kind: HazardKind,
+    pub write_addr: u64,
+    pub write_size: u32,
+    pub alloc_base: u64,
+    pub alloc_size: u64,
+    pub overflow_bytes: u64,
+    pub type_name: Option<String>,
+    pub field_name: Option<String>,
+}
+
 pub struct HeapAllocTracker {
-    allocs: HashMap<u64, u64>,
+    allocs: BTreeMap<u64, u64>,
     pub total_allocs: u64,
     pub total_frees: u64,
     pub orphan_frees: u64,
@@ -346,7 +364,7 @@ pub struct SizeMismatch {
 impl HeapAllocTracker {
     pub fn new() -> Self {
         Self {
-            allocs: HashMap::with_capacity(256),
+            allocs: BTreeMap::new(),
             total_allocs: 0,
             total_frees: 0,
             orphan_frees: 0,
@@ -378,6 +396,67 @@ impl HeapAllocTracker {
         self.allocs.len()
     }
 
+    /// O(log N) lookup: find the allocation whose range covers `addr`
+    pub fn containing_alloc(&self, addr: u64) -> Option<(u64, u64)> {
+        use std::ops::Bound;
+        self.allocs
+            .range((Bound::Unbounded, Bound::Included(&addr)))
+            .next_back()
+            .filter(|(&base, &sz)| addr < base + sz)
+            .map(|(&base, &sz)| (base, sz))
+    }
+
+    /// check if a write at [addr, addr+write_size) stays within a live allocation.
+    /// returns Some(hazard) if OOB or heap-hole detected.
+    pub fn check_write_bounds(
+        &self,
+        addr: u64,
+        write_size: u32,
+        stm: &ShadowTypeMap,
+    ) -> Option<HeapHazard> {
+        let end = addr + write_size as u64;
+        if let Some((base, alloc_sz)) = self.containing_alloc(addr) {
+            if end > base + alloc_sz {
+                let overflow = end - (base + alloc_sz);
+                let sym = stm.covering(addr).map(|p| {
+                    let off = addr - p.base_addr;
+                    let field = p.type_info.fields.iter()
+                        .find(|f| f.byte_offset == off)
+                        .map(|f| f.name.clone());
+                    (p.type_info.name.clone(), field)
+                });
+                return Some(HeapHazard {
+                    kind: HazardKind::OutOfBounds,
+                    write_addr: addr,
+                    write_size,
+                    alloc_base: base,
+                    alloc_size: alloc_sz,
+                    overflow_bytes: overflow,
+                    type_name: sym.as_ref().map(|(t, _)| t.clone()),
+                    field_name: sym.and_then(|(_, f)| f),
+                });
+            }
+            return None;
+        }
+        // only flag heap-hole if addr falls within the span of known allocations
+        let lo = self.allocs.keys().next().copied().unwrap_or(u64::MAX);
+        let hi = self.allocs.iter().next_back()
+            .map(|(&b, &s)| b + s).unwrap_or(0);
+        if addr >= lo && addr < hi {
+            return Some(HeapHazard {
+                kind: HazardKind::HeapHole,
+                write_addr: addr,
+                write_size,
+                alloc_base: 0,
+                alloc_size: 0,
+                overflow_bytes: 0,
+                type_name: stm.covering(addr).map(|p| p.type_info.name.clone()),
+                field_name: None,
+            });
+        }
+        None
+    }
+
     pub fn check_size(&mut self, addr: u64, type_info: &TypeInfo) -> bool {
         if let Some(&alloc_sz) = self.allocs.get(&addr) {
             if type_info.byte_size > alloc_sz {
@@ -399,6 +478,7 @@ pub struct WorldState {
     pub cl_tracker: CacheLineTracker,
     pub stm: ShadowTypeMap,
     pub heap_allocs: HeapAllocTracker,
+    pub hazards: Vec<HeapHazard>,
 }
 
 impl WorldState {
@@ -409,6 +489,7 @@ impl WorldState {
             cl_tracker: CacheLineTracker::new(),
             stm: ShadowTypeMap::new(),
             heap_allocs: HeapAllocTracker::new(),
+            hazards: Vec::new(),
         }
     }
 
