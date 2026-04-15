@@ -73,6 +73,10 @@ pub struct AppState {
     pub time_travel_idx: Option<usize>,
     pub snap_count: usize,
     pub filter: EventFilter,
+    pub search_mode: bool,
+    pub search_query: String,
+    pub search_matches: Vec<usize>,
+    pub search_idx: usize,
 }
 
 impl Default for AppState {
@@ -86,6 +90,10 @@ impl Default for AppState {
             time_travel_idx: None,
             snap_count: 0,
             filter: EventFilter::default(),
+            search_mode: false,
+            search_query: String::new(),
+            search_matches: Vec::new(),
+            search_idx: 0,
         }
     }
 }
@@ -113,6 +121,33 @@ pub fn restore_terminal(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) {
 pub fn handle_input(state: &mut AppState) {
     while event::poll(std::time::Duration::ZERO).unwrap_or(false) {
         if let Ok(CEvent::Key(key)) = event::read() {
+            // search mode: capture query input
+            if state.search_mode {
+                match key.code {
+                    KeyCode::Esc => {
+                        state.search_mode = false;
+                        state.search_query.clear();
+                        state.search_matches.clear();
+                    }
+                    KeyCode::Enter => {
+                        state.search_mode = false;
+                        // jump to first match
+                        if let Some(&line) = state.search_matches.first() {
+                            state.mem_scroll = line;
+                            state.search_idx = 0;
+                            state.focus = Panel::Memory;
+                        }
+                    }
+                    KeyCode::Backspace => {
+                        state.search_query.pop();
+                    }
+                    KeyCode::Char(c) => {
+                        state.search_query.push(c);
+                    }
+                    _ => {}
+                }
+                continue;
+            }
             match key.code {
                 KeyCode::Char('q') => state.quit = true,
                 KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
@@ -202,6 +237,26 @@ pub fn handle_input(state: &mut AppState) {
                 }
                 KeyCode::Char('x') if state.focus == Panel::Events => {
                     state.filter = EventFilter::new();
+                }
+                KeyCode::Char('/') => {
+                    state.search_mode = true;
+                    state.search_query.clear();
+                    state.search_matches.clear();
+                    state.search_idx = 0;
+                }
+                KeyCode::Char('n') if !state.search_matches.is_empty() => {
+                    state.search_idx = (state.search_idx + 1) % state.search_matches.len();
+                    state.mem_scroll = state.search_matches[state.search_idx];
+                    state.focus = Panel::Memory;
+                }
+                KeyCode::Char('N') if !state.search_matches.is_empty() => {
+                    state.search_idx = if state.search_idx == 0 {
+                        state.search_matches.len() - 1
+                    } else {
+                        state.search_idx - 1
+                    };
+                    state.mem_scroll = state.search_matches[state.search_idx];
+                    state.focus = Panel::Memory;
                 }
                 _ => {}
             }
@@ -526,6 +581,31 @@ pub fn draw(
     let seq_gap_warn = seq_gaps; // capture for header
     let evt_lines = build_event_lines(journal, &state.filter);
 
+    // live search: recompute matches from mem_lines text
+    if !state.search_query.is_empty() {
+        let q = state.search_query.to_ascii_lowercase();
+        state.search_matches = mem_lines
+            .iter()
+            .enumerate()
+            .filter(|(_, ml)| {
+                let text: String = ml.spans.iter().map(|s| s.content.as_ref()).collect();
+                text.to_ascii_lowercase().contains(&q)
+            })
+            .map(|(i, _)| i)
+            .collect();
+        if state.search_idx >= state.search_matches.len() {
+            state.search_idx = 0;
+        }
+        // auto-scroll to current match while typing
+        if state.search_mode {
+            if let Some(&line) = state.search_matches.get(state.search_idx) {
+                state.mem_scroll = line;
+            }
+        }
+    } else {
+        state.search_matches.clear();
+    }
+
     // clamp scrolls
     state.mem_scroll = state.mem_scroll.min(mem_lines.len().saturating_sub(1));
     state.evt_scroll = state.evt_scroll.min(evt_lines.len().saturating_sub(1));
@@ -623,15 +703,44 @@ pub fn draw(
         } else {
             Style::default().fg(Color::DarkGray)
         };
+        let current_match_line = state.search_matches.get(state.search_idx).copied();
         let mem_items: Vec<Line> = mem_lines
             .iter()
-            .map(|ml| Line::from(ml.spans.clone()))
+            .enumerate()
+            .map(|(i, ml)| {
+                if Some(i) == current_match_line {
+                    // current match: bright highlight
+                    let styled: Vec<Span> = ml.spans.iter().map(|s| {
+                        Span::styled(s.content.clone(), s.style.bg(Color::DarkGray))
+                    }).collect();
+                    Line::from(styled)
+                } else if state.search_matches.contains(&i) {
+                    // other matches: subtle highlight
+                    let styled: Vec<Span> = ml.spans.iter().map(|s| {
+                        Span::styled(s.content.clone(), s.style.bg(Color::Rgb(40, 40, 40)))
+                    }).collect();
+                    Line::from(styled)
+                } else {
+                    Line::from(ml.spans.clone())
+                }
+            })
             .collect();
+        let mem_title = if state.search_mode {
+            format!(" Memory Map  /{}▏ ", state.search_query)
+        } else if !state.search_matches.is_empty() {
+            format!(" Memory Map  [{}/{}] ", state.search_idx + 1, state.search_matches.len())
+        } else {
+            " Memory Map ".to_string()
+        };
         let mem_widget = Paragraph::new(mem_items)
             .block(
                 Block::default()
-                    .title(" Memory Map ")
-                    .title_style(Style::default().fg(Color::White).bold())
+                    .title(mem_title)
+                    .title_style(Style::default().fg(if state.search_mode || !state.search_matches.is_empty() {
+                        Color::Yellow
+                    } else {
+                        Color::White
+                    }).bold())
                     .borders(Borders::ALL)
                     .border_style(mem_border_style),
             )
@@ -895,7 +1004,11 @@ pub fn draw(
             Span::styled("←→/hl", Style::default().fg(Color::Yellow).bold()),
             Span::raw(" time-travel  "),
             Span::styled("End", Style::default().fg(Color::Yellow).bold()),
-            Span::raw(" live"),
+            Span::raw(" live  "),
+            Span::styled("/", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(" search  "),
+            Span::styled("n/N", Style::default().fg(Color::Yellow).bold()),
+            Span::raw(" next/prev"),
         ]));
         f.render_widget(footer, chunks[2]);
     });

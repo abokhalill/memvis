@@ -10,6 +10,7 @@ use memvis::heap_graph::{HeapGraph, HeapOracle};
 use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::ring::{Event, RingOrchestrator};
 use memvis::shadow_regs::ShadowRegisterFile;
+use memvis::record::{EventPlayer, EventRecorder};
 use memvis::tui::{self, AppState, JournalEntry};
 use memvis::world::{ShadowStack, SnapshotRing, WorldState, REG_COUNT};
 
@@ -288,7 +289,7 @@ fn populate_globals(
     addr_index.finalize();
 }
 
-fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64) {
+fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
     let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
@@ -307,6 +308,19 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         populate_globals(info, 0, &mut addr_index, &mut world);
     }
 
+    let mut recorder: Option<EventRecorder> = record_path.as_ref().and_then(|p| {
+        match EventRecorder::create(std::path::Path::new(p)) {
+            Ok(r) => {
+                eprintln!("memvis: recording to {}", p);
+                Some(r)
+            }
+            Err(e) => {
+                eprintln!("memvis: failed to create recording: {}", e);
+                None
+            }
+        }
+    });
+
     if once {
         run_headless(
             &mut orch,
@@ -323,7 +337,14 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             &mut shadow_regs,
             &mut heap_graph,
             &mut heap_oracle,
+            &mut recorder,
         );
+        if let Some(rec) = recorder {
+            match rec.finish() {
+                Ok(n) => eprintln!("memvis: recorded {} events", n),
+                Err(e) => eprintln!("memvis: recording finalize error: {}", e),
+            }
+        }
         return;
     }
 
@@ -390,6 +411,9 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                         &mut heap_graph,
                         &mut heap_oracle,
                     );
+                    if let Some(ref mut rec) = recorder {
+                        let _ = rec.record(ev);
+                    }
                     if interesting {
                         journal.push_back(JournalEntry {
                             seq: total,
@@ -470,6 +494,12 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         }
     }
 
+    if let Some(rec) = recorder {
+        match rec.finish() {
+            Ok(n) => eprintln!("memvis: recorded {} events", n),
+            Err(e) => eprintln!("memvis: recording finalize error: {}", e),
+        }
+    }
     tui::restore_terminal(&mut terminal);
 }
 
@@ -489,6 +519,7 @@ fn run_headless(
     shadow_regs: &mut HashMap<u16, ShadowRegisterFile>,
     heap_graph: &mut HeapGraph,
     heap_oracle: &mut HeapOracle,
+    recorder: &mut Option<EventRecorder>,
 ) {
     use std::io::Write;
     let stdout = io::stdout();
@@ -535,6 +566,9 @@ fn run_headless(
                     heap_graph,
                     heap_oracle,
                 );
+                if let Some(ref mut rec) = recorder {
+                    let _ = rec.record(ev);
+                }
                 if interesting {
                     journal.push_back(JournalEntry {
                         seq: *total,
@@ -832,6 +866,151 @@ fn headless_render(
     }
 }
 
+fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool) {
+    use std::io::Write;
+
+    let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
+        eprintln!("memvis: parsing DWARF from {}", path);
+        match dwarf::parse_elf(path) {
+            Ok(info) => {
+                eprintln!("memvis: {} globals, {} functions", info.globals.len(), info.functions.len());
+                Some(info)
+            }
+            Err(e) => {
+                eprintln!("memvis: DWARF parse failed: {}", e);
+                None
+            }
+        }
+    });
+
+    let mut player = match EventPlayer::open(std::path::Path::new(replay_path)) {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("memvis: failed to open recording: {}", e);
+            return;
+        }
+    };
+    eprintln!("memvis: replaying {} events from {}", player.event_count(), replay_path);
+
+    let mut addr_index = AddressIndex::new();
+    let mut world = WorldState::new();
+    let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
+    let mut next_frame_id: FrameId = 1;
+    let mut total: u64 = 0;
+    let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
+    let mut relocation_delta: Option<u64> = None;
+    let mut returned_frames: VecDeque<FrameId> = VecDeque::with_capacity(64);
+    let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
+    let mut heap_graph = HeapGraph::new();
+    let mut heap_oracle = HeapOracle::new();
+    // dummy orchestrator for headless_render (LAG will be 0)
+    let orch = RingOrchestrator::new();
+
+    if let Some(ref info) = dwarf_info {
+        populate_globals(info, 0, &mut addr_index, &mut world);
+    }
+
+    let mut event_buf: Vec<Event> = Vec::with_capacity(4096);
+    loop {
+        event_buf.clear();
+        let got = match player.read_batch(&mut event_buf, 4096) {
+            Ok(n) => n,
+            Err(e) => {
+                eprintln!("memvis: replay read error: {}", e);
+                break;
+            }
+        };
+        if got == 0 { break; }
+
+        let mut need_finalize = false;
+        let mut i = 0;
+        while i < event_buf.len() {
+            let ev = &event_buf[i];
+            total += 1;
+            world.inc_insn_counter();
+            let ev_kind = ev.kind();
+
+            // REG_SNAPSHOT: consume 6 continuation events inline (no ring access)
+            if ev_kind == EVENT_REG_SNAPSHOT {
+                if i + 6 < event_buf.len() {
+                    let cont = &event_buf[i + 1..i + 7];
+                    let valid = cont.iter().all(|c| c.kind() == EVENT_REG_SNAPSHOT);
+                    if valid {
+                        let mut regs = [0u64; REG_COUNT];
+                        for s in 0..6usize {
+                            regs[s * 3] = cont[s].addr;
+                            regs[s * 3 + 1] = cont[s].size as u64;
+                            regs[s * 3 + 2] = cont[s].value;
+                        }
+                        world.update_regs(regs, ev.addr);
+                        let srf = shadow_regs.entry(ev.thread_id).or_default();
+                        srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
+                    }
+                    i += 7; // skip header + 6 continuations
+                } else {
+                    i += 1; // incomplete snapshot at buffer boundary, skip
+                }
+                continue;
+            }
+
+            let interesting = process_event(
+                ev,
+                0,
+                &orch,
+                &mut world,
+                &mut addr_index,
+                &dwarf_info,
+                &mut stacks,
+                &mut next_frame_id,
+                &mut relocation_delta,
+                &mut returned_frames,
+                &mut shadow_regs,
+                &mut heap_graph,
+                &mut heap_oracle,
+            );
+            if interesting {
+                journal.push_back(JournalEntry {
+                    seq: total,
+                    kind: ev_kind,
+                    thread_id: ev.thread_id,
+                    addr: ev.addr,
+                    size: ev.size,
+                    value: ev.value,
+                });
+                if journal.len() > 1000 {
+                    journal.pop_front();
+                }
+            }
+            if ev_kind == EVENT_CALL {
+                need_finalize = true;
+            }
+            i += 1;
+        }
+        if need_finalize {
+            addr_index.finalize();
+        }
+        if total & 0xFFF == 0 {
+            world.cache_heat_tick();
+            world.cl_tracker_tick();
+        }
+        if heap_graph.needs_type_inference() {
+            if let Some(ref info) = dwarf_info {
+                heap_graph.run_type_inference(info);
+            }
+        }
+        if total & 0xFFFF == 0 {
+            heap_graph.gc_stale(total, 500_000);
+        }
+    }
+
+    eprintln!("memvis: replay complete, {} events processed", total);
+    let snap = world.snapshot();
+    let stdout = io::stdout();
+    let mut out = io::BufWriter::new(stdout.lock());
+    headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &journal, total, &orch);
+    let _ = out.flush();
+}
+
 fn cleanup_shm() {
     // remove ctl ring
     unsafe {
@@ -922,7 +1101,7 @@ fn install_signal_handlers() {
     }
 }
 
-fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64) {
+fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path: Option<String>) {
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
         eprintln!("memvis: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
@@ -957,7 +1136,7 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64) {
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
                 eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
-                run(orch, dwarf_info, once, min_events);
+                run(orch, dwarf_info, once, min_events, record_path);
                 return;
             }
         }
@@ -965,7 +1144,7 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64) {
     }
 }
 
-fn launch(target: &str, target_args: &[String], once: bool, min_events: u64) {
+fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, record_path: Option<String>) {
     let drrun = match find_drrun() {
         Some(p) => p,
         None => {
@@ -1022,7 +1201,7 @@ fn launch(target: &str, target_args: &[String], once: bool, min_events: u64) {
     let target_owned = target.to_string();
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_consumer(Some(&target_owned), once, min_events))
+        .spawn(move || run_consumer(Some(&target_owned), once, min_events, record_path))
         .expect("memvis: failed to spawn consumer thread");
     let _ = handle.join();
 
@@ -1040,7 +1219,9 @@ fn print_usage() {
     eprintln!("Usage:");
     eprintln!("  memvis <target> [args...]        Launch target under tracer + TUI");
     eprintln!("  memvis --once <target> [args...]  Headless mode (print to stdout, exit)");
-    eprintln!("  memvis --consumer-only [--once] [--min-events N] <target.elf>");
+    eprintln!("  memvis --record <file> [--once] <target>  Record events to file");
+    eprintln!("  memvis --replay <file> [--once] <target.elf>  Replay recorded events");
+    eprintln!("  memvis --consumer-only [--once] <target.elf>");
     eprintln!("                                    Consumer-only (tracer started separately)");
     eprintln!();
     eprintln!("Environment:");
@@ -1057,14 +1238,39 @@ fn main() {
         std::process::exit(if args.len() < 2 { 1 } else { 0 });
     }
 
+    let once = args.iter().any(|a| a == "--once");
+    let min_events: u64 = args
+        .windows(2)
+        .find(|w| w[0] == "--min-events")
+        .and_then(|w| w[1].parse().ok())
+        .unwrap_or(1);
+    let record_path: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--record")
+        .map(|w| w[1].clone());
+    let replay_path: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--replay")
+        .map(|w| w[1].clone());
+
+    // --replay mode: read events from file, no tracer needed
+    if let Some(ref rp) = replay_path {
+        let elf_path: Option<String> = args
+            .iter()
+            .filter(|a| !a.starts_with('-') && *a != &args[0] && *a != rp)
+            .find(|a| a.parse::<u64>().is_err())
+            .cloned();
+        let rp_owned = rp.clone();
+        let handle = thread::Builder::new()
+            .stack_size(64 * 1024 * 1024)
+            .spawn(move || run_replay(&rp_owned, elf_path.as_deref(), once))
+            .expect("memvis: failed to spawn replay thread");
+        let _ = handle.join();
+        return;
+    }
+
     // --consumer-only: legacy mode (tracer started separately)
     if args.iter().any(|a| a == "--consumer-only") {
-        let once = args.iter().any(|a| a == "--once");
-        let min_events: u64 = args
-            .windows(2)
-            .find(|w| w[0] == "--min-events")
-            .and_then(|w| w[1].parse().ok())
-            .unwrap_or(1);
         let elf_path: Option<String> = args
             .iter()
             .filter(|a| !a.starts_with('-') && *a != &args[0])
@@ -1072,20 +1278,13 @@ fn main() {
             .cloned();
         let handle = thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events))
+            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events, record_path))
             .expect("memvis: failed to spawn consumer thread");
         let _ = handle.join();
         return;
     }
 
-    // launcher mode: memvis [--once] [--min-events N] <target> [target_args...]
-    let once = args.iter().any(|a| a == "--once");
-    let min_events: u64 = args
-        .windows(2)
-        .find(|w| w[0] == "--min-events")
-        .and_then(|w| w[1].parse().ok())
-        .unwrap_or(1);
-
+    // launcher mode: memvis [--once] [--record <file>] <target> [target_args...]
     // find the target: first positional arg that isn't a flag or flag value
     let mut skip_next = false;
     let mut target_idx = None;
@@ -1094,7 +1293,7 @@ fn main() {
             skip_next = false;
             continue;
         }
-        if a == "--min-events" {
+        if a == "--min-events" || a == "--record" || a == "--replay" {
             skip_next = true;
             continue;
         }
@@ -1117,5 +1316,5 @@ fn main() {
     let target = &args[target_idx];
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(target, &target_args, once, min_events);
+    launch(target, &target_args, once, min_events, record_path);
 }
