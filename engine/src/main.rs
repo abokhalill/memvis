@@ -41,7 +41,7 @@ fn process_event(
     let ev_kind = ev.kind();
     match ev_kind {
         EVENT_WRITE => {
-            world.record_cl_write(ev.addr, ev.thread_id);
+            let cl_writers = world.record_cl_write(ev.addr, ev.thread_id);
             if let Some(ref info) = dwarf_info {
                 if addr_index.in_universe(ev.addr) {
                     let elf_pc = match *relocation_delta {
@@ -53,9 +53,11 @@ fn process_event(
                     srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
                 }
             }
-            for (&tid, srf) in shadow_regs.iter_mut() {
-                if tid != ev.thread_id {
-                    srf.check_coherence(ev.addr, ev.value, ev.size, ev.seq as u64);
+            if cl_writers.count_ones() > 1 {
+                for (&tid, srf) in shadow_regs.iter_mut() {
+                    if tid != ev.thread_id {
+                        srf.check_coherence(ev.addr, ev.value, ev.size, ev.seq as u64);
+                    }
                 }
             }
             if heap_oracle.is_heap(ev.addr) {
@@ -388,6 +390,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             tui::draw(
                 &mut terminal,
                 &display_snap,
+                &world.cl_tracker,
                 &journal,
                 total,
                 orch.ring_count(),
@@ -504,7 +507,7 @@ fn run_headless(
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && idle_rounds >= 50 {
                 let snap = world.snapshot();
-                headless_render(&mut out, &snap, journal, *total, orch);
+                headless_render(&mut out, &snap, &world.cl_tracker, journal, *total, orch);
                 let _ = out.flush();
                 return;
             }
@@ -530,6 +533,7 @@ fn run_headless(
 fn headless_render(
     out: &mut impl std::io::Write,
     world: &memvis::world::WorldInner,
+    cl_tracker: &memvis::world::CacheLineTracker,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -571,7 +575,7 @@ fn headless_render(
         }
         let cl = node.addr / 64;
         if cl != last_cl {
-            let fs = world.cl_tracker.contention_score(node.addr);
+            let fs = cl_tracker.contention_score(node.addr);
             let fs_tag = if fs > 1 {
                 format!(" FALSE_SHARE T={}", fs)
             } else {

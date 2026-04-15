@@ -2,7 +2,7 @@
 // world state: variables, pointer edges, register file, cache miss tracking.
 // arc-wrapped inner for cow snapshotting - mutation clones only when shared.
 
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap};
 use std::sync::Arc;
 
 use crate::dwarf::TypeInfo;
@@ -37,57 +37,58 @@ impl LiveRegisterFile {
     }
 }
 
-// per-cacheline write tracker. detects false sharing via thread bitmask.
-const CACHE_LINE_SHIFT: u32 = 6; // 64 bytes
+const CL_SHIFT: u32 = 6;
+const CL_SLOTS: usize = 16384;
+const CL_MASK: usize = CL_SLOTS - 1;
 
-#[derive(Debug, Clone)]
-pub struct CacheLineEntry {
-    pub write_count: u32,
-    pub writers: HashSet<u16>,
-    pub last_writer: u16,
+#[derive(Debug, Clone, Copy, Default)]
+pub struct ClSlot {
+    pub cl_addr: u64,
+    pub write_count: u16,
+    pub writers: u16, // bitmask: bit i = thread i has written
 }
 
 #[derive(Debug, Clone)]
 pub struct CacheLineTracker {
-    pub lines: HashMap<u64, CacheLineEntry>, // key = addr >> 6
+    pub slots: Box<[ClSlot; CL_SLOTS]>,
 }
 
 impl CacheLineTracker {
-    #[allow(clippy::new_without_default)]
     pub fn new() -> Self {
         Self {
-            lines: HashMap::new(),
+            slots: Box::new([ClSlot::default(); CL_SLOTS]),
         }
     }
 
-    pub fn record_write(&mut self, addr: u64, thread_id: u16) {
-        let cl = addr >> CACHE_LINE_SHIFT;
-        let e = self.lines.entry(cl).or_insert(CacheLineEntry {
-            write_count: 0,
-            writers: HashSet::new(),
-            last_writer: thread_id,
-        });
-        e.write_count += 1;
-        e.writers.insert(thread_id);
-        e.last_writer = thread_id;
+    #[inline(always)]
+    pub fn record_write(&mut self, addr: u64, thread_id: u16) -> u16 {
+        let cl = addr >> CL_SHIFT;
+        let idx = (cl as usize) & CL_MASK;
+        let s = unsafe { self.slots.get_unchecked_mut(idx) };
+        if s.cl_addr != cl {
+            *s = ClSlot { cl_addr: cl, write_count: 1, writers: 1u16 << (thread_id & 15) };
+            return s.writers;
+        }
+        s.write_count = s.write_count.saturating_add(1);
+        s.writers |= 1u16 << (thread_id & 15);
+        s.writers
     }
 
     pub fn contention_score(&self, addr: u64) -> u32 {
-        self.lines
-            .get(&(addr >> CACHE_LINE_SHIFT))
-            .map(|e| e.writers.len() as u32)
-            .unwrap_or(0)
+        let cl = addr >> CL_SHIFT;
+        let idx = (cl as usize) & CL_MASK;
+        let s = &self.slots[idx];
+        if s.cl_addr == cl { s.writers.count_ones() } else { 0 }
     }
 
-    // decay: halve write counts, clear stale writers, evict dead entries
     pub fn tick(&mut self) {
-        self.lines.retain(|_, e| {
-            e.write_count /= 2;
-            if e.write_count == 0 {
-                e.writers.clear();
+        for s in self.slots.iter_mut() {
+            s.write_count >>= 1;
+            if s.write_count == 0 {
+                s.writers = 0;
+                s.cl_addr = 0;
             }
-            e.write_count > 0
-        });
+        }
     }
 }
 
@@ -152,7 +153,6 @@ pub struct WorldInner {
     pub insn_counter: u64,
     pub reg_file: LiveRegisterFile,
     pub cache_heat: CacheHeatmap,
-    pub cl_tracker: CacheLineTracker,
 }
 
 impl WorldInner {
@@ -164,13 +164,13 @@ impl WorldInner {
             insn_counter: 0,
             reg_file: LiveRegisterFile::new(),
             cache_heat: CacheHeatmap::new(),
-            cl_tracker: CacheLineTracker::new(),
         }
     }
 }
 
 pub struct WorldState {
     inner: Arc<WorldInner>,
+    pub cl_tracker: CacheLineTracker,
 }
 
 impl WorldState {
@@ -178,6 +178,7 @@ impl WorldState {
     pub fn new() -> Self {
         Self {
             inner: Arc::new(WorldInner::new()),
+            cl_tracker: CacheLineTracker::new(),
         }
     }
 
@@ -300,12 +301,13 @@ impl WorldState {
         self.cow().cache_heat.tick();
     }
 
-    pub fn record_cl_write(&mut self, addr: u64, thread_id: u16) {
-        self.cow().cl_tracker.record_write(addr, thread_id);
+    #[inline(always)]
+    pub fn record_cl_write(&mut self, addr: u64, thread_id: u16) -> u16 {
+        self.cl_tracker.record_write(addr, thread_id)
     }
 
     pub fn cl_tracker_tick(&mut self) {
-        self.cow().cl_tracker.tick();
+        self.cl_tracker.tick();
     }
 
     pub fn node_count(&self) -> usize {

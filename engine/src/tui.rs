@@ -15,7 +15,7 @@ use ratatui::widgets::*;
 use crate::heap_graph::HeapGraph;
 use crate::index::NodeId;
 use crate::shadow_regs::{Confidence, ShadowRegisterFile};
-use crate::world::{ShadowStack, WorldInner, REG_COUNT, REG_NAMES};
+use crate::world::{CacheLineTracker, ShadowStack, WorldInner, REG_COUNT, REG_NAMES};
 
 #[derive(Clone)]
 pub struct JournalEntry {
@@ -249,7 +249,7 @@ struct MemLine {
     spans: Vec<Span<'static>>,
 }
 
-fn build_mem_lines(world: &WorldInner) -> Vec<MemLine> {
+fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<MemLine> {
     let mut sorted: Vec<_> = world.nodes.iter().filter(|(_, n)| n.size > 0).collect();
     sorted.sort_by_key(|(_, n)| (n.addr, std::cmp::Reverse(n.last_write_insn)));
     sorted.dedup_by(|a, b| {
@@ -270,7 +270,7 @@ fn build_mem_lines(world: &WorldInner) -> Vec<MemLine> {
         let cl = node.addr / 64;
 
         if cl != last_cl {
-            let fs = world.cl_tracker.contention_score(node.addr);
+            let fs = cl_tracker.contention_score(node.addr);
             let mut spans: Vec<Span<'static>> = vec![Span::styled(
                 format!("  ── CL 0x{:x} ──", cl * 64),
                 Style::default().fg(Color::DarkGray),
@@ -417,6 +417,7 @@ fn build_event_lines(journal: &VecDeque<JournalEntry>, filter: &EventFilter) -> 
 pub fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     world: &WorldInner,
+    cl_tracker: &CacheLineTracker,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     ring_count: usize,
@@ -430,7 +431,7 @@ pub fn draw(
     heap_graph: &HeapGraph,
 ) {
     state.snap_count = snap_total;
-    let mem_lines = build_mem_lines(world);
+    let mem_lines = build_mem_lines(world, cl_tracker);
     let seq_gap_warn = seq_gaps; // capture for header
     let evt_lines = build_event_lines(journal, &state.filter);
 
