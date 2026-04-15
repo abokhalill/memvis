@@ -91,9 +91,7 @@ pub struct ShadowReg {
     pub confidence: Confidence,
     pub last_seq: u64,
     pub last_pc: u64,
-    // memory address this register was loaded from (for coherence checks)
     pub mem_source: Option<u64>,
-    // byte width of the original load (4 for MOV r32; 8 for MOV r64)
     pub mem_source_size: u32,
 }
 
@@ -116,7 +114,6 @@ impl ShadowReg {
         self.confidence = conf;
         self.last_seq = seq;
         self.last_pc = pc;
-        // clear source unless caller sets it explicitly
         self.mem_source = None;
         self.mem_source_size = 0;
     }
@@ -164,8 +161,6 @@ impl ShadowRegisterFile {
         }
     }
 
-    // write-back correlation: if dwarf says var is in reg at this pc,
-    // a memory write reveals the register's value.
     pub fn observe_write(
         &mut self,
         _addr: u64,
@@ -267,8 +262,6 @@ impl ShadowRegisterFile {
         }
     }
 
-    // semantic reload: MOV reg, [mem] captured by tracer's selective instrumenter.
-    // ground-truth anchor: we know the register's exact value and source address.
     pub fn on_reload(
         &mut self,
         reg_idx: usize,
@@ -295,10 +288,7 @@ impl ShadowRegisterFile {
         self.regs[reg_idx].mem_source_size = load_size;
     }
 
-    // dirty-shadow coherence check: called on every WRITE event.
-    // uses proper interval overlap: write [w, w+ws) ∩ source [s, s+ss) ≠ ∅.
-    // for wide writes (>8 bytes, e.g. SSE/AVX), value comparison is skipped
-    // because the 64-bit event value can't represent the full written data.
+    // interval overlap coherence: [w, w+ws) ∩ [src, src+ss). wide writes (>8B) always stale.
     pub fn check_coherence(
         &mut self,
         written_addr: u64,
@@ -311,9 +301,7 @@ impl ShadowRegisterFile {
             if let Some(src) = self.regs[i].mem_source {
                 let s_size = self.regs[i].mem_source_size.max(1) as u64;
                 let s_end = src.saturating_add(s_size);
-                // interval overlap: [written_addr, w_end) ∩ [src, s_end)
                 if written_addr < s_end && src < w_end {
-                    // wide writes (>8B): value field is truncated/zero, always stale
                     let definitely_changed = if write_size > 8 {
                         true
                     } else {
@@ -328,7 +316,6 @@ impl ShadowRegisterFile {
     }
 }
 
-// piece assembler: reconstructs DW_OP_piece-fragmented variables on demand.
 
 #[derive(Debug, Clone)]
 pub struct PieceFragment {
@@ -359,7 +346,6 @@ pub struct AssembledValue {
 pub struct PieceAssembler;
 
 impl PieceAssembler {
-    // static pass: expr steps → fragments. called once at dwarf load time.
     pub fn parse_pieces(steps: &[ExprStep]) -> Vec<PieceFragment> {
         let mut fragments = Vec::new();
         let mut var_offset: u64 = 0;
@@ -405,7 +391,6 @@ impl PieceAssembler {
             }
         }
 
-        // trailing atom without piece: whole-variable single fragment
         if fragments.is_empty() {
             if let Some(source) = pending_source {
                 fragments.push(PieceFragment {
@@ -419,7 +404,6 @@ impl PieceAssembler {
         fragments
     }
 
-    // on-demand at draw time: assemble full byte value from fragments.
     pub fn resolve_pieces(
         fragments: &[PieceFragment],
         total_byte_size: u64,

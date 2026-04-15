@@ -21,7 +21,6 @@ const EVENT_CACHE_MISS: u8 = 6;
 const EVENT_MODULE_LOAD: u8 = 7;
 const EVENT_RELOAD: u8 = 12;
 
-// returns true if event was "interesting" (tracked write, or control event)
 #[inline]
 #[allow(clippy::too_many_arguments)]
 fn process_event(
@@ -43,7 +42,6 @@ fn process_event(
     match ev_kind {
         EVENT_WRITE => {
             world.record_cl_write(ev.addr, ev.thread_id);
-            // SRF write-back correlation
             if let Some(ref info) = dwarf_info {
                 let elf_pc = match *relocation_delta {
                     Some(d) => ev.addr.wrapping_sub(d),
@@ -53,14 +51,11 @@ fn process_event(
                 let srf = shadow_regs.entry(ev.thread_id).or_default();
                 srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
             }
-            // cross-thread coherence: check if this write invalidates any other
-            // thread's register that was loaded from this address.
             for (&tid, srf) in shadow_regs.iter_mut() {
                 if tid != ev.thread_id {
                     srf.check_coherence(ev.addr, ev.value, ev.size, ev.seq as u64);
                 }
             }
-            // heap graph: feed writes to heap addresses
             if heap_oracle.is_heap(ev.addr) {
                 heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
             }
@@ -81,12 +76,10 @@ fn process_event(
             false
         }
         EVENT_CALL => {
-            // SRF: push call frame. ev.addr = callee_pc, ev.value = rsp/frame_base
             {
                 let srf = shadow_regs.entry(ev.thread_id).or_default();
                 srf.on_call(ev.addr, ev.value, ev.seq as u64);
             }
-            // heap oracle: update stack bounds from rsp
             heap_oracle.update_stack(ev.thread_id, ev.value);
             if let Some(ref info) = dwarf_info {
                 let elf_pc = match *relocation_delta {
@@ -132,7 +125,6 @@ fn process_event(
             true
         }
         EVENT_RETURN => {
-            // SRF: pop call frame
             {
                 let srf = shadow_regs.entry(ev.thread_id).or_default();
                 srf.on_return(ev.seq as u64, ev.addr);
@@ -154,9 +146,6 @@ fn process_event(
         EVENT_REG_SNAPSHOT => {
             let mut cont = [Event::zero(); 6];
             if orch.rings[ring_idx].pop_n(6, &mut cont) {
-                // validate: all 6 continuation slots must be REG_SNAPSHOT kind.
-                // if any slot has a different kind, the ring may have wrapped or
-                // been corrupted; discard the entire snapshot.
                 let valid = cont.iter().all(|c| c.kind() == EVENT_REG_SNAPSHOT);
                 if valid {
                     let mut regs = [0u64; REG_COUNT];
@@ -166,7 +155,6 @@ fn process_event(
                         regs[s * 3 + 2] = cont[s].value;
                     }
                     world.update_regs(regs, ev.addr);
-                    // SRF: ground-truth anchor
                     let srf = shadow_regs.entry(ev.thread_id).or_default();
                     srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
                 }
@@ -180,14 +168,12 @@ fn process_event(
             true
         }
         EVENT_RELOAD => {
-            // semantic reload: MOV reg, [mem]. flags byte = dest register index.
             let reg_idx = ((ev.kind_flags >> 8) & 0xFF) as usize;
             let srf = shadow_regs.entry(ev.thread_id).or_default();
             srf.on_reload(reg_idx, ev.value, ev.addr, ev.size, ev.seq as u64, ev.addr);
             true
         }
         EVENT_MODULE_LOAD => {
-            // heap oracle: register module range
             heap_oracle.add_module(ev.addr, ev.value);
             if relocation_delta.is_none() {
                 if let Some(ref info) = dwarf_info {
@@ -220,7 +206,6 @@ fn populate_globals(
         addr_index.insert_global(base, g.size, g.name.clone(), g.type_info.clone(), gi);
         world.remove_node(NodeId::Global(gi));
         world.ensure_node(NodeId::Global(gi), &g.name, &g.type_info, base, g.size);
-        // decompose struct fields into separate addressable nodes
         for (fi, f) in g.type_info.fields.iter().enumerate() {
             if f.byte_size == 0 {
                 continue;
@@ -262,7 +247,6 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         populate_globals(info, 0, &mut addr_index, &mut world);
     }
 
-    // --once mode: headless render to stdout (for E2E tests and scripting)
     if once {
         run_headless(
             &mut orch,
@@ -283,7 +267,6 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         return;
     }
 
-    // interactive ratatui mode
     let mut terminal = match tui::init_terminal() {
         Ok(t) => t,
         Err(e) => {
@@ -367,7 +350,6 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                 world.cache_heat_tick();
                 world.cl_tracker_tick();
             }
-            // heap graph: periodic type inference + GC
             if heap_graph.needs_type_inference() {
                 if let Some(ref info) = dwarf_info {
                     heap_graph.run_type_inference(info);
@@ -385,7 +367,6 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             tick += 1;
             snap_ring.push(live_snap.clone(), tick, total);
 
-            // time-travel: use historical snapshot if scrubbing, else live
             let display_snap = match app.time_travel_idx {
                 Some(idx) => snap_ring
                     .get(idx)

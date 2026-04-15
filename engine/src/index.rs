@@ -1,9 +1,6 @@
 // SPDX-License-Identifier: MIT
-// two-tier address→variable index.
-// tier 1: static globals/fields — sorted Vec, O(log N) binary search, finalized once.
-// tier 2: dynamic stack locals — HashMap<FrameId, Vec<Interval>>, O(1) frame removal.
-// 8-slot MRU cache shared across both tiers (~90%+ hit rate in practice).
-// locals shadow globals/fields on overlap (higher rank wins; narrower wins on tie).
+
+// Two tier addr->variable index. statics: sorted vec, O(log N). dynamics: HashMap<FrameId>, O(1) removal.
 
 use crate::dwarf::TypeInfo;
 use std::collections::HashMap;
@@ -13,7 +10,7 @@ pub type FrameId = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub enum NodeId {
     Global(u32),
-    Field(u32, u16), // (global_idx, field_idx) — struct field decomposition
+    Field(u32, u16),
     Local(FrameId, u16),
 }
 
@@ -41,9 +38,6 @@ pub struct LookupResult<'a> {
 
 const MRU_SLOTS: usize = 8;
 
-// MRU entry: tier tag + coordinates for reconstructing a LookupResult.
-// Static: (lo, hi, index into self.statics)
-// Dynamic: (lo, hi, frame_id, local_index) — packed into u64s.
 #[derive(Clone, Copy)]
 enum MruEntry {
     Static { lo: u64, hi: u64, idx: usize },
@@ -64,12 +58,9 @@ impl MruEntry {
 }
 
 pub struct AddressIndex {
-    // tier 1: static (globals + fields). sorted by lo after finalize().
     statics: Vec<Interval>,
     statics_sorted: bool,
-    // tier 2: dynamic (stack locals). keyed by frame_id for O(1) removal.
     dynamics: HashMap<FrameId, Vec<Interval>>,
-    // 8-slot MRU cache, shared across both tiers.
     mru: [Option<MruEntry>; MRU_SLOTS],
     mru_len: usize,
 }
@@ -173,13 +164,12 @@ impl AddressIndex {
         if !frame_ivs.is_empty() {
             self.dynamics.insert(frame_id, frame_ivs);
         }
-        // no sort needed — dynamics are scanned linearly (typically <10 frames)
         self.mru_len = 0;
     }
 
     pub fn remove_frame(&mut self, frame_id: FrameId) {
         self.dynamics.remove(&frame_id);
-        self.mru_len = 0; // invalidate — cached entries may reference this frame
+        self.mru_len = 0;
     }
 
     pub fn finalize(&mut self) {
@@ -190,28 +180,22 @@ impl AddressIndex {
         }
     }
 
-    // primary lookup: MRU → dynamics (locals shadow) → statics (binary search).
-    // 8-slot MRU cache with LRU promotion eliminates ~90% of binary searches.
     #[inline(always)]
     pub fn lookup(&mut self, addr: u64) -> Option<LookupResult<'_>> {
-        // MRU probe
         for slot in 0..self.mru_len {
             if let Some(ref entry) = self.mru[slot] {
                 if entry.contains(addr) {
                     let lo = entry.lo();
-                    // promote to MRU[0]
                     if slot > 0 {
                         let e = self.mru[slot].take().unwrap();
                         self.mru.copy_within(0..slot, 1);
                         self.mru[0] = Some(e);
                     }
-                    // resolve the entry to a LookupResult
                     return self.resolve_mru(0, addr, lo);
                 }
             }
         }
 
-        // MRU miss: search dynamics first (locals shadow globals)
         let dyn_hit = self.lookup_dynamics(addr);
         if let Some((frame_id, local_idx, lo, hi)) = dyn_hit {
             self.push_mru(MruEntry::Dynamic { lo, hi, frame_id, local_idx });
@@ -224,7 +208,6 @@ impl AddressIndex {
             });
         }
 
-        // static tier: binary search
         let stat_hit = self.lookup_statics(addr);
         if let Some((idx, lo, hi)) = stat_hit {
             self.push_mru(MruEntry::Static { lo, hi, idx });
@@ -271,10 +254,8 @@ impl AddressIndex {
         self.mru_len = (self.mru_len + 1).min(MRU_SLOTS);
     }
 
-    // scan all active frames for a matching local. returns best match
-    // (highest rank, narrowest). typically <10 frames, <5 locals each.
     fn lookup_dynamics(&self, addr: u64) -> Option<(FrameId, usize, u64, u64)> {
-        let mut best: Option<(FrameId, usize, u64, u64, u64)> = None; // (fid, li, lo, hi, span)
+        let mut best: Option<(FrameId, usize, u64, u64, u64)> = None;
         for (&fid, frame_ivs) in &self.dynamics {
             for (li, iv) in frame_ivs.iter().enumerate() {
                 if addr >= iv.lo && addr < iv.hi {
@@ -292,7 +273,6 @@ impl AddressIndex {
         best.map(|(fid, li, lo, hi, _)| (fid, li, lo, hi))
     }
 
-    // binary search on sorted statics. same logic as before but cleaner.
     fn lookup_statics(&self, addr: u64) -> Option<(usize, u64, u64)> {
         let idx = self.statics.partition_point(|iv| iv.lo <= addr);
         if idx == 0 {

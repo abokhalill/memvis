@@ -165,7 +165,6 @@ pub fn resolve_location(
 fn resolve_expr(expr: &DwarfExprOp, regs: &[u64; 18], frame_base: u64, cfa: bool) -> Option<u64> {
     match expr {
         DwarfExprOp::DerefRegOffset { reg, offset, .. } => {
-            // no target memory access — return pre-deref address for index lookup
             dwarf_reg_to_index(*reg).map(|i| (regs[i] as i64).wrapping_add(*offset) as u64)
         }
         DwarfExprOp::RegPlusReg { r1, off1, r2, off2 } => {
@@ -208,7 +207,6 @@ fn eval_stack_machine(
             ExprStep::Addr(a) => stack.push(*a),
             ExprStep::CFA => stack.push(compute_cfa(regs)),
             ExprStep::Deref(_size) => {
-                // can't read target memory — leave address on stack (best effort)
                 if stack.is_empty() {
                     return None;
                 }
@@ -342,7 +340,6 @@ fn eval_stack_machine(
                 if len < 3 {
                     return None;
                 }
-                // top three: [a, b, c] (c=TOS) -> [c, a, b]
                 let c = stack[len - 1];
                 stack[len - 1] = stack[len - 2];
                 stack[len - 2] = stack[len - 3];
@@ -359,7 +356,6 @@ fn eval_stack_machine(
         }
     }
 
-    // stack_value = result is value, not address — not indexable
     if is_stack_value {
         return None;
     }
@@ -416,7 +412,6 @@ pub struct DwarfInfo {
 }
 
 impl DwarfInfo {
-    // range lookup: find function containing pc via BTreeMap upper_bound.
     pub fn func_containing(&self, pc: u64) -> Option<&FunctionMeta> {
         use std::ops::Bound;
         self.functions
@@ -449,7 +444,6 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         Ok(EndianSlice::new(data, LittleEndian))
     };
 
-    // lowest PT_LOAD vaddr = ELF base (typically 0 for PIE)
     let elf_base_vaddr = obj
         .segments()
         .filter_map(|s| {
@@ -490,7 +484,6 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
             }
         }
 
-        // second pass: attach locals to their parent subprograms and inlines
         extract_locals(&dw, &unit, &mut functions)?;
     }
 
@@ -969,8 +962,6 @@ fn extract_struct_fields<'a>(
     struct_offset: UnitOffset,
     parent_depth: u32,
 ) -> Vec<FieldInfo> {
-    // cap nested struct field extraction to avoid stack overflow on
-    // deeply nested types (e.g. kernel sched.c: rq -> cfs_rq -> sched_entity)
     if parent_depth >= 2 {
         return Vec::new();
     }
@@ -1002,8 +993,6 @@ fn extract_struct_fields<'a>(
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
-        // propagate depth through resolve_type_at, not resolve_type
-        // (resolve_type resets depth to 0, causing unbounded recursion)
         let type_ref = entry
             .attr_value(gimli::DW_AT_type)
             .ok()
@@ -1034,7 +1023,6 @@ fn extract_struct_fields<'a>(
     fields
 }
 
-// resolve DW_AT_type chain. peels typedef/const/volatile up to 8 levels.
 fn resolve_type<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
@@ -1128,7 +1116,6 @@ fn resolve_type_at<'a>(
             _ => return None,
         };
         let mut resolved = resolve_type_at(dwarf, unit, inner_ref, depth + 1)?;
-        // propagate typedef name to anonymous inner type
         if let Some(td_name) = typedef_name {
             if resolved.name == "<anon>" || resolved.name.is_empty() {
                 resolved.name = td_name;
@@ -1143,7 +1130,6 @@ fn resolve_type_at<'a>(
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
-        // resolve element type for name and size
         let elem_type = entry
             .attr_value(gimli::DW_AT_type)
             .ok()

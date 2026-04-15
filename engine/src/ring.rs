@@ -1,5 +1,4 @@
 // SPDX-License-Identifier: MIT
-// multi-ring orchestrator. control shm discovery, N-way merge.
 
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{mem, ptr};
@@ -19,8 +18,8 @@ pub struct Event {
     pub thread_id: u16,
     pub seq: u16,
     pub value: u64,
-    pub kind_flags: u32, // kind:8 | flags:8 | seq_hi:16
-    pub rip_lo: u32,     // app PC offset from module base
+    pub kind_flags: u32,
+    pub rip_lo: u32,
 }
 const _: () = assert!(mem::size_of::<Event>() == 32);
 
@@ -190,7 +189,6 @@ impl ThreadRing {
         true
     }
 
-    // pop up to `max` events. single head load, single tail store.
     pub fn batch_pop(&self, max: usize, out: &mut Vec<Event>) -> usize {
         let hdr = self.header();
         let mask = (hdr.capacity - 1) as u64;
@@ -215,8 +213,8 @@ pub struct RingOrchestrator {
     ctl: Option<MappedShm>,
     pub rings: Vec<ThreadRing>,
     known_count: u32,
-    rr_idx: usize,         // round-robin index for batch_drain
-    drain_tmp: Vec<Event>, // reusable scratch buffer for batch_drain
+    rr_idx: usize,
+    drain_tmp: Vec<Event>,
 }
 
 impl RingOrchestrator {
@@ -263,8 +261,6 @@ impl RingOrchestrator {
             let entry = &hdr.threads[idx];
             let state = entry.state.load(Ordering::Acquire);
             if state == THREAD_STATE_INITIALIZING {
-                // Producer is still writing shm_name/thread_id into this slot.
-                // Don't advance known_count — retry on next poll.
                 break;
             }
             self.known_count += 1;
@@ -307,9 +303,6 @@ impl RingOrchestrator {
             }
         }
 
-        // re-scan known slots for state transitions:
-        // - DEAD: mark the consumer-side ring as no longer alive
-        // - ACTIVE with unknown thread_id: reclaimed slot, attach new ring
         for entry_idx in 0..count as usize {
             let entry = &hdr.threads[entry_idx];
             let state = entry.state.load(Ordering::Acquire);
@@ -322,7 +315,6 @@ impl RingOrchestrator {
                     r.alive = false;
                 }
             } else if state == THREAD_STATE_ACTIVE {
-                // check if we already have a ring for this thread
                 let tid = entry.thread_id;
                 let already_known = self.rings.iter().any(|r| r.thread_id == tid && r.alive);
                 if !already_known {
@@ -376,9 +368,8 @@ impl RingOrchestrator {
         self.rings.iter().filter(|r| r.alive).count()
     }
 
-    // adaptive backpressure: shed reads when ring fill > 6/8, resume at < 3/8
     pub fn update_backpressure(&self) {
-        const BP_HIGH: u32 = 6; // eighths
+        const BP_HIGH: u32 = 6;
         const BP_LOW: u32 = 3;
         for ring in &self.rings {
             let hdr = ring.header();
@@ -394,8 +385,6 @@ impl RingOrchestrator {
         }
     }
 
-    // batch drain: pop up to `per_ring` events from each ring, round-robin start.
-    // returns total events drained. caller processes via callback.
     pub fn batch_drain(&mut self, per_ring: usize, buf: &mut Vec<(usize, Event)>) -> usize {
         let n = self.rings.len();
         if n == 0 {

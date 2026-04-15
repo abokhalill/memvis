@@ -1,12 +1,10 @@
 // SPDX-License-Identifier: MIT
-// Heap graph autonomous discovery.
-// pointer-chasing type reconstructor, passive from write stream.
+// heap graph: pointer-chasing type reconstructor, passive from write stream.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
 
 use crate::dwarf::{DwarfInfo, TypeInfo};
 
-// oracle: classify addresses as heap vs stack vs module.
 pub struct HeapOracle {
     module_ranges: Vec<(u64, u64)>,
     stack_bounds: HashMap<u16, (u64, u64)>,
@@ -31,7 +29,6 @@ impl HeapOracle {
             return;
         }
         let hi = base.saturating_add(size);
-        // merge overlapping
         if let Some(last) = self.module_ranges.last_mut() {
             if base <= last.1 {
                 last.1 = last.1.max(hi);
@@ -45,12 +42,10 @@ impl HeapOracle {
     pub fn update_stack(&mut self, tid: u16, rsp: u64) {
         let entry = self.stack_bounds.entry(tid).or_insert((rsp, rsp));
         entry.0 = entry.0.min(rsp);
-        // stack top: rsp + 128K heuristic (red zone + typical frame depth)
         entry.1 = entry.1.max(rsp.saturating_add(128 * 1024));
     }
 
     pub fn is_heap(&self, addr: u64) -> bool {
-        // not in any module
         if self
             .module_ranges
             .binary_search_by(|&(lo, hi)| {
@@ -66,7 +61,6 @@ impl HeapOracle {
         {
             return false;
         }
-        // not on any thread's stack
         if self
             .stack_bounds
             .values()
@@ -74,7 +68,6 @@ impl HeapOracle {
         {
             return false;
         }
-        // plausible userspace pointer (above 0x1000, below kernel space)
         (0x1000..0x0000_8000_0000_0000).contains(&addr)
     }
 
@@ -83,7 +76,6 @@ impl HeapOracle {
     }
 }
 
-// per-field observed data
 #[derive(Debug, Clone)]
 pub struct HeapFieldInfo {
     pub size: u32,
@@ -93,7 +85,6 @@ pub struct HeapFieldInfo {
     pub last_seq: u64,
 }
 
-// a pointer edge in the heap graph
 #[derive(Debug, Clone)]
 pub struct HeapEdge {
     pub source_addr: u64,
@@ -103,7 +94,6 @@ pub struct HeapEdge {
     pub write_count: u32,
 }
 
-// inferred heap object
 #[derive(Debug, Clone)]
 pub struct HeapObject {
     pub base_addr: u64,
@@ -116,7 +106,6 @@ pub struct HeapObject {
     pub last_seq: u64,
 }
 
-// recent write record for clustering
 struct RecentWrite {
     addr: u64,
     size: u32,
@@ -131,7 +120,6 @@ const TYPE_INFERENCE_INTERVAL: u64 = 10_000;
 
 pub struct HeapGraph {
     objects: BTreeMap<u64, HeapObject>,
-    // reverse index: addr → object base
     addr_to_base: BTreeMap<u64, u64>,
     recent_writes: VecDeque<RecentWrite>,
     events_since_inference: u64,
@@ -167,13 +155,10 @@ impl HeapGraph {
         self.objects.values().map(|o| o.outgoing_edges.len()).sum()
     }
 
-    // find the object containing addr, if any
     fn find_object_base(&self, addr: u64) -> Option<u64> {
-        // check reverse index first
         if let Some(&base) = self.addr_to_base.get(&addr) {
             return Some(base);
         }
-        // scan: find object whose range covers addr
         use std::ops::Bound;
         self.objects
             .range((Bound::Unbounded, Bound::Included(&addr)))
@@ -182,7 +167,6 @@ impl HeapGraph {
             .map(|(&base, _)| base)
     }
 
-    // process a single heap write event
     pub fn process_write(
         &mut self,
         addr: u64,
@@ -194,7 +178,6 @@ impl HeapGraph {
         self.total_events += 1;
         self.events_since_inference += 1;
 
-        // record for clustering
         self.recent_writes.push_back(RecentWrite {
             addr,
             size,
@@ -205,7 +188,6 @@ impl HeapGraph {
             self.recent_writes.pop_front();
         }
 
-        // try to assign to existing object
         if let Some(base) = self.find_object_base(addr) {
             let obj = self.objects.get_mut(&base).unwrap();
             let offset = addr - base;
@@ -222,14 +204,12 @@ impl HeapGraph {
             field.is_pointer = size == 8 && oracle.is_plausible_ptr(value);
             obj.last_seq = seq;
 
-            // pointer edge tracking
             if field.is_pointer && value != 0 {
                 self.update_edge(base, offset, addr, value, seq);
             }
             return;
         }
 
-        // clustering: check if nearby writes suggest a new object
         let nearby: Vec<&RecentWrite> = self
             .recent_writes
             .iter()
@@ -256,7 +236,6 @@ impl HeapGraph {
                     last_seq: seq,
                 };
 
-                // backfill fields from recent writes (including current)
                 for w in &nearby {
                     let offset = w.addr - base;
                     self.addr_to_base.insert(w.addr, base);
@@ -274,7 +253,6 @@ impl HeapGraph {
                     field.is_pointer = is_ptr;
                 }
 
-                // create edges for any pointer fields discovered
                 for (&off, f) in &obj.fields {
                     if f.is_pointer && f.last_value != 0 {
                         obj.outgoing_edges.push(HeapEdge {
@@ -297,7 +275,6 @@ impl HeapGraph {
             Some(o) => o,
             None => return,
         };
-        // update existing edge or insert new
         if let Some(edge) = obj
             .outgoing_edges
             .iter_mut()
@@ -321,7 +298,6 @@ impl HeapGraph {
         self.events_since_inference >= TYPE_INFERENCE_INTERVAL && !self.objects.is_empty()
     }
 
-    // match observed heap objects against DWARF struct definitions
     pub fn run_type_inference(&mut self, dwarf: &DwarfInfo) {
         self.events_since_inference = 0;
         let candidates = collect_struct_types(dwarf);
@@ -341,7 +317,6 @@ impl HeapGraph {
         }
     }
 
-    // GC: remove stale objects not written in a long time
     pub fn gc_stale(&mut self, current_seq: u64, max_age: u64) {
         let threshold = current_seq.saturating_sub(max_age);
         let stale: Vec<u64> = self
@@ -360,7 +335,6 @@ impl HeapGraph {
     }
 }
 
-// type inference helpers
 
 struct StructCandidate {
     name: String,
@@ -427,7 +401,6 @@ fn match_struct_type(obj: &HeapObject, candidates: &[StructCandidate]) -> (Strin
         }
 
         let score = matches as f32 / total as f32;
-        // bonus for size match
         let size_bonus = if obj.inferred_size == c.byte_size {
             0.1
         } else {
