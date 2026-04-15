@@ -2,12 +2,11 @@
 
 The engine is the consumer process. It is a Rust binary (`memvis`) that
 attaches to the tracer's shared memory rings, drains events, correlates them
-with DWARF debug information, and renders a live view of the target program's
-memory state.
+with DWARF debug information, and renders a live, structure-aware view of
+the target program's memory state.
 
-This document covers each subsystem: DWARF parsing, ring orchestration,
-address indexing, shadow register file, heap graph, world state management,
-and rendering. All claims are derived from the current `engine/src/` source.
+This document covers each subsystem. All claims are derived from the current
+`engine/src/` source.
 
 ## Subsystems
 
@@ -17,7 +16,7 @@ and rendering. All claims are derived from the current `engine/src/` source.
                        |    dwarf.rs      |
                        +--------+---------+
                                 |
-                         DwarfInfo (globals, functions, locals, types)
+                      DwarfInfo + type_registry
                                 |
                                 v
 +------------------+   +------------------+   +------------------+
@@ -31,15 +30,17 @@ and rendering. All claims are derived from the current `engine/src/` source.
                             |         |                 v
                      HeapGraph    HeapOracle   +------------------+
                      heap_graph.rs             |  Renderer        |
-                                               |  tui.rs (TUI)    |
-                                               |  main.rs (text)  |
-                                               +------------------+
+                            |                  |  tui.rs (TUI)    |
+                     ShadowTypeMap (STM)       |  main.rs (text)  |
+                     HeapAllocTracker          +------------------+
+                     Visual ASan
+                     world.rs
 ```
 
 ## DWARF parser (`dwarf.rs`)
 
 The DWARF parser runs once at startup. It reads the target ELF binary and
-extracts three categories of information.
+extracts four categories of information.
 
 ### Globals
 
@@ -69,6 +70,13 @@ pub struct TypeInfo {
     pub fields: Vec<FieldInfo>,
 }
 ```
+
+### Type registry
+
+After parsing, `register_recursive` builds a `HashMap<String, TypeInfo>`
+mapping struct/union names to their full `TypeInfo`. Only non-empty,
+non-pointer types with `byte_size > 0` are registered. This registry is
+used by the Shadow Type Map and RTR to resolve pointee types at runtime.
 
 ### Location tables
 
@@ -144,19 +152,28 @@ With `per_ring = 20,000` and 6 rings, a single call can return up to
 ### Backpressure
 
 After each drain: computes fill in eighths per ring. Sets `backpressure = 1`
-(release) when fill ≥ 6/8, clears when fill < 3/8. The tracer reads this
+(release) when fill >= 6/8, clears when fill < 3/8. The tracer reads this
 with relaxed ordering and sheds `READ` events.
 
 ## Address index (`index.rs`)
 
-Sorted interval map resolving addresses to named variables in O(log N).
+Two-tier sorted interval map resolving addresses to named variables in O(log N).
 
-### Two-tier design
+### Tier 1: Static globals
 
-1. **Static globals.** Inserted once after DWARF parsing and relocation.
-   Never removed.
-2. **Dynamic locals.** Inserted on CALL, removed on RETURN. Tagged with
-   `frame_id` for batch removal.
+Inserted once after DWARF parsing and relocation into a sorted
+`Vec<Interval>`. Binary search for O(log N) lookup. Never removed.
+
+### Tier 2: Dynamic locals
+
+Inserted on CALL, removed on RETURN. Stored in
+`HashMap<FrameId, Vec<Interval>>` for O(1) frame removal. Scanned linearly
+on lookup (typically <10 frames, <5 locals each).
+
+### MRU cache
+
+8-slot MRU cache shared across both tiers with LRU promotion. Each entry
+is either `Static { lo, hi, idx }` or `Dynamic { lo, hi, frame_id, local_idx }`.
 
 ### Lookup priority
 
@@ -166,8 +183,8 @@ On overlapping intervals, `lookup(addr)` prefers:
 
 ### Finalization
 
-`finalize()` re-sorts the interval vector. Deferred to end of each batch
-drain cycle (not per-event) to amortize sorting cost.
+`finalize()` re-sorts the static interval vector. Deferred to end of each
+batch drain cycle (not per-event) to amortize sorting cost.
 
 ## Shadow Register File (`shadow_regs.rs`)
 
@@ -229,20 +246,28 @@ Autonomous heap object discovery from the write event stream.
 Classifies addresses as heap, stack, or module:
 - **Module**: Falls within any `(base, base+size)` range from loaded modules.
 - **Stack**: Falls within any thread's `(min_rsp, max_rsp + 128KB)` range.
-- **Heap**: Plausible userspace pointer (≥0x1000, <0x0000_8000_0000_0000)
+- **Heap**: Plausible userspace pointer (>=0x1000, <0x0000_8000_0000_0000)
   that is neither module nor stack.
 
 ### Object discovery via clustering
 
 `process_write` maintains a sliding window of recent writes
-(`CLUSTER_WINDOW = 64`). When ≥3 writes fall within `CLUSTER_RADIUS = 256`
+(`CLUSTER_WINDOW = 64`). When >=3 writes fall within `CLUSTER_RADIUS = 256`
 bytes of each other and target heap addresses, a new `HeapObject` is created
 with the minimum address as base and the span as inferred size.
+
+### Field value storage
+
+Each `HeapObject` stores a `BTreeMap<u64, HeapFieldInfo>` mapping field
+offsets to their last-known values, sizes, write counts, and pointer flags.
+This is the data source for Retrospective Type Reconciliation — RTR reads
+`last_value` from these fields to discover pointer chains without additional
+tracer events.
 
 ### Pointer edge tracking
 
 Fields where `size == 8` and the value is a plausible pointer are tagged as
-pointer fields. `HeapEdge`s track source→target relationships with write
+pointer fields. `HeapEdge`s track source->target relationships with write
 counts.
 
 ### Type inference
@@ -250,16 +275,163 @@ counts.
 Periodically (`TYPE_INFERENCE_INTERVAL = 10,000` events), `run_type_inference`
 matches observed field layouts against DWARF struct definitions. Each
 candidate is scored by field-offset/size match ratio with a 10% bonus for
-exact size match. Objects with score ≥0.5 get a type annotation.
+exact size match. Objects with score >=0.5 get a type annotation.
+
+### Lifecycle integration
+
+`on_free(addr, size)` removes all objects whose base address falls within
+the freed range, and purges their entries from `addr_to_base`.
 
 ### Garbage collection
 
 `gc_stale(current_seq, max_age)` evicts objects not written within `max_age`
 sequence numbers. Called every 65,536 events with `max_age = 500,000`.
 
+## Shadow Type Map (`world.rs`)
+
+The STM is a `HashMap<u64, TypeProjection>` mapping heap addresses to
+authoritative DWARF type projections. Each projection stores:
+
+```rust
+pub struct TypeProjection {
+    pub base_addr: u64,
+    pub type_info: TypeInfo,
+    pub source_name: String,
+    pub stamp_seq: u64,
+}
+```
+
+### Stamp paths
+
+1. **Direct stamp** (`stamp_type`): When a DWARF-typed pointer global or
+   local writes a non-zero value to a heap address, the pointee's struct
+   type is looked up in `type_registry` and stamped. Returns `true` if this
+   is a new stamp (address was not previously in the map).
+
+2. **Field propagation** (`propagate_field_write`): When a write hits an
+   address covered by an existing STM projection, and the written field is
+   a pointer whose pointee type exists in `type_registry`, the engine stamps
+   the written value with the pointee type.
+
+3. **Size-validation sentinel** (`HeapAllocTracker::check_size`): Before
+   stamping, if the type's `byte_size` exceeds the known allocation size,
+   a `SizeMismatch` is recorded but the stamp still proceeds (last-write-wins).
+
+### Purge
+
+`purge_range(addr, size)` removes all projections whose `base_addr` falls
+within `[addr, addr + size)`. Called on every confirmed FREE event.
+
+## Retrospective Type Reconciliation (`world.rs`)
+
+`ShadowTypeMap::retrospective_scan` performs a bounded BFS from a
+freshly-stamped address:
+
+```
+queue = [seed_addr]
+stamped = 0
+while queue not empty AND stamped < 64:
+    base = queue.pop_front()
+    proj = stm.get(base)           // must be stamped
+    obj  = heap_graph.find(base)   // must have observed fields
+    for each pointer field in proj.type_info.fields:
+        val = obj.fields[field.byte_offset].last_value
+        if val != 0 AND val not in stm AND val in live_allocs:
+            pointee_type = type_registry[field.type_info.name.strip_prefix('*')]
+            stm.stamp(val, pointee_type, field.name, seq)
+            stamped += 1
+            queue.push_back(val)
+```
+
+The fuel budget (64 nodes) prevents latency spikes on large graphs. The BFS
+uses `find_object_base` on the HeapGraph to handle cases where the STM stamp
+address differs from the HeapGraph's clustering base, adjusting field offsets
+by the delta.
+
+**Effect**: The instant a global pointer is assigned to the head of a linked
+list, RTR discovers and types every reachable node in the chain — even if
+the list was built before tracing began.
+
+## Allocator lifecycle (`world.rs`)
+
+`HeapAllocTracker` tracks live allocations in a `BTreeMap<u64, u64>` (addr
+to size), enabling O(log N) range queries via `containing_alloc`.
+
+### Event handling
+
+- **ALLOC** (kind 9): `on_alloc(ptr, size)` inserts the allocation.
+  Size is read from `ev.size` (32-bit field).
+- **FREE** (kind 10): `on_free(ptr)` removes the allocation and returns
+  the old size. If no matching ALLOC exists (orphan free), the counter
+  `orphan_frees` is incremented but the STM is **not** purged.
+
+### Orphan free policy
+
+Orphan frees occur when the ALLOC event was dropped due to ring backpressure.
+Purging the STM on an orphan free would cause "type blindness" — typed nodes
+silently vanishing from the output. The conservative policy (count but don't
+purge) preserves type information until the address is overwritten or freed
+with a matching allocation.
+
+### Headless output
+
+The status line includes allocation metrics:
+```
+allocs {total_allocs}/{total_frees} live {live_count} [orphan_free={orphan_frees}]
+```
+
+## Visual ASan (`world.rs`)
+
+On every heap write, `check_write_bounds(addr, write_size, stm)` checks
+whether the write stays within a live allocation boundary.
+
+### Hazard classification
+
+```rust
+pub enum HazardKind {
+    OutOfBounds,  // write starts in alloc, extends past end
+    HeapHole,     // write addr between allocations (UAF / wild write)
+}
+```
+
+### Symbolic intent
+
+For OOB hazards, the engine looks up the STM projection covering the write
+address. If found, it reports the type name and specific field name, enabling
+output like:
+
+```
+OOB  0x...40 +8B exceeds alloc [0x...20..+24] by 8B (intended for node_t.next)
+```
+
+### Heap-hole filtering
+
+HeapHole hazards are only reported if the write address falls within the
+span `[min_alloc_addr, max_alloc_addr + max_alloc_size)`. This prevents
+false positives from globals and stack addresses that `HeapOracle` loosely
+classifies as heap.
+
+### Deduplication
+
+Hazards are deduplicated by `write_addr` — if a previous hazard exists for
+the same address, the new one is suppressed. Total hazard count is capped
+at 64 to bound memory usage.
+
 ## World state (`world.rs`)
 
 The engine's in-memory model of the target program's observable state.
+
+### WorldState
+
+```rust
+pub struct WorldState {
+    inner: Arc<WorldInner>,
+    pub cl_tracker: CacheLineTracker,
+    pub stm: ShadowTypeMap,
+    pub heap_allocs: HeapAllocTracker,
+    pub hazards: Vec<HeapHazard>,
+}
+```
 
 ### WorldInner
 
@@ -270,9 +442,12 @@ pub struct WorldInner {
     pub insn_counter: u64,
     pub reg_file: LiveRegisterFile,
     pub cache_heat: CacheHeatmap,
-    pub cl_tracker: CacheLineTracker,
 }
 ```
+
+Note: `cl_tracker`, `stm`, `heap_allocs`, and `hazards` are on `WorldState`
+(mutable), not `WorldInner` (snapshotted). This is intentional — these
+structures are only needed by the event processor, not the renderer.
 
 ### Node IDs
 
@@ -346,14 +521,16 @@ Central dispatch for all event types:
 
 | Event | Action |
 |---|---|
-| `WRITE` (0) | `shadow_regs.check_coherence`. `heap_oracle.update_stack` (if stack addr). `heap_graph.process_write` (if heap addr). `addr_index.lookup` → `world.update_value` + `world.update_edge`. `cl_tracker.record_write`. |
+| `WRITE` (0) | `cl_tracker.record_write`. `shadow_regs.check_coherence`. If heap: `heap_graph.process_write`, `stm.propagate_field_write` (+ RTR on new stamp), `heap_allocs.check_write_bounds` (Visual ASan). `addr_index.lookup` -> `world.update_value` + `world.update_edge`. If pointer to heap: `stm.stamp_type` + RTR scan. |
 | `READ` (1) | Journal only (no state mutation). |
 | `CALL` (2) | DWARF function lookup (relocated PC). Push shadow frame. Insert locals into index. |
 | `RETURN` (3) | Pop shadow frame. Remove locals. Queue deferred node removal. |
 | `REG_SNAPSHOT` (5) | Pop 6 continuation events. Unpack 18 registers. `shadow_regs.on_snapshot`. `world.reg_file` update. |
 | `CACHE_MISS` (6) | `addr_index.lookup`. Record miss in `cache_heat`. |
-| `MODULE_LOAD` (7) | Compute relocation delta. Re-populate globals with relocated addresses. |
+| `MODULE_LOAD` (7) | Compute relocation delta. Re-populate globals with relocated addresses. Register heap oracle module range. |
 | `TAIL_CALL` (8) | Like CALL but does not push a new shadow frame (replaces current). |
+| `ALLOC` (9) | `heap_allocs.on_alloc(ptr, size)`. Size read from `ev.size` (32-bit). |
+| `FREE` (10) | `heap_allocs.on_free(ptr)`. If matched: `stm.purge_range` + `heap_graph.on_free`. If orphan: count only, no purge. |
 | `RELOAD` (12) | `shadow_regs.on_reload(reg, value, src_addr, size, seq, rip)`. |
 
 Returns `true` if the event was "interesting" (tracked write or control
@@ -386,13 +563,13 @@ in the TUI header.
 ratatui with crossterm backend. 20 Hz refresh. Six panels:
 
 1. **Header bar.** Instruction counter, event count, node count, edge count,
-   ring count, LAG metric, time-travel indicator, pause indicator, gap
-   warnings.
+   ring count, LAG metric, allocation stats, time-travel indicator, pause
+   indicator, gap warnings.
 2. **Memory map** (top-left, 55%). Variables grouped by cache line. Addresses,
    sizes, type names, values with recency coloring (red <100 events, yellow
    <1K, white <10K, gray older). Pointer values show pointee name. Struct
    fields indented under parent. `FALSE_SHARE T=N` on multi-writer cache
-   lines.
+   lines. STM-typed heap regions shown in HEAP TYPES section.
 3. **Events** (bottom-left, 45%). Filterable journal. Kind labels: W, R,
    CALL, RET, OVF, REG, CMIS, MLOAD, TCAL, RLOD. Thread ID. Address, size,
    value. Auto-scrolls to bottom unless user has scrolled.
@@ -419,21 +596,31 @@ Filter state shown in panel title: `Events [W only, T3]`.
 
 ### Time travel
 
-- `←`/`h`: Step backward through snapshot ring. Auto-pauses.
-- `→`/`l`: Step forward. Returns to live when past latest snapshot.
+- `<-`/`h`: Step backward through snapshot ring. Auto-pauses.
+- `->`/`l`: Step forward. Returns to live when past latest snapshot.
 - `End`: Jump to live (exit time-travel).
 
 ### Headless mode (`--once`)
 
-Plain-text output to stdout. Prints status line every 100 ms. Exits after
-`--min-events` threshold. Used for end-to-end testing and scripting.
+Plain-text output to stdout. Exits via idle-timeout: after events begin
+flowing, if the ring stays empty for 500ms (50 consecutive 10ms polls),
+the engine renders the final snapshot and exits.
+
+Headless output sections:
+1. **Status line**: insn count, events, nodes, edges, rings, LAG, alloc stats.
+2. **Memory map**: variables grouped by cache line.
+3. **HEAP TYPES**: STM projections with field decomposition.
+4. **Size mismatches**: warnings from size-validation sentinel.
+5. **Heap hazards**: OOB and heap-hole detections with symbolic intent.
+6. **Pointer edges**: resolved and dangling pointer relationships.
+7. **Event journal**: last 12 events.
 
 ### LAG metric
 
 | LAG | Color | Meaning |
 |---|---|---|
-| 0–1,000 | Green | Consumer keeping up |
-| 1,001–50,000 | Yellow | Falling behind |
+| 0-1,000 | Green | Consumer keeping up |
+| 1,001-50,000 | Yellow | Falling behind |
 | >50,000 | Red | Significant lag |
 
 Displayed with K/M suffixes.
@@ -442,13 +629,14 @@ Displayed with K/M suffixes.
 
 Full startup when the user runs `memvis <target>`:
 
-1. Parse command-line arguments (`--once`, `--min-events`, `--consumer-only`).
+1. Parse command-line arguments (`--once`, `--consumer-only`).
 2. Locate `drrun` (via `DYNAMORIO_HOME`, `MEMVIS_DRRUN`, or PATH).
 3. Locate `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
 4. Clean up stale `/dev/shm/memvis_*` from previous runs.
 5. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.
 6. Spawn the tracer: `drrun -c libmemvis_tracer.so -- <target> [args]`.
-7. Parse DWARF from the target ELF binary (globals, functions, locals, types).
+7. Parse DWARF from the target ELF binary (globals, functions, locals, types,
+   type_registry).
 8. Poll for `/memvis_ctl` (up to 30 seconds, validating magic + proto).
 9. Discover the first thread ring and attach (validating magic + proto).
 10. Spawn the consumer on a 64 MB stack thread (required for deep DWARF

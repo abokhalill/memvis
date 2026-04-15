@@ -1,31 +1,32 @@
 # Architecture
 
-This document is the authoritative reference for the memvis system architecture.
-All claims are derived from the current implementation in `tracer.c`,
-`memvis_bridge.h`, and `engine/src/`. Protocol version: **3**.
+Authoritative reference for the memvis system architecture. All claims are
+derived from the current implementation in `tracer.c`, `memvis_bridge.h`, and
+`engine/src/`. Protocol version: **3**.
 
 ## System overview
 
 memvis consists of two cooperating OS processes connected by POSIX shared memory:
 
 ```
- +-------------------------------+      /dev/shm/         +------------------------------+
- |           TRACER              | =====================> |            ENGINE            |
- |   (DynamoRIO client, C)       |  per-thread SPSC rings |   (Rust consumer + TUI)      |
- |                               |  control ring          |                              |
- |  tracer.c                     |                        |  engine/src/main.rs          |
- |  memvis_bridge.h              |                        |  engine/src/ring.rs          |
- |                               |                        |  engine/src/dwarf.rs         |
- |  inline pre/post write path   |                        |  engine/src/index.rs         |
- |  clean-call value capture     |                        |  engine/src/world.rs         |
- |  per-thread raw TLS scratch   |                        |  engine/src/shadow_regs.rs   |
- |  adaptive backpressure        |                        |  engine/src/heap_graph.rs    |
- |  tail-call detection          |                        |  engine/src/tui.rs           |
- |  selective reload detection   |                        |  engine/src/lib.rs           |
- +-------------------------------+                        +------------------------------+
-         runs inside                                              runs as the
-      target's address space                                    memvis binary
-       (via DynamoRIO)                                        (separate process)
+ +-------------------------------+      /dev/shm/         +-------------------------------+
+ |           TRACER              | =====================> |            ENGINE             |
+ |   (DynamoRIO client, C)       |  per-thread SPSC rings |   (Rust consumer + TUI)       |
+ |                               |  control ring          |                               |
+ |  tracer.c                     |                        |  engine/src/main.rs           |
+ |  memvis_bridge.h              |                        |  engine/src/ring.rs           |
+ |                               |                        |  engine/src/dwarf.rs          |
+ |  inline pre/post write path   |                        |  engine/src/index.rs          |
+ |  clean-call value capture     |                        |  engine/src/world.rs          |
+ |  per-thread raw TLS scratch   |                        |  engine/src/shadow_regs.rs    |
+ |  adaptive backpressure        |                        |  engine/src/heap_graph.rs     |
+ |  tail-call detection          |                        |  engine/src/tui.rs            |
+ |  selective reload detection   |                        |  engine/src/lib.rs            |
+ |  allocator hooks (drwrap)     |                        |                               |
+ +-------------------------------+                        +-------------------------------+
+         runs inside                                               runs as the
+      target's address space                                     memvis binary
+       (via DynamoRIO)                                         (separate process)
 ```
 
 The **tracer** is a shared library (`libmemvis_tracer.so`) loaded into the
@@ -62,6 +63,10 @@ uses a **hybrid inline/clean-call** strategy:
   away, within main module. Emits TAIL_CALL event (kind 8).
 - **Reloads.** Selective detection: `MOV reg, [mem]` where destination is a
   callee-saved register (RBX, RBP, R12-R15). Emits RELOAD event (kind 12).
+- **Allocator hooks.** `drwrap` intercepts `malloc`, `free`, `realloc`, and
+  `calloc` in libc via `event_module_load`. Pre/post callbacks emit ALLOC
+  (kind 9) and FREE (kind 10) events. `realloc` emits FREE for the old
+  pointer in pre, ALLOC for the new pointer in post.
 
 Each thread gets its own SPSC ring buffer allocated via `shm_open(3)`. Thread
 metadata is published to a control ring (`/memvis_ctl`) so the engine can
@@ -78,13 +83,13 @@ discover new threads at runtime.
 | | 28 | `_pad0` | Reserved |
 | | 32-63 | `_cl0_reserved[4]` | Reserved |
 | CL1 (stats) | 64 | `stat_inline_writes` | Inline write events emitted |
-| | 72 | `stat_reads` | Read events emitted |
-| | 80 | `stat_reloads` | Reload events emitted |
-| | 88 | `stat_calls` | Call events emitted |
-| | 96 | `stat_returns` | Return events emitted |
-| | 104 | `stat_tail_calls` | Tail-call events emitted |
-| | 112 | `stat_dropped` | Events dropped (ring full) |
-| | 120 | `_cl1_reserved` | Reserved |
+| | 72 | `stat_write_slow` | Slow-path writes |
+| | 80 | `stat_reads` | Read events emitted |
+| | 88 | `stat_reloads` | Reload events emitted |
+| | 96 | `stat_calls` | Call events emitted |
+| | 104 | `stat_returns` | Return events emitted |
+| | 112 | `stat_tail_calls` | Tail-call events emitted |
+| | 120 | `stat_dropped` | Events dropped (ring full) |
 
 Stats are per-thread (zero contention). Thread exit drains pad stats into global
 atomics via `atomic_fetch_add`.
@@ -93,19 +98,20 @@ Source files:
 
 | File | Role |
 |---|---|
-| `tracer.c` | DynamoRIO client. Inline write path, clean calls, TLS, stats. |
+| `tracer.c` | DynamoRIO client. Inline write path, clean calls, TLS, allocator hooks, stats. |
 | `memvis_bridge.h` | Shared ABI. Ring protocol, event formats, control ring, scratch pad. |
 
 ### Engine (`engine/`)
 
-The engine is the consumer process. It performs eight tasks:
+The engine is the consumer process. It performs eleven tasks:
 
 1. **DWARF parsing** (`dwarf.rs`). Parses the target ELF binary's
    `.debug_info` section using `gimli`. Extracts global variables, functions,
    local variables, and type information including struct field decomposition
-   (depth-limited to 2 levels). Supports location tables with PC-qualified
-   ranges, `DW_OP_piece` fragments, and a full stack-machine evaluator for
-   complex expressions.
+   (depth-limited to 2 levels). Builds a `type_registry` mapping struct names
+   to their full `TypeInfo` for use by the Shadow Type Map. Supports location
+   tables with PC-qualified ranges, `DW_OP_piece` fragments, and a full
+   stack-machine evaluator for complex expressions.
 
 2. **Ring orchestration** (`ring.rs`). Attaches to the control ring with
    protocol version handshake (`MEMVIS_PROTO_VERSION = 3`). Discovers
@@ -113,10 +119,11 @@ The engine is the consumer process. It performs eight tasks:
    events per ring per cycle, amortizing atomic overhead to 2 atomics per
    ring per batch).
 
-3. **Address indexing** (`index.rs`). Maintains a sorted interval map that
-   maps memory addresses to named variables in O(log N). Two tiers: static
-   globals (inserted once) and dynamic locals (inserted on CALL, removed on
-   RETURN). Locals shadow globals on address overlap.
+3. **Address indexing** (`index.rs`). Two-tier sorted interval map that maps
+   memory addresses to named variables in O(log N). Tier 1 (static): globals
+   in a sorted `Vec<Interval>`, finalized once. Tier 2 (dynamic): stack
+   locals in `HashMap<FrameId, Vec<Interval>>`, O(1) frame removal. 8-slot
+   MRU cache shared across both tiers.
 
 4. **Shadow Register File** (`shadow_regs.rs`). Per-thread register tracking
    with six confidence tiers: Observed, ABI-Inferred, WriteBack, Speculative,
@@ -125,22 +132,53 @@ The engine is the consumer process. It performs eight tasks:
    variables.
 
 5. **Heap graph** (`heap_graph.rs`). Autonomous heap object discovery via
-   write-stream clustering (window=64, radius=256B, min 3 writes). Infers
-   struct types by matching observed field layouts against DWARF type
-   definitions. Periodic GC evicts stale objects.
+   write-stream clustering (window=64, radius=256B, min 3 writes). Stores
+   `last_value` per field offset for RTR consumption. Infers struct types by
+   matching observed field layouts against DWARF type definitions. Tracks
+   pointer edges. `on_free(addr, size)` purges objects within freed ranges.
 
-6. **World state** (`world.rs`). Maintains current values of all tracked
-   variables, pointer edges, live register file, cache-line contention
-   tracker (with periodic decay via `tick()`), and cache miss heatmap. Uses
-   copy-on-write (`Arc::make_mut`) snapshotting for lock-free rendering.
-   Circular snapshot ring (512 entries) for time-travel.
+6. **Shadow Type Map** (`world.rs`, `ShadowTypeMap`). Maps heap addresses to
+   authoritative DWARF type projections. Populated by two paths:
+   - **Direct stamp**: When a DWARF-typed pointer writes to a heap address,
+     the pointee's struct type is stamped onto the target.
+   - **Field propagation** (`propagate_field_write`): When a write hits an
+     address covered by an existing stamp, pointer fields trigger recursive
+     stamping of the written value.
+   `purge_range(addr, size)` removes projections when memory is freed.
 
-7. **TUI rendering** (`tui.rs`). Interactive ratatui terminal UI at 20 Hz
-   with six panels: Memory Map, Events (filterable), Shadow Registers, Call
-   Stacks, Heap Objects, footer. Time-travel scrubbing via snapshot ring.
+7. **Retrospective Type Reconciliation** (`world.rs`,
+   `ShadowTypeMap::retrospective_scan`). On a fresh stamp, performs a bounded
+   BFS (fuel=64 nodes) through the HeapGraph's last-known pointer field
+   values. For each pointer field whose value is a live allocation and not
+   yet stamped, the pointee type is resolved from `type_registry` and
+   stamped. This discovers entire data structures (linked lists, trees)
+   retroactively, even if they were built before tracing began.
 
-8. **Headless rendering** (`main.rs`). Plain-text output mode (`--once`) for
-   scripting and end-to-end testing.
+8. **Allocator lifecycle** (`world.rs`, `HeapAllocTracker`). Tracks live
+   allocations in a `BTreeMap<addr, size>` for O(log N) range queries.
+   On FREE: purges STM projections and HeapGraph objects. **Orphan frees**
+   (FREE without matching ALLOC, caused by ring event drops) are counted
+   but do **not** purge — this prevents type blindness. Size-validation
+   sentinel warns when a stamped type exceeds the known allocation size.
+
+9. **Visual ASan** (`world.rs`, `HeapHazard`). On every heap write, checks
+   whether the write stays within a live allocation boundary (O(log N) via
+   `BTreeMap` range query). Two hazard classes:
+   - **OutOfBounds**: Write starts inside an allocation but extends past its
+     end. Reports overflow bytes, type name, and field name.
+   - **HeapHole**: Write address falls between allocations within the known
+     allocation span. Indicates use-after-free or wild write.
+   Hazards are deduplicated by address, capped at 64 entries.
+
+10. **World state** (`world.rs`). Maintains current values of all tracked
+    variables, pointer edges, live register file, cache-line contention
+    tracker, Shadow Type Map, HeapAllocTracker, and hazard log. Uses
+    copy-on-write (`Arc::make_mut`) snapshotting for lock-free rendering.
+    Circular snapshot ring (512 entries) for time-travel.
+
+11. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz
+    with six panels. Headless mode (`--once`) prints final snapshot when
+    the ring goes idle for 500ms after event flow begins.
 
 Source files:
 
@@ -148,11 +186,11 @@ Source files:
 |---|---|
 | `engine/src/main.rs` | Entry point, event loop, headless renderer, signal handling. |
 | `engine/src/ring.rs` | SHM mapping, ring consumer, orchestrator, proto validation. |
-| `engine/src/dwarf.rs` | DWARF parser: globals, functions, locals, types, locations. |
-| `engine/src/index.rs` | Sorted interval map. O(log N) address-to-variable lookup. |
-| `engine/src/world.rs` | World state, CoW snapshots, snapshot ring, cache tracking. |
+| `engine/src/dwarf.rs` | DWARF parser: globals, functions, locals, types, type_registry. |
+| `engine/src/index.rs` | Two-tier interval map. O(log N) address-to-variable lookup. |
+| `engine/src/world.rs` | WorldState, STM, RTR, HeapAllocTracker, Visual ASan, CoW snapshots. |
 | `engine/src/shadow_regs.rs` | Shadow Register File, confidence tiers, piece assembler. |
-| `engine/src/heap_graph.rs` | Heap object discovery, type inference, GC. |
+| `engine/src/heap_graph.rs` | Heap object discovery, field value storage, pointer edges, GC. |
 | `engine/src/tui.rs` | ratatui TUI: panels, keybindings, event filters, time-travel. |
 | `engine/src/lib.rs` | Crate root. Re-exports all modules. |
 
@@ -161,8 +199,7 @@ Source files:
 The bridge header defines the binary interface between the tracer and engine:
 
 - **Event formats.** Two event structs are defined:
-  - `memvis_event_t` (v2): 32-byte with 64-bit `kind_flags`. Used by
-    `memvis_push_ex` and the ring data functions.
+  - `memvis_event_t` (v2): 32-byte with 64-bit `kind_flags`.
   - `memvis_event_v3_t` (v3): 32-byte with 32-bit `kind_flags` (kind:8 |
     flags:8 | seq_hi:16) and 32-bit `rip_lo` (app PC offset from module
     base). Used by the inline write path for extended sequence numbers.
@@ -170,6 +207,8 @@ The bridge header defines the binary interface between the tracer and engine:
   head and tail cursors on separate cache lines.
 - **Control ring.** Fixed-size structure (256 thread slots) with
   `proto_version` field. Dead-slot reclamation via CAS.
+- **Build hash.** FNV-1a hash of `__DATE__ __TIME__` stored in the ctl header
+  for detecting C/Rust header mismatches.
 
 See [Ring Protocol](ring-protocol.md) for the full specification.
 
@@ -188,7 +227,7 @@ The path of a single memory write event from target program to screen:
      - reserves drreg scratch registers
      - computes EA via drutil_insert_get_mem_addr
      - saves EA to pad.scratch[0]
-     - reserves ring slot inline (head & mask → slot pointer)
+     - reserves ring slot inline (head & mask -> slot pointer)
      - writes metadata: addr, size, tid, seq_lo, kind_flags, rip_lo
      - saves slot pointer to pad.scratch[1]
            |
@@ -203,22 +242,27 @@ The path of a single memory write event from target program to screen:
      - conditionally flushes head to ring header (1/64 events)
            |
            v
- [5] at BB exit: unconditional head flush → ring.head (release store)
+ [5] at BB exit: unconditional head flush -> ring.head (release store)
            |
            v
  [6] engine ring.rs:batch_pop loads ring.head (acquire), reads up to
-     20K events, stores ring.tail (release) — 2 atomics per ring
+     20K events, stores ring.tail (release) -- 2 atomics per ring
            |
            v
- [7] main.rs event dispatch:
-     - shadow_regs.check_coherence(addr, value, size, seq)
-     - heap_graph.process_write(addr, size, value, seq, oracle)
-     - addr_index.lookup(addr) → named variable (O(log N))
-     - world.update_value(node_id, value, insn)
-     - world.update_edge(node_id, value) if pointer type
+ [7] main.rs event dispatch (EVENT_WRITE path):
+     a. cl_tracker.record_write(addr, tid)
+     b. shadow_regs.check_coherence(addr, value, size, seq)
+     c. if heap addr:
+        - heap_graph.process_write(addr, size, value, seq, oracle)
+        - stm.propagate_field_write(addr, value, size, seq, type_registry)
+        - if new stamp: stm.retrospective_scan(value, heap_graph, allocs, registry, seq)
+        - heap_allocs.check_write_bounds(addr, size, stm) -> hazard log
+     d. addr_index.lookup(addr) -> named variable (O(log N))
+     e. world.update_value(node_id, value, insn)
+     f. if pointer: world.update_edge + stm.stamp_type + retrospective_scan
            |
            v
- [8] world.snapshot() → Arc<WorldInner> (ref-count bump, zero copy)
+ [8] world.snapshot() -> Arc<WorldInner> (ref-count bump, zero copy)
      TUI renders snapshot at 20 Hz
 ```
 
@@ -266,9 +310,9 @@ delta = runtime_module_base - elf_base_vaddr
 
 The tracer emits a `MODULE_LOAD` event (kind 7) containing the runtime base
 address. The engine receives this and re-populates all global variable
-addresses by adding the delta. The tracer filters out system libraries (vdso,
-ld-linux, libc, libpthread, libdynamorio) and captures the first non-system
-module as the main executable.
+addresses by adding the delta. The tracer's `event_module_load` callback
+detects libc (for allocator hook installation via `drwrap`) and captures
+the first non-system module as the main executable.
 
 ## Concurrency model
 
@@ -285,7 +329,7 @@ There is no mutex, spinlock, or CAS in the hot path. The only CAS operations
 are:
 - `memvis_ctl_register_thread`: CAS to reclaim DEAD slots (thread creation,
   once per thread lifetime).
-- `g_module_base_phase`: CAS 1→2 to emit MODULE_LOAD (exactly once per
+- `g_module_base_phase`: CAS 1->2 to emit MODULE_LOAD (exactly once per
   process lifetime).
 
 ### Head caching
@@ -305,6 +349,8 @@ ring header's atomic `head` field:
 | Tracer | drmgr | (bundled) | Multi-callback management |
 | Tracer | drutil | (bundled) | Memory operand analysis |
 | Tracer | drreg | (bundled) | Register reservation |
+| Tracer | drwrap | (bundled) | Function wrapping (allocator hooks) |
+| Tracer | drsyms | (bundled) | Symbol lookup (allocator function resolution) |
 | Engine | gimli | 0.31 | DWARF parsing |
 | Engine | object | 0.36 | ELF parsing |
 | Engine | ratatui | 0.29 | Terminal UI |
@@ -313,7 +359,7 @@ ring header's atomic `head` field:
 
 ## Build
 
-### Docker (recommended)
+### Docker
 
 The multi-stage `Dockerfile` builds the tracer (CMake + DynamoRIO SDK) and
 engine (Cargo) in an Ubuntu 22.04 builder stage, then produces a minimal
@@ -337,9 +383,8 @@ process attachment. The builder stage patches
 
 ```sh
 # tracer (requires DynamoRIO SDK)
-mkdir build && cd build
-cmake -DCMAKE_BUILD_TYPE=Release -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake ..
-make -j$(nproc)
+cmake -B build -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake
+cmake --build build -j$(nproc)
 
 # engine
 cd engine && cargo build --release
@@ -348,15 +393,19 @@ cd engine && cargo build --release
 ## Invocation
 
 ```sh
-# launch mode: starts tracer + engine together
+# launch mode: starts tracer + engine together (interactive TUI)
 memvis <target> [args...]
 
-# headless mode: print to stdout, exit after min-events reached
-memvis --once --min-events 50000 <target>
+# headless mode: print final snapshot, exit when target finishes
+memvis --once <target>
 
 # consumer-only mode: engine only (tracer started separately via drrun)
-memvis --consumer-only [--once] [--min-events N] <target.elf>
+memvis --consumer-only [--once] <target.elf>
 ```
+
+Headless mode exits via idle-timeout: after events begin flowing, if the
+ring stays empty for 500ms (50 consecutive 10ms polls), the engine renders
+the final snapshot and exits.
 
 | Variable | Purpose |
 |---|---|

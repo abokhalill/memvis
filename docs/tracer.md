@@ -14,7 +14,8 @@ are derived from the current `tracer.c` and `memvis_bridge.h`.
 
 The tracer entry point is `dr_client_main()`. It performs the following steps:
 
-1. Initializes DynamoRIO extension libraries: `drmgr`, `drutil`, `drreg`.
+1. Initializes DynamoRIO extension libraries: `drmgr`, `drutil`, `drreg`,
+   `drwrap`, `drsyms`.
 2. Registers 6 drmgr TLS fields via `drmgr_register_tls_field`. The returned
    indices are stored in `g_tls_idx[]`.
 3. Registers 8 raw TLS slots via `drmgr_tls_field_request_raw`.
@@ -197,6 +198,25 @@ Memory reads use a buffered strategy to reduce clean_call overhead:
 
 A BB with 10 read instructions produces 10 fast `at_mem_read_buf` calls (no
 ring interaction) plus 1 `flush_read_buf` call (pushes up to 10 events).
+
+### Allocator hooks (`drwrap`)
+
+When `event_module_load` detects a module whose name contains `"libc"`, it
+calls `wrap_alloc_funcs(info)` to install `drwrap` pre/post callbacks on four
+allocator functions:
+
+| Function | Pre callback | Post callback |
+|---|---|---|
+| `malloc` | Stashes `size` arg in `user_data` | Emits ALLOC(`ptr`, `size`) |
+| `free` | Emits FREE(`ptr`) | — |
+| `realloc` | Emits FREE(`old_ptr`) if non-NULL, stashes `new_size` | Emits ALLOC(`new_ptr`, `new_size`) |
+| `calloc` | Stashes `nmemb * size` in `user_data` | Emits ALLOC(`ptr`, `total_size`) |
+
+ALLOC events encode the allocation size in the `size` field (32-bit) and the
+returned pointer in `addr`. FREE events encode the freed pointer in `addr`.
+
+Global counters `g_stat_allocs` and `g_stat_frees` track totals (relaxed
+atomics, printed at process exit).
 
 ## Thread lifecycle
 

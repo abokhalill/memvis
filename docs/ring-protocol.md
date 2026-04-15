@@ -87,8 +87,8 @@ for both formats.
 | `CACHE_MISS` | 6 | Miss address | Cache level | Sample IP | |
 | `MODULE_LOAD` | 7 | Runtime base addr | 0 | 0 | Emitted exactly once |
 | `TAIL_CALL` | 8 | Callee PC | 0 | Frame base (RSP) | JMP >4KB, main module |
-| `ALLOC` | 9 | — | — | — | Reserved (not yet emitted) |
-| `FREE` | 10 | — | — | — | Reserved (not yet emitted) |
+| `ALLOC` | 9 | Pointer returned | Alloc size (bytes) | (unused) | `drwrap` post-malloc/calloc/realloc |
+| `FREE` | 10 | Pointer freed | 0 | 0 | `drwrap` pre-free / pre-realloc(old) |
 | `BB_ENTRY` | 11 | — | — | — | Reserved (not yet emitted) |
 | `RELOAD` | 12 | Source address | Load size | Register index | MOV to callee-saved |
 

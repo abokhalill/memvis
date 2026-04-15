@@ -1,56 +1,79 @@
 # memvis
 
-Real-time memory visualization for Linux x86-64. Instruments a target binary
-at runtime, captures every memory write, read, function call, and return, then
-correlates events with DWARF debug information to produce a live, named view
-of the program's memory state.
+Real-time memory observability for Linux x86-64. Instruments a target binary
+via DynamoRIO, captures every memory write, function call, and return, then
+correlates events with DWARF debug information to produce a live, named,
+structure-aware view of the program's memory state — including heap type
+recovery, out-of-bounds detection, and false-sharing identification.
 
 No source modifications. No recompilation. Point it at a `-g` binary and watch.
 
-## What it shows
+## Capabilities
 
-Headless output (`--once`) on a simple program with three globals and a 300-iteration
-increment loop:
+- **Named memory map.** Every tracked address is resolved to its DWARF
+  variable name, type, struct field, and current value.
+- **Shadow Type Map (STM).** Heap addresses are typed by observing pointer
+  writes from DWARF-typed globals/locals. Recursive field propagation
+  discovers nested structs.
+- **Retrospective Type Reconciliation (RTR).** On a new type stamp, a bounded
+  BFS (fuel=64) walks pointer fields using last-known values from the heap
+  graph. Discovers entire linked lists the instant a global points at the head.
+- **Allocator lifecycle tracking.** `malloc`, `free`, `realloc`, `calloc`
+  hooked via `drwrap`. STM projections are purged on `free()` — no ghost types.
+  Orphan frees (FREE without matching ALLOC) are logged but do not purge,
+  preventing type blindness from dropped ring events.
+- **Visual ASan.** Real-time out-of-bounds and heap-hole (use-after-free)
+  detection with symbolic intent: reports the type, field name, allocation
+  boundary, and overflow size.
+- **False-sharing detection.** Cache-line contention tracker identifies lines
+  written by multiple threads, annotated in the TUI and headless output.
+
+## Example output
+
+Headless output (`--once`) on a linked-list program after partial free (4 of 8
+nodes freed, 4 surviving):
 
 ```
-MEMVIS │ insn 25262 │ events 25262 │ nodes 6 │ edges 2 │ rings 1 │ LAG 0
+MEMVIS │ insn 33010 │ events 33010 │ nodes 2 │ edges 2 │ rings 1 │ LAG 0 │ allocs 9/4 live 5
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 MEMORY MAP
-  ── cacheline 0x7e3f749fe000 ──
-  7e3f749fe018     4B  g_counter            int             val=               12c
-  7e3f749fe01c     4B  g_shared             int             val=               12c
-  7e3f749fe020     8B  g_ptr                *int            val=      7e3f749fe018  → g_counter
-  ── cacheline 0x7fff79ca1a00 ──
-  7fff79ca1a04     4B  n                    int             val=                 0
-  7fff79ca1a08     8B  p                    *int            val=      7e3f749fe018  → g_counter
-  7fff79ca1a1c     4B  i                    int             val=               12c
+  ── cacheline 0x71cad77fe000 ──
+  71cad77fe018     8B  g_head               *node           val=      71cad7800320  → 0x71cad7800320
+  71cad77fe020     8B  g_tail               *node           val=      71cad7800380  → 0x71cad7800380
 
-POINTER EDGES
-  g_ptr ──> g_counter (0x7e3f749fe018)
-  p ──> g_counter (0x7e3f749fe018)
-
-EVENTS (last 12)
-     25254 CALL  T0   7e3f760ee200     0      7fff79ca19e0
-     25255 REG   T0           1830     0                 0
-     25260 REG   T0              1     0                 0
-     25261 REG   T0   7e3f76204fc0     0               202
+HEAP TYPES (Shadow Type Map: 4 projections)
+  71cad7800320    24B  node                 (via g_head)
+    71cad7800320     4B  value                int
+    71cad7800324     4B  flags                int
+    71cad7800328     8B  next                 *node
+    71cad7800330     8B  prev                 *node
+  71cad7800340    24B  node                 (via next)
+    ...
+  71cad7800360    24B  node                 (via next)
+    ...
+  71cad7800380    24B  node                 (via g_tail)
+    ...
 ```
 
+The freed nodes are absent from HEAP TYPES. The surviving chain was discovered
+entirely by RTR; no writes occurred after `g_head` was re-pointed.
+
 The interactive TUI (`ratatui`) renders the same data across six panels at
-20 Hz: memory map, filterable event journal, shadow registers, call stacks,
-heap objects, and a status bar with the LAG metric.
+20 Hz: memory map with STM-typed heap regions, filterable event journal,
+shadow registers with confidence bars, call stacks, heap objects, and a
+status bar with LAG and allocation metrics.
 
 ## Requirements
 
 - Linux x86-64
-- Rust 1.74+ (edition 2021; required by ratatui 0.29)
+- Rust 1.74+ (edition 2021)
 - [DynamoRIO](https://dynamorio.org/) 11.91+ (11.x series)
 - CMake 3.7+
 - Target binary compiled with `-g` (DWARF debug info)
 
 ## Build
 
-### Docker (recommended)
+### Docker
 
 ```sh
 DOCKER_BUILDKIT=1 docker build -t memvis .
@@ -59,11 +82,8 @@ docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     memvis /app/my_program
 ```
 
-The multi-stage `Dockerfile` builds the tracer and engine in an Ubuntu 22.04
-builder stage, then produces a runtime image containing only the compiled
-binaries and the DynamoRIO shared libraries. Both `--cap-add=SYS_PTRACE` and
-`--security-opt seccomp=unconfined` are required for DynamoRIO's process
-injection and code cache management inside the container.
+`--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required
+for DynamoRIO's process injection inside the container.
 
 ### Manual
 
@@ -76,30 +96,26 @@ cmake --build build -j$(nproc)
 cargo build --release --manifest-path engine/Cargo.toml
 ```
 
-The tracer and engine are independent — either can be built first.
-
 ## Usage
 
 ```sh
-# launch mode: starts tracer + engine together (interactive TUI)
+# interactive TUI
 DYNAMORIO_HOME=/path/to/DynamoRIO memvis ./my_program [args...]
 
-# headless mode: print final snapshot to stdout, exit when target finishes
+# headless: print final snapshot to stdout, exit when target finishes
 DYNAMORIO_HOME=/path/to/DynamoRIO memvis --once ./my_program
 
-# consumer-only mode: engine only, tracer started separately via drrun
+# consumer-only: engine attaches to an already-running tracer
 memvis --consumer-only [--once] ./my_program
 ```
 
-For manual builds, the binary is at `engine/target/release/memvis`.
-
-The `memvis` binary locates `drrun` and `libmemvis_tracer.so` automatically.
-Override with environment variables if needed:
+The engine binary is at `engine/target/release/memvis`. It locates `drrun`
+and `libmemvis_tracer.so` automatically.
 
 | Variable | Purpose |
 |---|---|
-| `DYNAMORIO_HOME` | Path to the DynamoRIO installation directory |
-| `MEMVIS_DRRUN` | Explicit path to the `drrun` binary |
+| `DYNAMORIO_HOME` | DynamoRIO installation directory |
+| `MEMVIS_DRRUN` | Explicit path to `drrun` |
 | `MEMVIS_TRACER` | Explicit path to `libmemvis_tracer.so` |
 
 ### TUI keybindings
@@ -121,17 +137,15 @@ Override with environment variables if needed:
 
 ## Documentation
 
-Detailed technical documentation is in [`docs/`](docs/):
-
-- [**Architecture**](docs/architecture.md) — system overview, component map,
-  data flow, concurrency model, shared memory lifecycle, build details.
-- [**Ring Protocol**](docs/ring-protocol.md) — v2/v3 event formats, ring
-  header layout, SPSC memory ordering, backpressure, control ring, protocol
-  version handshake.
+- [**Architecture**](docs/architecture.md) — system overview, data flow,
+  concurrency model, shared memory lifecycle.
+- [**Ring Protocol**](docs/ring-protocol.md) — v3 event format, SPSC memory
+  ordering, backpressure, control ring, protocol handshake.
 - [**Tracer**](docs/tracer.md) — DynamoRIO client internals, inline write
-  path, raw TLS scratch pad, value capture, tail-call/reload detection.
-- [**Engine**](docs/engine.md) — DWARF parser, ring orchestrator, shadow
-  register file, heap graph, address index, world state, TUI rendering.
+  path, value capture, allocator hooks, tail-call/reload detection.
+- [**Engine**](docs/engine.md) — DWARF parser, ring orchestrator, Shadow Type
+  Map, Retrospective Type Reconciliation, Visual ASan, heap graph, address
+  index, world state, TUI rendering.
 
 ## License
 
