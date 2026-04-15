@@ -52,6 +52,8 @@ _Static_assert(offsetof(memvis_ring_header_t, tail) == 2 * MEMVIS_CACHE_LINE, "r
 #include "drmgr.h"
 #include "drreg.h"
 #include "drutil.h"
+#include "drwrap.h"
+#include "drsyms.h"
 #include "dr_ir_macros_x86.h"
 
 #include <sys/mman.h>
@@ -82,6 +84,8 @@ static _Atomic uint64_t g_stat_reg_snaps    = 0;
 static _Atomic uint64_t g_stat_rdbuf_flushes = 0;
 static _Atomic uint64_t g_stat_inline_writes = 0;
 static _Atomic uint64_t g_stat_reloads       = 0;
+static _Atomic uint64_t g_stat_allocs        = 0;
+static _Atomic uint64_t g_stat_frees         = 0;
 
 static _Atomic uint16_t g_next_thread_id    = 0;
 
@@ -1104,12 +1108,129 @@ after_write:
 }
 
 static void
+wrap_malloc_pre(void *wrapctx, void **user_data)
+{
+    *user_data = (void *)drwrap_get_arg(wrapctx, 0);
+}
+
+static void
+wrap_malloc_post(void *wrapctx, void *user_data)
+{
+    void *ret = drwrap_get_retval(wrapctx);
+    if (ret == NULL) return;
+    uint64_t ptr  = (uint64_t)(uintptr_t)ret;
+    uint64_t size = (uint64_t)(uintptr_t)user_data;
+
+    void *drcontext = drwrap_get_drcontext(wrapctx);
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) return;
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    memvis_push_ex(ring, ptr, (uint32_t)size, size,
+                   MEMVIS_EVENT_ALLOC, tid, seq);
+    sync_head_cache(drcontext);
+    atomic_fetch_add_explicit(&g_stat_allocs, 1, memory_order_relaxed);
+}
+
+static void
+wrap_calloc_pre(void *wrapctx, void **user_data)
+{
+    size_t nmemb = (size_t)drwrap_get_arg(wrapctx, 0);
+    size_t sz    = (size_t)drwrap_get_arg(wrapctx, 1);
+    *user_data = (void *)(uintptr_t)(nmemb * sz);
+}
+
+static void
+wrap_realloc_pre(void *wrapctx, void **user_data)
+{
+    void *old_ptr  = drwrap_get_arg(wrapctx, 0);
+    size_t new_sz  = (size_t)drwrap_get_arg(wrapctx, 1);
+    *user_data = old_ptr;
+    void *drcontext = drwrap_get_drcontext(wrapctx);
+    /* emit FREE for old_ptr now, ALLOC in post */
+    if (old_ptr != NULL) {
+        memvis_ring_header_t *ring = tls_ring(drcontext);
+        if (ring) {
+            uint16_t tid = tls_thread_id(drcontext);
+            uint16_t seq = tls_next_seq(drcontext);
+            memvis_push_ex(ring, (uint64_t)(uintptr_t)old_ptr, 0, 0,
+                           MEMVIS_EVENT_FREE, tid, seq);
+            sync_head_cache(drcontext);
+            atomic_fetch_add_explicit(&g_stat_frees, 1, memory_order_relaxed);
+        }
+    }
+    *user_data = (void *)(uintptr_t)new_sz;
+}
+
+static void
+wrap_realloc_post(void *wrapctx, void *user_data)
+{
+    void *ret = drwrap_get_retval(wrapctx);
+    if (ret == NULL) return;
+    uint64_t ptr  = (uint64_t)(uintptr_t)ret;
+    uint64_t size = (uint64_t)(uintptr_t)user_data;
+
+    void *drcontext = drwrap_get_drcontext(wrapctx);
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) return;
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    memvis_push_ex(ring, ptr, (uint32_t)size, size,
+                   MEMVIS_EVENT_ALLOC, tid, seq);
+    sync_head_cache(drcontext);
+    atomic_fetch_add_explicit(&g_stat_allocs, 1, memory_order_relaxed);
+}
+
+static void
+wrap_free_pre(void *wrapctx, void **user_data)
+{
+    void *ptr = drwrap_get_arg(wrapctx, 0);
+    if (ptr == NULL) return;
+
+    void *drcontext = drwrap_get_drcontext(wrapctx);
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (!ring) return;
+    uint16_t tid = tls_thread_id(drcontext);
+    uint16_t seq = tls_next_seq(drcontext);
+    memvis_push_ex(ring, (uint64_t)(uintptr_t)ptr, 0, 0,
+                   MEMVIS_EVENT_FREE, tid, seq);
+    sync_head_cache(drcontext);
+    atomic_fetch_add_explicit(&g_stat_frees, 1, memory_order_relaxed);
+    *user_data = NULL;
+}
+
+static void
+wrap_alloc_funcs(const module_data_t *mod)
+{
+    const char *names[] = { "malloc", "free", "calloc", "realloc" };
+    for (int i = 0; i < 4; i++) {
+        size_t offset;
+        drsym_error_t err = drsym_lookup_symbol(
+            mod->full_path, names[i], &offset, DRSYM_DEFAULT_FLAGS);
+        if (err != DRSYM_SUCCESS) continue;
+        app_pc func_pc = mod->start + offset;
+        switch (i) {
+        case 0: drwrap_wrap(func_pc, wrap_malloc_pre, wrap_malloc_post); break;
+        case 1: drwrap_wrap(func_pc, wrap_free_pre, NULL); break;
+        case 2: drwrap_wrap(func_pc, wrap_calloc_pre, wrap_malloc_post); break;
+        case 3: drwrap_wrap(func_pc, wrap_realloc_pre, wrap_realloc_post); break;
+        }
+        dr_printf("memvis: wrapped %s @ %p\n", names[i], (void *)func_pc);
+    }
+}
+
+static void
 event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 {
     (void)drcontext; (void)loaded;
+    const char *name = dr_module_preferred_name(info);
+
+    if (name && (strstr(name, "libc") != NULL)) {
+        wrap_alloc_funcs(info);
+    }
+
     if (atomic_load_explicit(&g_module_base_phase, memory_order_relaxed) == 0 &&
         info->full_path[0] != '\0') {
-        const char *name = dr_module_preferred_name(info);
         if (name && strstr(name, "vdso") == NULL &&
             strstr(name, "ld-linux") == NULL &&
             strstr(name, "libc") == NULL &&
@@ -1213,6 +1334,8 @@ event_exit(void)
     dr_printf("memvis:   dropped: %llu\n", (unsigned long long)atomic_load(&g_stat_dropped));
     dr_printf("memvis:   regsnap: %llu\n", (unsigned long long)atomic_load(&g_stat_reg_snaps));
     dr_printf("memvis:   rdflush: %llu\n", (unsigned long long)atomic_load(&g_stat_rdbuf_flushes));
+    dr_printf("memvis:   allocs:  %llu\n", (unsigned long long)atomic_load(&g_stat_allocs));
+    dr_printf("memvis:   frees:   %llu\n", (unsigned long long)atomic_load(&g_stat_frees));
     dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
 #ifdef MEMVIS_CCC_AUDIT
     dr_printf("memvis: --- CCC shadow audit ---\n");
@@ -1226,6 +1349,8 @@ event_exit(void)
     for (int i = 0; i < TLS_SLOT_COUNT; i++)
         drmgr_unregister_tls_field(g_tls_idx[i]);
     dr_raw_tls_cfree(g_raw_tls_off, MEMVIS_RAW_TLS_SLOTS);
+    drwrap_exit();
+    drsym_exit();
     drreg_exit();
     drutil_exit();
     drmgr_exit();
@@ -1242,6 +1367,8 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     drutil_init();
     drreg_options_t drreg_ops = { sizeof(drreg_ops), 8, false };
     drreg_init(&drreg_ops);
+    drwrap_init();
+    drsym_init(0);
 
     if (!dr_raw_tls_calloc(&g_raw_tls_seg, &g_raw_tls_off,
                             MEMVIS_RAW_TLS_SLOTS, 0))

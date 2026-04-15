@@ -346,9 +346,8 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker, stm: &Shad
 
         lines.push(MemLine { spans });
 
-        // struct field sub-lines (skip pointer globals — no real sub-fields)
         if let NodeId::Global(gi) = nid {
-            if node.type_info.is_pointer { /* pointer globals have no memory sub-fields */ }
+            if node.type_info.is_pointer { }
             else { for (fi, f) in node.type_info.fields.iter().enumerate() {
                 if f.byte_size == 0 || f.name == "<pointee>" {
                     continue;
@@ -398,7 +397,6 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker, stm: &Shad
             }
         } }
     }
-    // STM: append typed heap regions
     if stm.len() > 0 {
         lines.push(MemLine {
             spans: vec![Span::styled(

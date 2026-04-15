@@ -9,6 +9,8 @@ target_include_directories(memvis_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 use_DynamoRIO_extension(memvis_tracer drmgr)
 use_DynamoRIO_extension(memvis_tracer drutil)
 use_DynamoRIO_extension(memvis_tracer drreg)
+use_DynamoRIO_extension(memvis_tracer drwrap)
+use_DynamoRIO_extension(memvis_tracer drsyms)
 
 configure_DynamoRIO_client(memvis_tracer)
 

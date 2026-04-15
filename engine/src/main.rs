@@ -19,6 +19,8 @@ const EVENT_RETURN: u8 = 3;
 const EVENT_REG_SNAPSHOT: u8 = 5;
 const EVENT_CACHE_MISS: u8 = 6;
 const EVENT_MODULE_LOAD: u8 = 7;
+const EVENT_ALLOC: u8 = 9;
+const EVENT_FREE: u8 = 10;
 const EVENT_RELOAD: u8 = 12;
 
 #[inline]
@@ -62,7 +64,6 @@ fn process_event(
             }
             if heap_oracle.is_heap(ev.addr) {
                 heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
-                // STM: recursive propagation through stamped heap regions
                 if let Some(ref info) = dwarf_info {
                     world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq as u64, &info.type_registry);
                 }
@@ -81,13 +82,13 @@ fn process_event(
                         addr_index.lookup(ev.value).map(|t| t.node_id)
                     };
                     world.update_edge(nid, target, ev.value);
-                    // STM: propagate pointee type to heap target
                     if ev.value != 0 {
                         let is_heap = heap_oracle.is_heap(ev.value);
                         if is_heap {
                             if let Some(ref info) = dwarf_info {
                                 let pointee_name = h_type.name.strip_prefix('*').unwrap_or("");
                                 if let Some(pointee_ti) = info.type_registry.get(pointee_name) {
+                                    world.heap_allocs.check_size(ev.value, pointee_ti);
                                     world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq as u64);
                                 }
                             }
@@ -196,6 +197,22 @@ fn process_event(
             srf.on_reload(reg_idx, ev.value, ev.addr, ev.size, ev.seq as u64, ev.addr);
             true
         }
+        EVENT_ALLOC => {
+            let ptr = ev.addr;
+            let size = ev.value;
+            world.heap_allocs.on_alloc(ptr, size);
+            true
+        }
+        EVENT_FREE => {
+            let ptr = ev.addr;
+            if let Some(old_size) = world.heap_allocs.on_free(ptr) {
+                world.stm.purge_range(ptr, old_size);
+                heap_graph.on_free(ptr, old_size);
+            } else {
+                world.stm.purge_range(ptr, 1);
+            }
+            true
+        }
         EVENT_MODULE_LOAD => {
             heap_oracle.add_module(ev.addr, ev.value);
             if relocation_delta.is_none() {
@@ -230,7 +247,7 @@ fn populate_globals(
         world.remove_node(NodeId::Global(gi));
         world.ensure_node(NodeId::Global(gi), &g.name, &g.type_info, base, g.size);
         if g.type_info.is_pointer {
-            continue; // pointer globals have no real sub-fields in memory
+            continue;
         }
         for (fi, f) in g.type_info.fields.iter().enumerate() {
             if f.byte_size == 0 || f.name == "<pointee>" {
@@ -530,7 +547,7 @@ fn run_headless(
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && idle_rounds >= 50 {
                 let snap = world.snapshot();
-                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, journal, *total, orch);
+                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, journal, *total, orch);
                 let _ = out.flush();
                 return;
             }
@@ -558,6 +575,7 @@ fn headless_render(
     world: &memvis::world::WorldInner,
     cl_tracker: &memvis::world::CacheLineTracker,
     stm: &memvis::world::ShadowTypeMap,
+    heap_allocs: &memvis::world::HeapAllocTracker,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -572,13 +590,16 @@ fn headless_render(
     };
     let _ = writeln!(
         out,
-        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ LAG {}",
+        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ LAG {} │ allocs {}/{} live {}",
         world.insn_counter,
         total,
         world.nodes.len(),
         world.edges.len(),
         orch.ring_count(),
-        lag_str
+        lag_str,
+        heap_allocs.total_allocs,
+        heap_allocs.total_frees,
+        heap_allocs.live_count(),
     );
     let _ = writeln!(out, "{}", "─".repeat(100));
     let _ = writeln!(out, "MEMORY MAP");
@@ -592,7 +613,6 @@ fn headless_render(
             && a.1.name == b.1.name
     });
 
-    // addr->name reverse index. fields lowest priority so parent struct overwrites at offset 0.
     let mut by_pri: Vec<_> = world.nodes.iter().collect();
     by_pri.sort_by_key(|(nid, _)| match nid {
         NodeId::Field(..) => 0u8,
@@ -661,7 +681,6 @@ fn headless_render(
         }
     }
 
-    // STM: render typed heap regions
     if stm.len() > 0 {
         let _ = writeln!(out, "\nHEAP TYPES (Shadow Type Map: {} projections)", stm.len());
         let mut stm_sorted: Vec<_> = stm.iter().collect();
@@ -676,7 +695,6 @@ fn headless_render(
                 if f.byte_size == 0 { continue; }
                 let fa = base + f.byte_offset;
                 let ptr_tag = if f.type_info.is_pointer {
-                    // check if STM has a projection for this field's target
                     if let Some(tgt) = stm.lookup(fa) {
                         format!("  → {} (0x{:x})", tgt.type_info.name, tgt.base_addr)
                     } else {
@@ -691,6 +709,17 @@ fn headless_render(
                     fa, f.byte_size, f.name, f.type_info.name, ptr_tag
                 );
             }
+        }
+    }
+
+    if !heap_allocs.size_mismatches.is_empty() {
+        let _ = writeln!(out, "\n⚠ HEAP SIZE MISMATCHES ({} detected)", heap_allocs.size_mismatches.len());
+        for m in &heap_allocs.size_mismatches {
+            let _ = writeln!(
+                out,
+                "  0x{:x}: type {} needs {}B but alloc only {}B",
+                m.addr, m.type_name, m.type_size, m.alloc_size
+            );
         }
     }
 

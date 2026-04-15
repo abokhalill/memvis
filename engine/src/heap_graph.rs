@@ -151,6 +151,15 @@ impl HeapGraph {
         self.objects.len()
     }
 
+    pub fn on_free(&mut self, addr: u64, size: u64) {
+        let hi = addr.saturating_add(size);
+        let to_remove: Vec<u64> = self.objects.range(addr..hi).map(|(&k, _)| k).collect();
+        for base in to_remove {
+            self.objects.remove(&base);
+            self.addr_to_base.retain(|_, v| *v != base);
+        }
+    }
+
     pub fn edge_count(&self) -> usize {
         self.objects.values().map(|o| o.outgoing_edges.len()).sum()
     }

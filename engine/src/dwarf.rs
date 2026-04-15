@@ -494,8 +494,6 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         functions.len()
     );
 
-    // build type registry: map struct/union names -> full TypeInfo (with fields).
-    // recurse through pointer fields' synthetic <pointee> entries.
     let mut type_registry: HashMap<String, TypeInfo> = HashMap::new();
     fn register_recursive(ti: &TypeInfo, reg: &mut HashMap<String, TypeInfo>) {
         if !ti.fields.is_empty() && ti.byte_size > 0 && !ti.name.is_empty() && !ti.is_pointer {

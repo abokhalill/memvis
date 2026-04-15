@@ -185,8 +185,6 @@ impl ShadowTypeMap {
         Self { map: HashMap::with_capacity(256) }
     }
 
-    /// stamp a heap address with a concrete type from a DWARF-typed pointer.
-    /// returns true if this is a new or updated projection.
     pub fn stamp_type(
         &mut self,
         target_addr: u64,
@@ -207,7 +205,7 @@ impl ShadowTypeMap {
         true
     }
 
-    /// called when a write hits addr and we know the STM covers it.
+    /// resolve *T→T on pointer field writes within stamped regions
     pub fn propagate_field_write(
         &mut self,
         write_addr: u64,
@@ -234,7 +232,6 @@ impl ShadowTypeMap {
         let offset = write_addr - base;
         if let Some(field) = ti.fields.iter().find(|f| f.byte_offset == offset && f.name != "<pointee>") {
             if field.type_info.is_pointer {
-                // resolve *T -> T in the type registry
                 let pointee_name = field.type_info.name.strip_prefix('*').unwrap_or("");
                 if let Some(pointee_ti) = type_registry.get(pointee_name) {
                     self.stamp_type(write_value, pointee_ti, &field.name, seq);
@@ -247,7 +244,6 @@ impl ShadowTypeMap {
         self.map.get(&addr)
     }
 
-    /// Find the projection that covers a given address (addr within [base, base+size)).
     pub fn covering(&self, addr: u64) -> Option<&TypeProjection> {
         self.map.values().find(|p| {
             addr >= p.base_addr && addr < p.base_addr + p.type_info.byte_size
@@ -261,12 +257,79 @@ impl ShadowTypeMap {
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &TypeProjection)> {
         self.map.iter()
     }
+
+    pub fn purge_range(&mut self, addr: u64, size: u64) -> usize {
+        let hi = addr.saturating_add(size);
+        let before = self.map.len();
+        self.map.retain(|_, p| p.base_addr < addr || p.base_addr >= hi);
+        before - self.map.len()
+    }
+}
+
+pub struct HeapAllocTracker {
+    allocs: HashMap<u64, u64>,
+    pub total_allocs: u64,
+    pub total_frees: u64,
+    pub size_mismatches: Vec<SizeMismatch>,
+}
+
+#[derive(Debug, Clone)]
+pub struct SizeMismatch {
+    pub addr: u64,
+    pub alloc_size: u64,
+    pub type_size: u64,
+    pub type_name: String,
+}
+
+impl HeapAllocTracker {
+    pub fn new() -> Self {
+        Self {
+            allocs: HashMap::with_capacity(256),
+            total_allocs: 0,
+            total_frees: 0,
+            size_mismatches: Vec::new(),
+        }
+    }
+
+    pub fn on_alloc(&mut self, addr: u64, size: u64) {
+        self.allocs.insert(addr, size);
+        self.total_allocs += 1;
+    }
+
+    pub fn on_free(&mut self, addr: u64) -> Option<u64> {
+        self.total_frees += 1;
+        self.allocs.remove(&addr)
+    }
+
+    pub fn alloc_size(&self, addr: u64) -> Option<u64> {
+        self.allocs.get(&addr).copied()
+    }
+
+    pub fn live_count(&self) -> usize {
+        self.allocs.len()
+    }
+
+    pub fn check_size(&mut self, addr: u64, type_info: &TypeInfo) -> bool {
+        if let Some(&alloc_sz) = self.allocs.get(&addr) {
+            if type_info.byte_size > alloc_sz {
+                self.size_mismatches.push(SizeMismatch {
+                    addr,
+                    alloc_size: alloc_sz,
+                    type_size: type_info.byte_size,
+                    type_name: type_info.name.clone(),
+                });
+                return false;
+            }
+        }
+        true
+    }
 }
 
 pub struct WorldState {
     inner: Arc<WorldInner>,
     pub cl_tracker: CacheLineTracker,
     pub stm: ShadowTypeMap,
+    pub heap_allocs: HeapAllocTracker,
 }
 
 impl WorldState {
@@ -276,6 +339,7 @@ impl WorldState {
             inner: Arc::new(WorldInner::new()),
             cl_tracker: CacheLineTracker::new(),
             stm: ShadowTypeMap::new(),
+            heap_allocs: HeapAllocTracker::new(),
         }
     }
 
