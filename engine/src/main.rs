@@ -43,13 +43,15 @@ fn process_event(
         EVENT_WRITE => {
             world.record_cl_write(ev.addr, ev.thread_id);
             if let Some(ref info) = dwarf_info {
-                let elf_pc = match *relocation_delta {
-                    Some(d) => ev.addr.wrapping_sub(d),
-                    None => ev.addr,
-                };
-                let func = info.func_containing(elf_pc);
-                let srf = shadow_regs.entry(ev.thread_id).or_default();
-                srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
+                if addr_index.in_universe(ev.addr) {
+                    let elf_pc = match *relocation_delta {
+                        Some(d) => ev.addr.wrapping_sub(d),
+                        None => ev.addr,
+                    };
+                    let func = info.func_containing(elf_pc);
+                    let srf = shadow_regs.entry(ev.thread_id).or_default();
+                    srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
+                }
             }
             for (&tid, srf) in shadow_regs.iter_mut() {
                 if tid != ev.thread_id {

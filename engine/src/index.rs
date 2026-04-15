@@ -63,6 +63,8 @@ pub struct AddressIndex {
     dynamics: HashMap<FrameId, Vec<Interval>>,
     mru: [Option<MruEntry>; MRU_SLOTS],
     mru_len: usize,
+    universe_lo: u64,
+    universe_hi: u64,
 }
 
 impl Default for AddressIndex {
@@ -73,6 +75,8 @@ impl Default for AddressIndex {
             dynamics: HashMap::with_capacity(64),
             mru: [None; MRU_SLOTS],
             mru_len: 0,
+            universe_lo: u64::MAX,
+            universe_hi: 0,
         }
     }
 }
@@ -112,6 +116,7 @@ impl AddressIndex {
         });
         self.statics_sorted = false;
         self.mru_len = 0;
+        self.widen_universe(addr, addr + size);
     }
 
     pub fn insert_field(
@@ -137,6 +142,7 @@ impl AddressIndex {
         });
         self.statics_sorted = false;
         self.mru_len = 0;
+        self.widen_universe(addr, addr + size);
     }
 
     pub fn insert_frame_locals(
@@ -161,6 +167,9 @@ impl AddressIndex {
                 },
             });
         }
+        for iv in &frame_ivs {
+            self.widen_universe(iv.lo, iv.hi);
+        }
         if !frame_ivs.is_empty() {
             self.dynamics.insert(frame_id, frame_ivs);
         }
@@ -181,7 +190,15 @@ impl AddressIndex {
     }
 
     #[inline(always)]
+    pub fn in_universe(&self, addr: u64) -> bool {
+        addr >= self.universe_lo && addr < self.universe_hi
+    }
+
+    #[inline(always)]
     pub fn lookup(&mut self, addr: u64) -> Option<LookupResult<'_>> {
+        if addr < self.universe_lo || addr >= self.universe_hi {
+            return None;
+        }
         for slot in 0..self.mru_len {
             if let Some(ref entry) = self.mru[slot] {
                 if entry.contains(addr) {
@@ -252,6 +269,12 @@ impl AddressIndex {
         self.mru.copy_within(0..len, 1);
         self.mru[0] = Some(entry);
         self.mru_len = (self.mru_len + 1).min(MRU_SLOTS);
+    }
+
+    #[inline(always)]
+    fn widen_universe(&mut self, lo: u64, hi: u64) {
+        if lo < self.universe_lo { self.universe_lo = lo; }
+        if hi > self.universe_hi { self.universe_hi = hi; }
     }
 
     fn lookup_dynamics(&self, addr: u64) -> Option<(FrameId, usize, u64, u64)> {
