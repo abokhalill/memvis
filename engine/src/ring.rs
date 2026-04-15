@@ -87,7 +87,7 @@ struct CtlHeader {
     proto_version: u32,
     thread_count: AtomicU32,
     max_threads: u32,
-    _pad0: u32,
+    build_hash: u32,
     threads: [ThreadEntry; MAX_THREADS],
 }
 
@@ -243,6 +243,8 @@ impl RingOrchestrator {
             );
             return false;
         }
+        eprintln!("memvis: ctl attached (proto={}, build_hash=0x{:08x})",
+                  hdr.proto_version, hdr.build_hash);
         self.ctl = Some(shm);
         true
     }
