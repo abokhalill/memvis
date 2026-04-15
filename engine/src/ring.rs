@@ -1,5 +1,8 @@
 // SPDX-License-Identifier: MIT
 
+#[cfg(target_arch = "x86_64")]
+use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{mem, ptr};
 
@@ -189,24 +192,38 @@ impl ThreadRing {
         true
     }
 
-    pub fn batch_pop(&self, max: usize, out: &mut Vec<Event>) -> usize {
+    #[inline]
+    pub fn consume_batch(&self, out: &mut [Event]) -> usize {
         let hdr = self.header();
         let mask = (hdr.capacity - 1) as u64;
         let data = unsafe { hdr.data() };
         let t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
         let avail = h.saturating_sub(t).min(hdr.capacity as u64) as usize;
-        let n = avail.min(max);
+        let n = avail.min(out.len());
         if n == 0 {
             return 0;
         }
-        for i in 0..n {
-            out.push(unsafe { ptr::read_volatile(data.add(((t + i as u64) & mask) as usize)) });
+        let mut i = 0;
+        while i < n {
+            #[cfg(target_arch = "x86_64")]
+            if i + 8 < n {
+                unsafe {
+                    _mm_prefetch(
+                        data.add(((t + (i + 8) as u64) & mask) as usize) as *const i8,
+                        _MM_HINT_T0,
+                    );
+                }
+            }
+            out[i] = unsafe { ptr::read_volatile(data.add(((t + i as u64) & mask) as usize)) };
+            i += 1;
         }
         hdr.tail.store(t + n as u64, Ordering::Release);
         n
     }
 }
+
+const BATCH_SIZE: usize = 4096;
 
 #[derive(Default)]
 pub struct RingOrchestrator {
@@ -214,7 +231,7 @@ pub struct RingOrchestrator {
     pub rings: Vec<ThreadRing>,
     known_count: u32,
     rr_idx: usize,
-    drain_tmp: Vec<Event>,
+    scratch: Vec<Event>,
 }
 
 impl RingOrchestrator {
@@ -390,15 +407,16 @@ impl RingOrchestrator {
         if n == 0 {
             return 0;
         }
-        self.drain_tmp.clear();
-        self.drain_tmp.reserve(per_ring);
+        let limit = per_ring.min(BATCH_SIZE);
+        if self.scratch.len() < limit {
+            self.scratch.resize(limit, Event::zero());
+        }
         let mut total = 0;
         for offset in 0..n {
             let i = (self.rr_idx + offset) % n;
-            self.drain_tmp.clear();
-            let got = self.rings[i].batch_pop(per_ring, &mut self.drain_tmp);
-            for ev in self.drain_tmp.drain(..) {
-                buf.push((i, ev));
+            let got = self.rings[i].consume_batch(&mut self.scratch[..limit]);
+            for j in 0..got {
+                buf.push((i, self.scratch[j]));
             }
             total += got;
         }

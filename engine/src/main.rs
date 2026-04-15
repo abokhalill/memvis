@@ -297,53 +297,59 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         }
 
         if !app.paused {
-            batch_buf.clear();
-            orch.batch_drain(20_000, &mut batch_buf);
             let mut need_finalize = false;
+            let mut tick_events = 0usize;
+            const TICK_BUDGET: usize = 200_000;
+            while tick_events < TICK_BUDGET {
+                batch_buf.clear();
+                let got = orch.batch_drain(4096, &mut batch_buf);
+                if got == 0 { break; }
+                tick_events += got;
 
-            for &(ri, ref ev) in &batch_buf {
-                total += 1;
-                world.inc_insn_counter();
+                for &(ri, ref ev) in &batch_buf {
+                    total += 1;
+                    world.inc_insn_counter();
 
-                let ev_kind = ev.kind();
-                let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
-                if ev.seq != *exp && ev_kind != EVENT_REG_SNAPSHOT {
-                    seq_gaps += 1;
-                }
-                *exp = ev.seq.wrapping_add(1);
+                    let ev_kind = ev.kind();
+                    let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
+                    if ev.seq != *exp && ev_kind != EVENT_REG_SNAPSHOT {
+                        seq_gaps += 1;
+                    }
+                    *exp = ev.seq.wrapping_add(1);
 
-                let interesting = process_event(
-                    ev,
-                    ri,
-                    &orch,
-                    &mut world,
-                    &mut addr_index,
-                    &dwarf_info,
-                    &mut stacks,
-                    &mut next_frame_id,
-                    &mut relocation_delta,
-                    &mut returned_frames,
-                    &mut shadow_regs,
-                    &mut heap_graph,
-                    &mut heap_oracle,
-                );
-                if interesting {
-                    journal.push_back(JournalEntry {
-                        seq: total,
-                        kind: ev_kind,
-                        thread_id: ev.thread_id,
-                        addr: ev.addr,
-                        size: ev.size,
-                        value: ev.value,
-                    });
-                    if journal.len() > 1000 {
-                        journal.pop_front();
+                    let interesting = process_event(
+                        ev,
+                        ri,
+                        &orch,
+                        &mut world,
+                        &mut addr_index,
+                        &dwarf_info,
+                        &mut stacks,
+                        &mut next_frame_id,
+                        &mut relocation_delta,
+                        &mut returned_frames,
+                        &mut shadow_regs,
+                        &mut heap_graph,
+                        &mut heap_oracle,
+                    );
+                    if interesting {
+                        journal.push_back(JournalEntry {
+                            seq: total,
+                            kind: ev_kind,
+                            thread_id: ev.thread_id,
+                            addr: ev.addr,
+                            size: ev.size,
+                            value: ev.value,
+                        });
+                        if journal.len() > 1000 {
+                            journal.pop_front();
+                        }
+                    }
+                    if ev_kind == EVENT_CALL {
+                        need_finalize = true;
                     }
                 }
-                if ev_kind == EVENT_CALL {
-                    need_finalize = true;
-                }
-            }
+            } // while tick_events < TICK_BUDGET
 
             if need_finalize {
                 addr_index.finalize();
@@ -438,45 +444,53 @@ fn run_headless(
             last_discovery = now_disc;
         }
 
-        batch_buf.clear();
-        let drained = orch.batch_drain(20_000, &mut batch_buf);
         let mut need_finalize = false;
+        let mut drained = 0usize;
+        let mut tick_events = 0usize;
+        const HEADLESS_BUDGET: usize = 500_000;
+        while tick_events < HEADLESS_BUDGET {
+            batch_buf.clear();
+            let got = orch.batch_drain(4096, &mut batch_buf);
+            if got == 0 { break; }
+            tick_events += got;
+            drained += got;
 
-        for &(ri, ref ev) in &batch_buf {
-            *total += 1;
-            world.inc_insn_counter();
+            for &(ri, ref ev) in &batch_buf {
+                *total += 1;
+                world.inc_insn_counter();
 
-            let ev_kind = ev.kind();
-            let interesting = process_event(
-                ev,
-                ri,
-                orch,
-                world,
-                addr_index,
-                dwarf_info,
-                stacks,
-                next_frame_id,
-                relocation_delta,
-                returned_frames,
-                shadow_regs,
-                heap_graph,
-                heap_oracle,
-            );
-            if interesting {
-                journal.push_back(JournalEntry {
-                    seq: *total,
-                    kind: ev_kind,
-                    thread_id: ev.thread_id,
-                    addr: ev.addr,
-                    size: ev.size,
-                    value: ev.value,
-                });
-                if journal.len() > 1000 {
-                    journal.pop_front();
+                let ev_kind = ev.kind();
+                let interesting = process_event(
+                    ev,
+                    ri,
+                    orch,
+                    world,
+                    addr_index,
+                    dwarf_info,
+                    stacks,
+                    next_frame_id,
+                    relocation_delta,
+                    returned_frames,
+                    shadow_regs,
+                    heap_graph,
+                    heap_oracle,
+                );
+                if interesting {
+                    journal.push_back(JournalEntry {
+                        seq: *total,
+                        kind: ev_kind,
+                        thread_id: ev.thread_id,
+                        addr: ev.addr,
+                        size: ev.size,
+                        value: ev.value,
+                    });
+                    if journal.len() > 1000 {
+                        journal.pop_front();
+                    }
                 }
-            }
-            if ev_kind == EVENT_CALL {
-                need_finalize = true;
+                if ev_kind == EVENT_CALL {
+                    need_finalize = true;
+                }
             }
         }
 
