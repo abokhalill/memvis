@@ -15,7 +15,7 @@ use ratatui::widgets::*;
 use crate::heap_graph::HeapGraph;
 use crate::index::NodeId;
 use crate::shadow_regs::{Confidence, ShadowRegisterFile};
-use crate::world::{CacheLineTracker, ShadowStack, WorldInner, REG_COUNT, REG_NAMES};
+use crate::world::{CacheLineTracker, ShadowTypeMap, ShadowStack, WorldInner, REG_COUNT, REG_NAMES};
 
 #[derive(Clone)]
 pub struct JournalEntry {
@@ -257,7 +257,7 @@ fn resolve_ptr_target<'a>(val: u64, addr_names: &'a HashMap<u64, (String, u64)>)
     None
 }
 
-fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<MemLine> {
+fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker, stm: &ShadowTypeMap) -> Vec<MemLine> {
     let mut sorted: Vec<_> = world.nodes.iter().filter(|(_, n)| n.size > 0).collect();
     sorted.sort_by_key(|(_, n)| (n.addr, std::cmp::Reverse(n.last_write_insn)));
     sorted.dedup_by(|a, b| {
@@ -346,10 +346,11 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<Mem
 
         lines.push(MemLine { spans });
 
-        // struct field sub-lines
+        // struct field sub-lines (skip pointer globals — no real sub-fields)
         if let NodeId::Global(gi) = nid {
-            for (fi, f) in node.type_info.fields.iter().enumerate() {
-                if f.byte_size == 0 {
+            if node.type_info.is_pointer { /* pointer globals have no memory sub-fields */ }
+            else { for (fi, f) in node.type_info.fields.iter().enumerate() {
+                if f.byte_size == 0 || f.name == "<pointee>" {
                     continue;
                 }
                 let fa = node.addr + f.byte_offset;
@@ -395,8 +396,67 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<Mem
                     }
                 }
             }
+        } }
+    }
+    // STM: append typed heap regions
+    if stm.len() > 0 {
+        lines.push(MemLine {
+            spans: vec![Span::styled(
+                format!("  ── HEAP TYPES ({} projections) ──", stm.len()),
+                Style::default().fg(Color::Yellow).bold(),
+            )],
+        });
+        let mut stm_sorted: Vec<_> = stm.iter().collect();
+        stm_sorted.sort_by_key(|(addr, _)| *addr);
+        for (&base, proj) in &stm_sorted {
+            lines.push(MemLine {
+                spans: vec![
+                    Span::styled(
+                        format!("  {:>12x}", base),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(format!(" {:>3}B ", proj.type_info.byte_size)),
+                    Span::styled(
+                        format!("{:<18}", proj.type_info.name),
+                        Style::default().fg(Color::Yellow),
+                    ),
+                    Span::styled(
+                        format!("via {}", proj.source_name),
+                        Style::default().fg(Color::DarkGray).italic(),
+                    ),
+                ],
+            });
+            for f in &proj.type_info.fields {
+                if f.byte_size == 0 || f.name == "<pointee>" { continue; }
+                let fa = base + f.byte_offset;
+                let mut fspans = vec![
+                    Span::styled(
+                        format!("    {:>12x}", fa),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::raw(format!(" {:>3}B ", f.byte_size)),
+                    Span::styled(
+                        format!("{:<18}", f.name),
+                        Style::default().fg(Color::DarkGray),
+                    ),
+                    Span::styled(
+                        format!("{:<12}", f.type_info.name),
+                        Style::default().fg(type_color(&f.type_info.name)),
+                    ),
+                ];
+                if f.type_info.is_pointer {
+                    if let Some(tgt) = stm.lookup(fa) {
+                        fspans.push(Span::styled(
+                            format!(" → {} (0x{:x})", tgt.type_info.name, tgt.base_addr),
+                            Style::default().fg(Color::Magenta),
+                        ));
+                    }
+                }
+                lines.push(MemLine { spans: fspans });
+            }
         }
     }
+
     lines
 }
 
@@ -450,6 +510,7 @@ pub fn draw(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     world: &WorldInner,
     cl_tracker: &CacheLineTracker,
+    stm: &ShadowTypeMap,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     ring_count: usize,
@@ -463,7 +524,7 @@ pub fn draw(
     heap_graph: &HeapGraph,
 ) {
     state.snap_count = snap_total;
-    let mem_lines = build_mem_lines(world, cl_tracker);
+    let mem_lines = build_mem_lines(world, cl_tracker, stm);
     let seq_gap_warn = seq_gaps; // capture for header
     let evt_lines = build_event_lines(journal, &state.filter);
 

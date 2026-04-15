@@ -7,7 +7,7 @@ use gimli::{
     Unit, UnitOffset,
 };
 use object::{Object, ObjectSection, ObjectSegment};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
 type R<'a> = EndianSlice<'a, LittleEndian>;
@@ -409,6 +409,7 @@ pub struct DwarfInfo {
     pub globals: Vec<GlobalVar>,
     pub functions: BTreeMap<u64, FunctionMeta>,
     pub elf_base_vaddr: u64, // lowest PT_LOAD vaddr (0 for PIE)
+    pub type_registry: HashMap<String, TypeInfo>,
 }
 
 impl DwarfInfo {
@@ -493,10 +494,31 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         functions.len()
     );
 
+    // build type registry: map struct/union names -> full TypeInfo (with fields).
+    // recurse through pointer fields' synthetic <pointee> entries.
+    let mut type_registry: HashMap<String, TypeInfo> = HashMap::new();
+    fn register_recursive(ti: &TypeInfo, reg: &mut HashMap<String, TypeInfo>) {
+        if !ti.fields.is_empty() && ti.byte_size > 0 && !ti.name.is_empty() && !ti.is_pointer {
+            reg.entry(ti.name.clone()).or_insert_with(|| ti.clone());
+        }
+        for f in &ti.fields {
+            register_recursive(&f.type_info, reg);
+        }
+    }
+    for g in &globals {
+        register_recursive(&g.type_info, &mut type_registry);
+    }
+    for func in functions.values() {
+        for local in &func.locals {
+            register_recursive(&local.type_info, &mut type_registry);
+        }
+    }
+
     Ok(DwarfInfo {
         globals,
         functions,
         elf_base_vaddr,
+        type_registry,
     })
 }
 
@@ -962,7 +984,7 @@ fn extract_struct_fields<'a>(
     struct_offset: UnitOffset,
     parent_depth: u32,
 ) -> Vec<FieldInfo> {
-    if parent_depth >= 2 {
+    if parent_depth >= 4 {
         return Vec::new();
     }
 
@@ -1088,22 +1110,35 @@ fn resolve_type_at<'a>(
             .and_then(|v| v.udata_value())
             .unwrap_or(8);
 
-        let pointee_name = entry
+        let pointee = entry
             .attr_value(gimli::DW_AT_type)
             .ok()
             .flatten()
             .and_then(|v| match v {
                 AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1),
                 _ => None,
-            })
+            });
+
+        let pointee_name = pointee.as_ref()
             .map(|t| format!("*{}", t.name))
             .unwrap_or_else(|| "*void".into());
+
+        // carry pointee layout as synthetic field so type_registry can harvest it
+        let fields = match pointee {
+            Some(ref pt) if !pt.fields.is_empty() => vec![FieldInfo {
+                name: "<pointee>".into(),
+                byte_offset: 0,
+                byte_size: pt.byte_size,
+                type_info: pt.clone(),
+            }],
+            _ => Vec::new(),
+        };
 
         Some(TypeInfo {
             name: pointee_name,
             byte_size,
             is_pointer: true,
-            fields: Vec::new(),
+            fields,
         })
     } else if tag == gimli::DW_TAG_typedef
         || tag == gimli::DW_TAG_const_type

@@ -168,9 +168,105 @@ impl WorldInner {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct TypeProjection {
+    pub base_addr: u64,
+    pub type_info: TypeInfo,
+    pub source_name: String,
+    pub stamp_seq: u64,
+}
+
+pub struct ShadowTypeMap {
+    map: HashMap<u64, TypeProjection>,
+}
+
+impl ShadowTypeMap {
+    pub fn new() -> Self {
+        Self { map: HashMap::with_capacity(256) }
+    }
+
+    /// stamp a heap address with a concrete type from a DWARF-typed pointer.
+    /// returns true if this is a new or updated projection.
+    pub fn stamp_type(
+        &mut self,
+        target_addr: u64,
+        pointee_type: &TypeInfo,
+        source_name: &str,
+        seq: u64,
+    ) -> bool {
+        if target_addr == 0 || pointee_type.byte_size == 0 {
+            return false;
+        }
+        let proj = TypeProjection {
+            base_addr: target_addr,
+            type_info: pointee_type.clone(),
+            source_name: source_name.to_string(),
+            stamp_seq: seq,
+        };
+        self.map.insert(target_addr, proj);
+        true
+    }
+
+    /// called when a write hits addr and we know the STM covers it.
+    pub fn propagate_field_write(
+        &mut self,
+        write_addr: u64,
+        write_value: u64,
+        write_size: u32,
+        seq: u64,
+        type_registry: &HashMap<String, TypeInfo>,
+    ) {
+        if write_size != 8 || write_value == 0 {
+            return;
+        }
+        let covering = self.map.iter()
+            .find(|(_, p)| {
+                write_addr >= p.base_addr
+                    && write_addr < p.base_addr + p.type_info.byte_size
+            })
+            .map(|(_, p)| (p.base_addr, p.type_info.clone()));
+
+        let (base, ti) = match covering {
+            Some(x) => x,
+            None => return,
+        };
+
+        let offset = write_addr - base;
+        if let Some(field) = ti.fields.iter().find(|f| f.byte_offset == offset && f.name != "<pointee>") {
+            if field.type_info.is_pointer {
+                // resolve *T -> T in the type registry
+                let pointee_name = field.type_info.name.strip_prefix('*').unwrap_or("");
+                if let Some(pointee_ti) = type_registry.get(pointee_name) {
+                    self.stamp_type(write_value, pointee_ti, &field.name, seq);
+                }
+            }
+        }
+    }
+
+    pub fn lookup(&self, addr: u64) -> Option<&TypeProjection> {
+        self.map.get(&addr)
+    }
+
+    /// Find the projection that covers a given address (addr within [base, base+size)).
+    pub fn covering(&self, addr: u64) -> Option<&TypeProjection> {
+        self.map.values().find(|p| {
+            addr >= p.base_addr && addr < p.base_addr + p.type_info.byte_size
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.map.len()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&u64, &TypeProjection)> {
+        self.map.iter()
+    }
+}
+
 pub struct WorldState {
     inner: Arc<WorldInner>,
     pub cl_tracker: CacheLineTracker,
+    pub stm: ShadowTypeMap,
 }
 
 impl WorldState {
@@ -179,6 +275,7 @@ impl WorldState {
         Self {
             inner: Arc::new(WorldInner::new()),
             cl_tracker: CacheLineTracker::new(),
+            stm: ShadowTypeMap::new(),
         }
     }
 

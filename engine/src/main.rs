@@ -62,18 +62,37 @@ fn process_event(
             }
             if heap_oracle.is_heap(ev.addr) {
                 heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
+                // STM: recursive propagation through stamped heap regions
+                if let Some(ref info) = dwarf_info {
+                    world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq as u64, &info.type_registry);
+                }
             }
             if let Some(h) = addr_index.lookup(ev.addr) {
                 let nid = h.node_id;
-                world.ensure_node(nid, h.name, h.type_info, ev.addr, ev.size as u64);
+                let h_name = h.name.to_string();
+                let h_type = h.type_info.clone();
+                let is_ptr = h.type_info.is_pointer;
+                world.ensure_node(nid, &h_name, &h_type, ev.addr, ev.size as u64);
                 world.update_value(nid, ev.value, world.insn_counter());
-                if h.type_info.is_pointer && ev.size == 8 {
+                if is_ptr && ev.size == 8 {
                     let target = if ev.value == 0 {
                         None
                     } else {
                         addr_index.lookup(ev.value).map(|t| t.node_id)
                     };
                     world.update_edge(nid, target, ev.value);
+                    // STM: propagate pointee type to heap target
+                    if ev.value != 0 {
+                        let is_heap = heap_oracle.is_heap(ev.value);
+                        if is_heap {
+                            if let Some(ref info) = dwarf_info {
+                                let pointee_name = h_type.name.strip_prefix('*').unwrap_or("");
+                                if let Some(pointee_ti) = info.type_registry.get(pointee_name) {
+                                    world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq as u64);
+                                }
+                            }
+                        }
+                    }
                 }
                 return true;
             }
@@ -210,8 +229,11 @@ fn populate_globals(
         addr_index.insert_global(base, g.size, g.name.clone(), g.type_info.clone(), gi);
         world.remove_node(NodeId::Global(gi));
         world.ensure_node(NodeId::Global(gi), &g.name, &g.type_info, base, g.size);
+        if g.type_info.is_pointer {
+            continue; // pointer globals have no real sub-fields in memory
+        }
         for (fi, f) in g.type_info.fields.iter().enumerate() {
-            if f.byte_size == 0 {
+            if f.byte_size == 0 || f.name == "<pointee>" {
                 continue;
             }
             let faddr = base + f.byte_offset;
@@ -391,6 +413,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                 &mut terminal,
                 &display_snap,
                 &world.cl_tracker,
+                &world.stm,
                 &journal,
                 total,
                 orch.ring_count(),
@@ -507,7 +530,7 @@ fn run_headless(
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && idle_rounds >= 50 {
                 let snap = world.snapshot();
-                headless_render(&mut out, &snap, &world.cl_tracker, journal, *total, orch);
+                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, journal, *total, orch);
                 let _ = out.flush();
                 return;
             }
@@ -534,6 +557,7 @@ fn headless_render(
     out: &mut impl std::io::Write,
     world: &memvis::world::WorldInner,
     cl_tracker: &memvis::world::CacheLineTracker,
+    stm: &memvis::world::ShadowTypeMap,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -614,22 +638,57 @@ fn headless_render(
             node.addr, node.size, node.name, node.type_info.name, node.raw_value, ptr_info
         );
         if let NodeId::Global(gi) = nid {
-            for (fi, f) in node.type_info.fields.iter().enumerate() {
-                if f.byte_size == 0 {
-                    continue;
+            if !node.type_info.is_pointer {
+                for (fi, f) in node.type_info.fields.iter().enumerate() {
+                    if f.byte_size == 0 || f.name == "<pointee>" {
+                        continue;
+                    }
+                    let fa = node.addr + f.byte_offset;
+                    let fid = NodeId::Field(*gi, fi as u16);
+                    let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
+                    let fptr = if f.type_info.is_pointer && fval != 0 {
+                        resolve(fval)
+                    } else {
+                        String::new()
+                    };
+                    let _ = writeln!(
+                        out,
+                        "    {:>12x}  {:>4}B  {:<20} {:<14}  val={:>18x}{}",
+                        fa, f.byte_size, f.name, f.type_info.name, fval, fptr
+                    );
                 }
-                let fa = node.addr + f.byte_offset;
-                let fid = NodeId::Field(*gi, fi as u16);
-                let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
-                let fptr = if f.type_info.is_pointer && fval != 0 {
-                    resolve(fval)
+            }
+        }
+    }
+
+    // STM: render typed heap regions
+    if stm.len() > 0 {
+        let _ = writeln!(out, "\nHEAP TYPES (Shadow Type Map: {} projections)", stm.len());
+        let mut stm_sorted: Vec<_> = stm.iter().collect();
+        stm_sorted.sort_by_key(|(addr, _)| *addr);
+        for (&base, proj) in &stm_sorted {
+            let _ = writeln!(
+                out,
+                "  {:>12x}  {:>4}B  {:<20} (via {})",
+                base, proj.type_info.byte_size, proj.type_info.name, proj.source_name
+            );
+            for f in &proj.type_info.fields {
+                if f.byte_size == 0 { continue; }
+                let fa = base + f.byte_offset;
+                let ptr_tag = if f.type_info.is_pointer {
+                    // check if STM has a projection for this field's target
+                    if let Some(tgt) = stm.lookup(fa) {
+                        format!("  → {} (0x{:x})", tgt.type_info.name, tgt.base_addr)
+                    } else {
+                        String::new()
+                    }
                 } else {
                     String::new()
                 };
                 let _ = writeln!(
                     out,
-                    "    {:>12x}  {:>4}B  {:<20} {:<14}  val={:>18x}{}",
-                    fa, f.byte_size, f.name, f.type_info.name, fval, fptr
+                    "    {:>12x}  {:>4}B  {:<20} {:<14}{}",
+                    fa, f.byte_size, f.name, f.type_info.name, ptr_tag
                 );
             }
         }
