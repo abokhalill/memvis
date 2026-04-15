@@ -249,6 +249,14 @@ struct MemLine {
     spans: Vec<Span<'static>>,
 }
 
+fn resolve_ptr_target<'a>(val: u64, addr_names: &'a HashMap<u64, (String, u64)>) -> Option<&'a str> {
+    if val == 0 { return None; }
+    if let Some((name, _)) = addr_names.get(&val) {
+        return Some(name.as_str());
+    }
+    None
+}
+
 fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<MemLine> {
     let mut sorted: Vec<_> = world.nodes.iter().filter(|(_, n)| n.size > 0).collect();
     sorted.sort_by_key(|(_, n)| (n.addr, std::cmp::Reverse(n.last_write_insn)));
@@ -258,6 +266,19 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<Mem
             && a.1.addr == b.1.addr
             && a.1.name == b.1.name
     });
+
+    // addr->(name, size) reverse index. fields first (lowest priority), then globals, then locals.
+    // at the same address, parent struct overwrites its first field (offset-0 alias).
+    let mut by_priority: Vec<_> = world.nodes.iter().collect();
+    by_priority.sort_by_key(|(nid, _)| match nid {
+        NodeId::Field(..) => 0u8,
+        NodeId::Global(_) => 1,
+        NodeId::Local(..) => 2,
+    });
+    let mut addr_names: HashMap<u64, (String, u64)> = HashMap::with_capacity(by_priority.len());
+    for (_, node) in &by_priority {
+        addr_names.insert(node.addr, (node.name.clone(), node.size));
+    }
 
     let mut lines = Vec::new();
     let mut last_cl: u64 = u64::MAX;
@@ -311,13 +332,9 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<Mem
         ];
 
         if node.type_info.is_pointer && node.raw_value != 0 {
-            let target = world
-                .nodes
-                .values()
-                .find(|t| node.raw_value >= t.addr && node.raw_value < t.addr + t.size.max(1));
-            match target {
-                Some(t) => spans.push(Span::styled(
-                    format!(" → {}", t.name),
+            match resolve_ptr_target(node.raw_value, &addr_names) {
+                Some(name) => spans.push(Span::styled(
+                    format!(" → {}", name),
                     Style::default().fg(Color::Magenta),
                 )),
                 None => spans.push(Span::styled(
@@ -362,6 +379,21 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker) -> Vec<Mem
                         Span::styled(format!(" 0x{:<16x}", fval), Style::default().fg(fvc)),
                     ],
                 });
+                if f.type_info.is_pointer && fval != 0 {
+                    if let Some(tname) = resolve_ptr_target(fval, &addr_names) {
+                        let last = lines.last_mut().unwrap();
+                        last.spans.push(Span::styled(
+                            format!(" → {}", tname),
+                            Style::default().fg(Color::Magenta),
+                        ));
+                    } else {
+                        let last = lines.last_mut().unwrap();
+                        last.spans.push(Span::styled(
+                            format!(" → 0x{:x}", fval),
+                            Style::default().fg(Color::Magenta),
+                        ));
+                    }
+                }
             }
         }
     }

@@ -568,6 +568,25 @@ fn headless_render(
             && a.1.name == b.1.name
     });
 
+    // addr->name reverse index. fields lowest priority so parent struct overwrites at offset 0.
+    let mut by_pri: Vec<_> = world.nodes.iter().collect();
+    by_pri.sort_by_key(|(nid, _)| match nid {
+        NodeId::Field(..) => 0u8,
+        NodeId::Global(_) => 1,
+        NodeId::Local(..) => 2,
+    });
+    let mut addr_names: HashMap<u64, String> = HashMap::with_capacity(by_pri.len());
+    for (_, n) in &by_pri {
+        addr_names.insert(n.addr, n.name.clone());
+    }
+    let resolve = |val: u64| -> String {
+        if val == 0 { return String::new(); }
+        match addr_names.get(&val) {
+            Some(name) => format!("  → {}", name),
+            None => format!("  → 0x{:x}", val),
+        }
+    };
+
     let mut last_cl: u64 = u64::MAX;
     for (nid, node) in &sorted {
         if matches!(nid, NodeId::Field(..)) {
@@ -585,14 +604,7 @@ fn headless_render(
             last_cl = cl;
         }
         let ptr_info = if node.type_info.is_pointer && node.raw_value != 0 {
-            let target = world
-                .nodes
-                .values()
-                .find(|t| node.raw_value >= t.addr && node.raw_value < t.addr + t.size.max(1));
-            match target {
-                Some(t) => format!("  → {}", t.name),
-                None => format!("  → 0x{:x}", node.raw_value),
-            }
+            resolve(node.raw_value)
         } else {
             String::new()
         };
@@ -609,10 +621,15 @@ fn headless_render(
                 let fa = node.addr + f.byte_offset;
                 let fid = NodeId::Field(*gi, fi as u16);
                 let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
+                let fptr = if f.type_info.is_pointer && fval != 0 {
+                    resolve(fval)
+                } else {
+                    String::new()
+                };
                 let _ = writeln!(
                     out,
-                    "    {:>12x}  {:>4}B  {:<20} {:<14}  val={:>18x}",
-                    fa, f.byte_size, f.name, f.type_info.name, fval
+                    "    {:>12x}  {:>4}B  {:<20} {:<14}  val={:>18x}{}",
+                    fa, f.byte_size, f.name, f.type_info.name, fval, fptr
                 );
             }
         }
@@ -631,10 +648,8 @@ fn headless_render(
             if !seen.insert(key) {
                 continue;
             }
-            let tgt_name = world
-                .nodes
-                .get(&edge.target)
-                .map(|n| n.name.as_str())
+            let tgt_name = addr_names.get(&edge.ptr_value)
+                .map(|s| s.as_str())
                 .unwrap_or("?");
             let _ = writeln!(
                 out,
