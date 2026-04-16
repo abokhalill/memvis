@@ -6,4 +6,5 @@ pub mod ring;
 pub mod shadow_regs;
 pub mod tui;
 pub mod record;
+pub mod topology;
 pub mod world;

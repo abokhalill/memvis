@@ -11,6 +11,7 @@ use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::ring::{Event, RingOrchestrator};
 use memvis::shadow_regs::ShadowRegisterFile;
 use memvis::record::{EventPlayer, EventRecorder};
+use memvis::topology::TopologyStream;
 use memvis::tui::{self, AppState, JournalEntry};
 use memvis::world::{ShadowStack, SnapshotRing, WorldState, REG_COUNT};
 
@@ -40,6 +41,7 @@ fn process_event(
     shadow_regs: &mut HashMap<u16, ShadowRegisterFile>,
     heap_graph: &mut HeapGraph,
     heap_oracle: &mut HeapOracle,
+    topo: &mut Option<TopologyStream>,
 ) -> bool {
     let ev_kind = ev.kind();
     match ev_kind {
@@ -68,14 +70,27 @@ fn process_event(
                 if let Some(ref info) = dwarf_info {
                     let before = world.stm.len();
                     world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq as u64, &info.type_registry);
-                    if world.stm.len() > before {
+                    let after = world.stm.len();
+                    if after > before {
                         world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
+                    }
+                    // emit STAMP for any new STM projections
+                    if after > before {
+                        if let Some(ref mut ts) = topo {
+                            if let Some(proj) = world.stm.lookup(ev.value) {
+                                ts.emit_stamp(ev.seq as u64, ev.value, &proj.type_info.name, proj.type_info.byte_size, &proj.source_name, proj.type_info.fields.len());
+                            }
+                        }
                     }
                 }
                 if world.hazards.len() < 64 {
                     if let Some(h) = world.heap_allocs.check_write_bounds(ev.addr, ev.size, &world.stm) {
                         let dominated = world.hazards.iter().any(|prev| prev.write_addr == h.write_addr);
                         if !dominated {
+                            if let Some(ref mut ts) = topo {
+                                let kind_str = match h.kind { memvis::world::HazardKind::OutOfBounds => "OOB", memvis::world::HazardKind::HeapHole => "HOLE" };
+                                ts.emit_hazard(ev.seq as u64, kind_str, h.write_addr, h.write_size, h.alloc_base, h.alloc_size, h.overflow_bytes, h.type_name.as_deref(), h.field_name.as_deref());
+                            }
                             world.hazards.push(h);
                         }
                     }
@@ -104,9 +119,16 @@ fn process_event(
                                     world.heap_allocs.check_size(ev.value, pointee_ti);
                                     if world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq as u64) {
                                         world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
+                                        if let Some(ref mut ts) = topo {
+                                            ts.emit_stamp(ev.seq as u64, ev.value, &pointee_ti.name, pointee_ti.byte_size, &h_name, pointee_ti.fields.len());
+                                        }
                                     }
                                 }
                             }
+                        }
+                        if let Some(ref mut ts) = topo {
+                            let pointee_name = h_type.name.strip_prefix('*').unwrap_or(&h_type.name);
+                            ts.emit_link(ev.seq as u64, &h_name, ev.addr, ev.value, pointee_name, &h_name);
                         }
                     }
                 }
@@ -216,19 +238,24 @@ fn process_event(
             let ptr = ev.addr;
             let size = ev.size as u64;
             if let Some(old_size) = world.heap_allocs.on_alloc(ptr, size) {
-                // address reuse: force-purge stale type projections
                 world.stm.purge_range(ptr, old_size);
                 heap_graph.on_free(ptr, old_size);
+            }
+            if let Some(ref mut ts) = topo {
+                ts.emit_alloc(ev.seq as u64, ev.thread_id, ptr, size);
             }
             true
         }
         EVENT_FREE => {
             let ptr = ev.addr;
-            if let Some(old_size) = world.heap_allocs.on_free(ptr) {
+            let freed_size = world.heap_allocs.on_free(ptr);
+            if let Some(old_size) = freed_size {
                 world.stm.purge_range(ptr, old_size);
                 heap_graph.on_free(ptr, old_size);
+                if let Some(ref mut ts) = topo {
+                    ts.emit_free(ev.seq as u64, ev.thread_id, ptr, old_size);
+                }
             }
-            // orphan free (no matching ALLOC): keep STM projections
             true
         }
         EVENT_MODULE_LOAD => {
@@ -289,7 +316,7 @@ fn populate_globals(
     addr_index.finalize();
 }
 
-fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>) {
+fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
     let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
@@ -321,6 +348,19 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         }
     });
 
+    let mut topo: Option<TopologyStream> = topo_path.as_ref().and_then(|p| {
+        match TopologyStream::create(std::path::Path::new(p)) {
+            Ok(t) => {
+                eprintln!("memvis: topology stream → {}", p);
+                Some(t)
+            }
+            Err(e) => {
+                eprintln!("memvis: failed to create topology stream: {}", e);
+                None
+            }
+        }
+    });
+
     if once {
         run_headless(
             &mut orch,
@@ -338,11 +378,21 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             &mut heap_graph,
             &mut heap_oracle,
             &mut recorder,
+            &mut topo,
         );
+        if let Some(ref mut ts) = topo {
+            ts.emit_summary(total, world.node_count(), world.edge_count(), world.stm.len(), world.heap_allocs.live_count(), world.hazards.len());
+        }
         if let Some(rec) = recorder {
             match rec.finish() {
                 Ok(n) => eprintln!("memvis: recorded {} events", n),
                 Err(e) => eprintln!("memvis: recording finalize error: {}", e),
+            }
+        }
+        if let Some(ts) = topo {
+            match ts.finish() {
+                Ok(n) => eprintln!("memvis: topology: {} lines", n),
+                Err(e) => eprintln!("memvis: topology finalize error: {}", e),
             }
         }
         return;
@@ -410,6 +460,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                         &mut shadow_regs,
                         &mut heap_graph,
                         &mut heap_oracle,
+                        &mut topo,
                     );
                     if let Some(ref mut rec) = recorder {
                         let _ = rec.record(ev);
@@ -494,10 +545,19 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
         }
     }
 
+    if let Some(ref mut ts) = topo {
+        ts.emit_summary(total, world.node_count(), world.edge_count(), world.stm.len(), world.heap_allocs.live_count(), world.hazards.len());
+    }
     if let Some(rec) = recorder {
         match rec.finish() {
             Ok(n) => eprintln!("memvis: recorded {} events", n),
             Err(e) => eprintln!("memvis: recording finalize error: {}", e),
+        }
+    }
+    if let Some(ts) = topo {
+        match ts.finish() {
+            Ok(n) => eprintln!("memvis: topology: {} lines", n),
+            Err(e) => eprintln!("memvis: topology finalize error: {}", e),
         }
     }
     tui::restore_terminal(&mut terminal);
@@ -520,6 +580,7 @@ fn run_headless(
     heap_graph: &mut HeapGraph,
     heap_oracle: &mut HeapOracle,
     recorder: &mut Option<EventRecorder>,
+    recorder_topo: &mut Option<TopologyStream>,
 ) {
     use std::io::Write;
     let stdout = io::stdout();
@@ -565,6 +626,7 @@ fn run_headless(
                     shadow_regs,
                     heap_graph,
                     heap_oracle,
+                    recorder_topo,
                 );
                 if let Some(ref mut rec) = recorder {
                     let _ = rec.record(ev);
@@ -866,7 +928,7 @@ fn headless_render(
     }
 }
 
-fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool) {
+fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path: Option<String>) {
     use std::io::Write;
 
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
@@ -905,6 +967,19 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool) {
     let mut heap_oracle = HeapOracle::new();
     // dummy orchestrator for headless_render (LAG will be 0)
     let orch = RingOrchestrator::new();
+
+    let mut topo: Option<TopologyStream> = topo_path.as_ref().and_then(|p| {
+        match TopologyStream::create(std::path::Path::new(p)) {
+            Ok(t) => {
+                eprintln!("memvis: topology stream → {}", p);
+                Some(t)
+            }
+            Err(e) => {
+                eprintln!("memvis: failed to create topology stream: {}", e);
+                None
+            }
+        }
+    });
 
     if let Some(ref info) = dwarf_info {
         populate_globals(info, 0, &mut addr_index, &mut world);
@@ -967,6 +1042,7 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool) {
                 &mut shadow_regs,
                 &mut heap_graph,
                 &mut heap_oracle,
+                &mut topo,
             );
             if interesting {
                 journal.push_back(JournalEntry {
@@ -1000,6 +1076,16 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool) {
         }
         if total & 0xFFFF == 0 {
             heap_graph.gc_stale(total, 500_000);
+        }
+    }
+
+    if let Some(ref mut ts) = topo {
+        ts.emit_summary(total, world.node_count(), world.edge_count(), world.stm.len(), world.heap_allocs.live_count(), world.hazards.len());
+    }
+    if let Some(ts) = topo {
+        match ts.finish() {
+            Ok(n) => eprintln!("memvis: topology: {} lines", n),
+            Err(e) => eprintln!("memvis: topology finalize error: {}", e),
         }
     }
 
@@ -1101,7 +1187,7 @@ fn install_signal_handlers() {
     }
 }
 
-fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path: Option<String>) {
+fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>) {
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
         eprintln!("memvis: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
@@ -1136,7 +1222,7 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
                 eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
-                run(orch, dwarf_info, once, min_events, record_path);
+                run(orch, dwarf_info, once, min_events, record_path, topo_path);
                 return;
             }
         }
@@ -1144,7 +1230,7 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path
     }
 }
 
-fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, record_path: Option<String>) {
+fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>) {
     let drrun = match find_drrun() {
         Some(p) => p,
         None => {
@@ -1201,7 +1287,7 @@ fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, rec
     let target_owned = target.to_string();
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_consumer(Some(&target_owned), once, min_events, record_path))
+        .spawn(move || run_consumer(Some(&target_owned), once, min_events, record_path, topo_path))
         .expect("memvis: failed to spawn consumer thread");
     let _ = handle.join();
 
@@ -1221,6 +1307,7 @@ fn print_usage() {
     eprintln!("  memvis --once <target> [args...]  Headless mode (print to stdout, exit)");
     eprintln!("  memvis --record <file> [--once] <target>  Record events to file");
     eprintln!("  memvis --replay <file> [--once] <target.elf>  Replay recorded events");
+    eprintln!("  memvis --export-topology <file.jsonl> [--once] <target>  Stream graph deltas");
     eprintln!("  memvis --consumer-only [--once] <target.elf>");
     eprintln!("                                    Consumer-only (tracer started separately)");
     eprintln!();
@@ -1252,18 +1339,24 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--replay")
         .map(|w| w[1].clone());
+    let topo_path: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--export-topology")
+        .map(|w| w[1].clone());
 
     // --replay mode: read events from file, no tracer needed
     if let Some(ref rp) = replay_path {
+        let tp_ref = topo_path.as_deref().unwrap_or("");
         let elf_path: Option<String> = args
             .iter()
-            .filter(|a| !a.starts_with('-') && *a != &args[0] && *a != rp)
+            .filter(|a| !a.starts_with('-') && *a != &args[0] && *a != rp && a.as_str() != tp_ref)
             .find(|a| a.parse::<u64>().is_err())
             .cloned();
         let rp_owned = rp.clone();
+        let tp_owned = topo_path.clone();
         let handle = thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || run_replay(&rp_owned, elf_path.as_deref(), once))
+            .spawn(move || run_replay(&rp_owned, elf_path.as_deref(), once, tp_owned))
             .expect("memvis: failed to spawn replay thread");
         let _ = handle.join();
         return;
@@ -1278,7 +1371,7 @@ fn main() {
             .cloned();
         let handle = thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events, record_path))
+            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events, record_path, topo_path))
             .expect("memvis: failed to spawn consumer thread");
         let _ = handle.join();
         return;
@@ -1293,7 +1386,7 @@ fn main() {
             skip_next = false;
             continue;
         }
-        if a == "--min-events" || a == "--record" || a == "--replay" {
+        if a == "--min-events" || a == "--record" || a == "--replay" || a == "--export-topology" {
             skip_next = true;
             continue;
         }
@@ -1316,5 +1409,5 @@ fn main() {
     let target = &args[target_idx];
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(target, &target_args, once, min_events, record_path);
+    launch(target, &target_args, once, min_events, record_path, topo_path);
 }
