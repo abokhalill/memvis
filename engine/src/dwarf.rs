@@ -6,7 +6,7 @@ use gimli::{
     AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, LittleEndian, Operation, Range,
     Unit, UnitOffset,
 };
-use object::{Object, ObjectSection, ObjectSegment};
+use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 use std::collections::{BTreeMap, HashMap};
 use std::fs;
 
@@ -462,6 +462,10 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
 
     let mut globals = Vec::new();
     let mut functions = BTreeMap::new();
+    let mut type_registry: HashMap<String, TypeInfo> = HashMap::new();
+    // spec globals: variables with DW_AT_specification but no DW_AT_location.
+    // keyed by name → TypeInfo; address resolved from ELF symtab after DWARF pass.
+    let mut spec_globals: HashMap<String, TypeInfo> = HashMap::new();
 
     let mut iter = dw.units();
     while let Some(header) = iter.next()? {
@@ -473,6 +477,14 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
             if tag == gimli::DW_TAG_variable {
                 if let Some(g) = try_extract_global(&dw, &unit, entry) {
                     globals.push(g);
+                } else if let Some((name, ti)) = try_extract_spec_global(&dw, &unit, entry) {
+                    // prefer richest definition when multiple CUs emit the same spec
+                    spec_globals
+                        .entry(name)
+                        .and_modify(|existing| {
+                            if ti.fields.len() > existing.fields.len() { *existing = ti.clone(); }
+                        })
+                        .or_insert(ti);
                 }
             } else if tag == gimli::DW_TAG_subprogram {
                 if let Some(f) = try_extract_function(&dw, &unit, entry) {
@@ -482,22 +494,80 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                 if let Some(f) = try_extract_inlined(&dw, &unit, entry) {
                     functions.insert(f.low_pc, f);
                 }
+            } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
+                // harvest canonical struct/union types into the global registry.
+                // resolve the struct DIE itself (it IS the type); prefer the richest
+                // definition when multiple CUs declare the same name.
+                if let Some(ti) = resolve_type_at(&dw, &unit, entry.offset(), 0) {
+                    if !ti.name.is_empty() && ti.name != "<anon>" && !ti.is_pointer && ti.byte_size > 0 && !ti.fields.is_empty() {
+                        let entry_fields = ti.fields.len();
+                        type_registry
+                            .entry(ti.name.clone())
+                            .and_modify(|existing| {
+                                if entry_fields > existing.fields.len() { *existing = ti.clone(); }
+                            })
+                            .or_insert(ti);
+                    }
+                }
             }
         }
 
         extract_locals(&dw, &unit, &mut functions)?;
     }
 
+    // ── ELF symtab fallback for spec globals ──────────────────────────────
+    // Variables like Redis `server` have DW_AT_specification but no DW_AT_location;
+    // GCC puts the address only in the ELF symbol table.
+    if !spec_globals.is_empty() {
+        let existing_names: std::collections::HashSet<String> =
+            globals.iter().map(|g| g.name.clone()).collect();
+        let mut resolved_globals: Vec<GlobalVar> = Vec::new();
+        for sym in obj.symbols() {
+            let name = match sym.name() {
+                Ok(n) => n,
+                Err(_) => continue,
+            };
+            if !spec_globals.contains_key(name) { continue; }
+            if existing_names.contains(name) { continue; }
+            if sym.size() == 0 { continue; }
+            if !matches!(sym.kind(), SymbolKind::Data | SymbolKind::Unknown) { continue; }
+            let addr = sym.address();
+            if addr == 0 { continue; }
+            if let Some(ti) = spec_globals.remove(name) {
+                let size = if ti.byte_size > 0 { ti.byte_size } else { sym.size() };
+                resolved_globals.push(GlobalVar {
+                    name: name.to_string(),
+                    addr,
+                    size,
+                    type_info: ti,
+                    location: LocationTable::single(LocationPiece::Address(addr)),
+                });
+            }
+            if spec_globals.is_empty() { break; }
+        }
+        let resolved = resolved_globals.len();
+        globals.extend(resolved_globals);
+        if resolved > 0 {
+            eprintln!("dwarf: resolved {} spec-globals via ELF symtab", resolved);
+        }
+    }
+
     eprintln!(
-        "dwarf: {} globals, {} functions extracted",
+        "dwarf: {} globals, {} functions, {} types harvested",
         globals.len(),
-        functions.len()
+        functions.len(),
+        type_registry.len()
     );
 
-    let mut type_registry: HashMap<String, TypeInfo> = HashMap::new();
+    // supplementary pass: harvest types reachable through globals/locals
+    // (catches typedef-only paths the DIE walker missed)
     fn register_recursive(ti: &TypeInfo, reg: &mut HashMap<String, TypeInfo>) {
         if !ti.fields.is_empty() && ti.byte_size > 0 && !ti.name.is_empty() && !ti.is_pointer {
-            reg.entry(ti.name.clone()).or_insert_with(|| ti.clone());
+            reg.entry(ti.name.clone())
+                .and_modify(|existing| {
+                    if ti.fields.len() > existing.fields.len() { *existing = ti.clone(); }
+                })
+                .or_insert_with(|| ti.clone());
         }
         for f in &ti.fields {
             register_recursive(&f.type_info, reg);
@@ -779,6 +849,31 @@ fn try_extract_global<'a>(
         type_info,
         location,
     })
+}
+
+/// Extract a global variable that uses DW_AT_specification (no DW_AT_location).
+/// Returns (name, type_info) — address will be resolved from the ELF symbol table.
+fn try_extract_spec_global<'a>(
+    dwarf: &Dwarf<R<'a>>,
+    unit: &Unit<R<'a>>,
+    entry: &DebuggingInformationEntry<R<'a>>,
+) -> Option<(String, TypeInfo)> {
+    // must NOT have DW_AT_location (those are handled by try_extract_global)
+    if entry.attr_value(gimli::DW_AT_location).ok().flatten().is_some() {
+        return None;
+    }
+    // must have DW_AT_specification pointing at a declaration DIE
+    let spec_offset = match entry.attr_value(gimli::DW_AT_specification).ok().flatten()? {
+        AttributeValue::UnitRef(off) => off,
+        _ => return None,
+    };
+    let spec_entry = unit.entry(spec_offset).ok()?;
+    let name = attr_name(dwarf, unit, &spec_entry)?;
+    let type_info = resolve_type(dwarf, unit, &spec_entry)?;
+    if type_info.byte_size == 0 {
+        return None;
+    }
+    Some((name, type_info))
 }
 
 fn try_extract_function<'a>(

@@ -90,6 +90,8 @@ struct CtlHeader {
     thread_count: AtomicU32,
     max_threads: u32,
     build_hash: u32,
+    target_pid: u32,
+    _pad0: u32,
     threads: [ThreadEntry; MAX_THREADS],
 }
 
@@ -258,10 +260,16 @@ impl RingOrchestrator {
             );
             return false;
         }
-        eprintln!("memvis: ctl attached (proto={}, build_hash=0x{:08x})",
-                  hdr.proto_version, hdr.build_hash);
+        eprintln!("memvis: ctl attached (proto={}, build_hash=0x{:08x}, target_pid={})",
+                  hdr.proto_version, hdr.build_hash, hdr.target_pid);
         self.ctl = Some(shm);
         true
+    }
+
+    pub fn target_pid(&self) -> Option<u32> {
+        let shm = self.ctl.as_ref()?;
+        let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
+        if hdr.target_pid == 0 { None } else { Some(hdr.target_pid) }
     }
 
     pub fn poll_new_rings(&mut self) {

@@ -139,6 +139,8 @@ map_ctl_ring(void)
     DR_ASSERT(g_ctl != MAP_FAILED);
     if (g_ctl->magic != MEMVIS_CTL_MAGIC)
         memvis_ctl_init(g_ctl);
+    /* publish target PID so engine can /proc/<pid>/mem warm-scan globals */
+    g_ctl->target_pid = (uint32_t)dr_get_process_id();
 }
 
 /* per-BB state. reg_addr reserved at instr N, unreserved at N+1. */

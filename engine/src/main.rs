@@ -115,6 +115,8 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let mut last_render = time::Instant::now();
     let mut last_discovery = time::Instant::now();
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
+    let mut warm_scan_done = false;
+    let mut warm_idle_rounds: u32 = 0;
 
     loop {
         tui::handle_input(&mut app);
@@ -203,6 +205,23 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                 heap_graph.gc_stale(total, 500_000);
             }
             orch.update_backpressure();
+
+            // warm-scan trigger: after relocation known + sustained idle
+            // (DynamoRIO makes startup slow; wait for target to finish init)
+            if tick_events == 0 { warm_idle_rounds += 1; } else { warm_idle_rounds = 0; }
+            if !warm_scan_done && relocation_delta.is_some() && total > 2_000_000 && warm_idle_rounds >= 10 {
+                if let (Some(ref info), Some(pid), Some(delta)) =
+                    (&dwarf_info, orch.target_pid(), relocation_delta) {
+                    match reconciler::warm_scan(info, pid, delta, &mut world, &heap_oracle, &mut topo, 10_000, 8) {
+                        Ok(s) => eprintln!(
+                            "memvis: warm-scan: globals={} reads={} null={} missing_ti={} enqueued={} stamps={} depth={} errors={} not_heap={}",
+                            s.globals_scanned, s.reads, s.null_ptrs, s.missing_pointee_ti,
+                            s.enqueued, s.stamps_applied, s.max_depth_reached, s.read_errors, s.not_heap),
+                        Err(e) => eprintln!("memvis: warm-scan failed: {}", e),
+                    }
+                }
+                warm_scan_done = true;
+            }
         }
 
         let now = time::Instant::now();
@@ -291,6 +310,7 @@ fn run_headless(
     let mut last_discovery = time::Instant::now();
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
     let mut idle_rounds: u32 = 0;
+    let mut warm_scan_done = false;
 
     loop {
         let now_disc = time::Instant::now();
@@ -377,6 +397,21 @@ fn run_headless(
         if *total & 0xFFF == 0 {
             world.cache_heat_tick();
             world.cl_tracker_tick();
+        }
+
+        // warm-scan trigger: after enough events + sustained idle (target quiescent)
+        if !warm_scan_done && relocation_delta.is_some() && *total > 2_000_000 && drained == 0 && idle_rounds >= 10 {
+            if let (Some(ref info), Some(pid), Some(delta)) =
+                (dwarf_info, orch.target_pid(), *relocation_delta) {
+                match reconciler::warm_scan(info, pid, delta, world, heap_oracle, recorder_topo, 10_000, 8) {
+                    Ok(s) => eprintln!(
+                        "memvis: warm-scan: globals={} reads={} null={} missing_ti={} enqueued={} stamps={} depth={} errors={} not_heap={}",
+                        s.globals_scanned, s.reads, s.null_ptrs, s.missing_pointee_ti,
+                        s.enqueued, s.stamps_applied, s.max_depth_reached, s.read_errors, s.not_heap),
+                    Err(e) => eprintln!("memvis: warm-scan failed: {}", e),
+                }
+            }
+            warm_scan_done = true;
         }
 
         // safety valve: if we've been running a long time with no tracer, bail

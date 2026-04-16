@@ -2,9 +2,12 @@
 
 // Core event reconciler: process_event + populate_globals, extracted for library consumers.
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs::File;
+use std::io;
+use std::os::unix::fs::FileExt;
 
-use crate::dwarf::{self, DwarfInfo};
+use crate::dwarf::{self, DwarfInfo, TypeInfo};
 use crate::heap_graph::{HeapGraph, HeapOracle};
 use crate::index::{AddressIndex, FrameId, NodeId};
 use crate::ring::{Event, RingOrchestrator};
@@ -360,6 +363,144 @@ fn register_fields_recursive(
                 world,
                 depth + 1,
             );
+        }
+    }
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+pub struct WarmScanStats {
+    pub reads: u64,
+    pub stamps_applied: u64,
+    pub max_depth_reached: u32,
+    pub read_errors: u64,
+    pub queue_visits: u64,
+    pub enqueued: u64,
+    pub null_ptrs: u64,
+    pub missing_pointee_ti: u64,
+    pub not_heap: u64,
+    pub globals_scanned: u64,
+}
+
+/// Engine-side warm-scan: reads /proc/<pid>/mem to seed-stamp cold global pointer fields.
+/// Solves the Initial State Problem — globals whose pointer values were written before
+/// memvis attached and never rewritten (e.g. server.db in Redis).
+/// BFS-walks the topology from global roots, bounded by max_reads and max_depth.
+pub fn warm_scan(
+    info: &DwarfInfo,
+    pid: u32,
+    delta: u64,
+    world: &mut WorldState,
+    heap_oracle: &HeapOracle,
+    topo: &mut Option<TopologyStream>,
+    max_reads: u64,
+    max_depth: u32,
+) -> io::Result<WarmScanStats> {
+    let mem_path = format!("/proc/{}/mem", pid);
+    let mem = File::open(&mem_path)?;
+    let mut stats = WarmScanStats::default();
+    let mut visited: HashSet<u64> = HashSet::new();
+    let mut queue: VecDeque<(u64, TypeInfo, String, u32)> = VecDeque::new();
+
+    // seed: scan all globals for pointer fields (compile-time recursion through nested structs)
+    for g in &info.globals {
+        if stats.reads >= max_reads { break; }
+        let base = g.addr.wrapping_add(delta);
+        stats.globals_scanned += 1;
+        scan_ptr_fields(
+            &mem, base, &g.type_info, &g.name, 1,
+            &mut queue, &mut stats, heap_oracle, &info.type_registry, topo, max_reads,
+        );
+    }
+
+    // BFS through heap. Stamp even non-heap pointers (bss/data globals that point
+    // into other global regions) to capture cross-global edges as well.
+    while let Some((target_addr, pointee_ti, source_name, depth)) = queue.pop_front() {
+        if stats.reads >= max_reads { break; }
+        if depth > max_depth { continue; }
+        if !visited.insert(target_addr) { continue; }
+        stats.queue_visits += 1;
+        stats.max_depth_reached = stats.max_depth_reached.max(depth);
+
+        let on_heap = heap_oracle.is_heap(target_addr);
+        if on_heap {
+            world.heap_allocs.check_size(target_addr, &pointee_ti);
+        } else {
+            stats.not_heap += 1;
+        }
+        if world.stm.stamp_type(target_addr, &pointee_ti, &source_name, 0) {
+            stats.stamps_applied += 1;
+            if let Some(ref mut ts) = topo {
+                ts.emit_cold_stamp(
+                    target_addr, &pointee_ti.name, pointee_ti.byte_size,
+                    &source_name, pointee_ti.fields.len(), depth,
+                );
+            }
+        }
+        scan_ptr_fields(
+            &mem, target_addr, &pointee_ti, &source_name, depth + 1,
+            &mut queue, &mut stats, heap_oracle, &info.type_registry, topo, max_reads,
+        );
+    }
+
+    Ok(stats)
+}
+
+fn scan_ptr_fields(
+    mem: &File,
+    base: u64,
+    ti: &TypeInfo,
+    source: &str,
+    depth: u32,
+    queue: &mut VecDeque<(u64, TypeInfo, String, u32)>,
+    stats: &mut WarmScanStats,
+    heap_oracle: &HeapOracle,
+    type_registry: &HashMap<String, TypeInfo>,
+    topo: &mut Option<TopologyStream>,
+    max_reads: u64,
+) {
+    for f in &ti.fields {
+        if stats.reads >= max_reads { return; }
+        if f.name == "<pointee>" { continue; }
+        let faddr = base.wrapping_add(f.byte_offset);
+        if f.type_info.is_pointer && f.byte_size == 8 {
+            let mut buf = [0u8; 8];
+            match mem.read_at(&mut buf, faddr) {
+                Ok(8) => {
+                    stats.reads += 1;
+                    let ptr = u64::from_le_bytes(buf);
+                    if ptr == 0 { stats.null_ptrs += 1; continue; }
+                    let pointee_name = f.type_info.name.strip_prefix('*').unwrap_or("");
+                    let qualified = format!("{}.{}", source, f.name);
+                    // prefer the registry's canonical (deep) type; fall back to
+                    // the pointer's synthetic <pointee> field carried in f.type_info.
+                    let pointee_ti_opt = type_registry.get(pointee_name)
+                        .cloned()
+                        .or_else(|| f.type_info.fields.iter()
+                            .find(|sf| sf.name == "<pointee>")
+                            .map(|sf| sf.type_info.clone()));
+                    match pointee_ti_opt {
+                        Some(pointee_ti) if pointee_ti.byte_size > 0 => {
+                            if let Some(ref mut ts) = topo {
+                                ts.emit_cold_link(source, faddr, ptr, pointee_name, &f.name);
+                            }
+                            queue.push_back((ptr, pointee_ti, qualified, depth));
+                            stats.enqueued += 1;
+                        }
+                        _ => { stats.missing_pointee_ti += 1; }
+                    }
+                }
+                Ok(_) | Err(_) => stats.read_errors += 1,
+            }
+        } else if !f.type_info.is_pointer && !f.type_info.fields.is_empty() {
+            // compile-time recursion into nested struct/array fields (no memory read)
+            // bounded by a conservative depth (same budget as BFS walk depth)
+            if depth <= 6 {
+                scan_ptr_fields(
+                    mem, faddr, &f.type_info,
+                    &format!("{}.{}", source, f.name),
+                    depth, queue, stats, heap_oracle, type_registry, topo, max_reads,
+                );
+            }
         }
     }
 }

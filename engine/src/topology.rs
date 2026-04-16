@@ -46,6 +46,39 @@ impl TopologyStream {
         self.lines += 1;
     }
 
+    pub fn emit_cold_stamp(
+        &mut self,
+        target_addr: u64,
+        type_name: &str,
+        type_size: u64,
+        source_name: &str,
+        field_count: usize,
+        depth: u32,
+    ) {
+        let _ = writeln!(
+            self.w,
+            r#"{{"type":"COLD_STAMP","addr":"0x{:x}","type_name":"{}","type_size":{},"source":"{}","fields":{},"depth":{}}}"#,
+            target_addr, esc(type_name), type_size, esc(source_name), field_count, depth
+        );
+        self.lines += 1;
+    }
+
+    pub fn emit_cold_link(
+        &mut self,
+        from_name: &str,
+        from_addr: u64,
+        to_addr: u64,
+        pointee_type: &str,
+        edge_field: &str,
+    ) {
+        let _ = writeln!(
+            self.w,
+            r#"{{"type":"COLD_LINK","from":"{}","from_addr":"0x{:x}","to_addr":"0x{:x}","pointee_type":"{}","edge":"{}"}}"#,
+            esc(from_name), from_addr, to_addr, esc(pointee_type), esc(edge_field)
+        );
+        self.lines += 1;
+    }
+
     pub fn emit_stamp(
         &mut self,
         seq: u64,

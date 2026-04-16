@@ -340,6 +340,8 @@ typedef struct {
     _Atomic uint32_t thread_count;
     uint32_t max_threads;
     uint32_t build_hash;
+    uint32_t target_pid;  /* tracer writes getpid() for engine-side /proc/<pid>/mem warm-scan */
+    uint32_t _pad0;
     memvis_thread_entry_t threads[MEMVIS_MAX_THREADS];
 } memvis_ctl_header_t;
 
