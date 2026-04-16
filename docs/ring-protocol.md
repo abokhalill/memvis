@@ -125,6 +125,11 @@ Register indices follow the memvis layout (not DWARF numbering):
 The producer checks that 7 slots are available before writing a snapshot. If
 there is insufficient space, the entire snapshot is dropped.
 
+**Recording**: `EventRecorder::record_reg_snapshot` writes the same 7-event
+layout to disk. The offline replayer (`memvis-diff`, `memvis --replay`)
+detects the header, reads 6 continuations, and reconstructs the 18-register
+array for `ShadowRegisterFile` population.
+
 ## Ring header
 
 The ring header is a 192-byte (3 cache lines) struct:

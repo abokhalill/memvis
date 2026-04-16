@@ -1,12 +1,15 @@
 # Engine
 
-The engine is the consumer process. It is a Rust binary (`memvis`) that
-attaches to the tracer's shared memory rings, drains events, correlates them
-with DWARF debug information, and renders a live, structure-aware view of
-the target program's memory state.
+The engine is a Rust crate (`engine/`) that produces three binaries:
 
-This document covers each subsystem. All claims are derived from the current
-`engine/src/` source.
+| Binary | Entry point | Purpose |
+|---|---|---|
+| `memvis` | `main.rs` | Live instrumentation (TUI/headless), event recording, event replay |
+| `memvis-diff` | `diff.rs` | Offline ASLR-invariant differential topology comparison |
+| `memvis-check` | `check.rs` | CI/CD structural assertion engine over JSONL topology files |
+
+All three share the same library modules via `lib.rs`. This document covers
+each subsystem. All claims are derived from the current `engine/src/` source.
 
 ## Subsystems
 
@@ -14,27 +17,32 @@ This document covers each subsystem. All claims are derived from the current
                        +------------------+
                        |    DWARF parser  |  (startup, one-shot)
                        |    dwarf.rs      |
+                       |  + ELF symtab    |
                        +--------+---------+
                                 |
                       DwarfInfo + type_registry
                                 |
                                 v
 +------------------+   +------------------+   +------------------+
-|  Ring            |-->|  Event processor |-->|  World state     |
-|  orchestrator    |   |     main.rs      |   |    world.rs      |
-|  ring.rs         |   |                  |   |  Arc<WorldInner> |
-+------------------+   +---+---------+----+   +--------+---------+
-                            |         |                 |
-                     AddressIndex  ShadowRegs    CoW snapshot
-                     index.rs     shadow_regs.rs        |
-                            |         |                 v
-                     HeapGraph    HeapOracle   +------------------+
-                     heap_graph.rs             |  Renderer        |
-                            |                  |  tui.rs (TUI)    |
-                     ShadowTypeMap (STM)       |  main.rs (text)  |
-                     HeapAllocTracker          +------------------+
-                     Visual ASan
-                     world.rs
+|  Ring            |-->|  Reconciler      |-->|  World state     |
+|  orchestrator    |   |  reconciler.rs   |   |    world.rs      |
+|  ring.rs         |   |  process_event   |   |  Arc<WorldInner> |
++------------------+   |  warm_scan       |   +--------+---------+
+         |              +---+---------+----+            |
+   EventPlayer              |         |          CoW snapshot
+   record.rs         AddressIndex  ShadowRegs          |
+         |           index.rs     shadow_regs.rs       v
+         v                  |         |       +------------------+
+   memvis-diff       HeapGraph    HeapOracle  |  Renderer        |
+   diff.rs           heap_graph.rs            |  tui.rs (TUI)    |
+         |                  |                 |  main.rs (text)  |
+   memvis-check      ShadowTypeMap (STM)      +------------------+
+   check.rs          HeapAllocTracker                  |
+         |           Visual ASan               EventRecorder
+   topology.jsonl    world.rs                  record.rs
+   topology.rs                                        |
+                                               TopologyStream
+                                               topology.rs
 ```
 
 ## DWARF parser (`dwarf.rs`)
@@ -48,6 +56,12 @@ A global variable is a `DW_TAG_variable` with a `DW_AT_location` attribute
 that resolves to a fixed address (`DW_OP_addr`). The parser extracts name,
 address, and type information via recursive `DW_AT_type` resolution (including
 struct field decomposition, depth-limited to 2 levels).
+
+**ELF symtab fallback**: Globals with `DW_AT_specification` but no
+`DW_AT_location` (common in C++ and large C programs like Redis) have their
+addresses resolved from the ELF symbol table via `try_extract_spec_global`.
+This recovers globals that would otherwise be invisible to the STM and
+warm-scan.
 
 ### Functions
 
@@ -334,16 +348,22 @@ while queue not empty AND stamped < 64:
     base = queue.pop_front()
     proj = stm.get(base)           // must be stamped
     obj  = heap_graph.find(base)   // must have observed fields
+    candidates = []
     for each pointer field in proj.type_info.fields:
         val = obj.fields[field.byte_offset].last_value
         if val != 0 AND val not in stm AND val in live_allocs:
             pointee_type = type_registry[field.type_info.name.strip_prefix('*')]
-            stm.stamp(val, pointee_type, field.name, seq)
-            stamped += 1
-            queue.push_back(val)
+            candidates.push((field.name, val, pointee_type))
+    candidates.sort_by(field_name)          // deterministic order
+    for (name, val, type) in candidates:
+        stm.stamp(val, type, name, seq)
+        stamped += 1
+        queue.push_back(val)
 ```
 
-The fuel budget (64 nodes) prevents latency spikes on large graphs. The BFS
+The fuel budget (64 nodes) prevents latency spikes on large graphs.
+**Deterministic BFS**: candidates are sorted by field name before pushing to
+the queue, ensuring identical discovery order across ASLR'd runs. The BFS
 uses `find_object_base` on the HeapGraph to handle cases where the STM stamp
 address differs from the HeapGraph's clustering base, adjusting field offsets
 by the delta.
@@ -410,6 +430,18 @@ HeapHole hazards are only reported if the write address falls within the
 span `[min_alloc_addr, max_alloc_addr + max_alloc_size)`. This prevents
 false positives from globals and stack addresses that `HeapOracle` loosely
 classifies as heap.
+
+### Register context
+
+Each `HeapHazard` carries two additional fields populated at creation time
+in `reconciler::process_event`:
+
+- **`pc`** (`u64`): faulting program counter from `ev.rip_lo` (module-relative).
+- **`reg_snapshot`** (`Option<[u64; 18]>`): full register values from the
+  per-thread `ShadowRegisterFile::values()` at hazard time.
+
+The diff output extracts a compact `HazardRegContext` with `pc`, `rax`,
+`rdi`, `rsi`, `rdx`, `rsp` for each hazard.
 
 ### Deduplication
 
@@ -515,17 +547,24 @@ pub struct SnapshotRing {
 
 Each entry: snapshot + instruction counter + render tick + event sequence.
 
-## Event processing (`main.rs`)
+## Event reconciler (`reconciler.rs`)
 
-Central dispatch for all event types:
+Extracted from `main.rs` into a library module for consumption by both the
+live engine and `memvis-diff`. Contains three public functions:
+
+- **`process_event`**: Central dispatch for all event types.
+- **`populate_globals`**: Inserts DWARF globals into the address index.
+- **`warm_scan`**: Engine-side BFS over `/proc/<pid>/mem`.
+
+### Event dispatch table
 
 | Event | Action |
 |---|---|
-| `WRITE` (0) | `cl_tracker.record_write`. `shadow_regs.check_coherence`. If heap: `heap_graph.process_write`, `stm.propagate_field_write` (+ RTR on new stamp), `heap_allocs.check_write_bounds` (Visual ASan). `addr_index.lookup` -> `world.update_value` + `world.update_edge`. If pointer to heap: `stm.stamp_type` + RTR scan. |
+| `WRITE` (0) | `cl_tracker.record_write`. `shadow_regs.check_coherence`. If heap: `heap_graph.process_write`, `stm.propagate_field_write` (+ RTR on new stamp), `heap_allocs.check_write_bounds` (Visual ASan, populates `pc` + `reg_snapshot` on hazard). `addr_index.lookup` → `world.update_value` + `world.update_edge`. If pointer to heap: `stm.stamp_type` + RTR scan. |
 | `READ` (1) | Journal only (no state mutation). |
 | `CALL` (2) | DWARF function lookup (relocated PC). Push shadow frame. Insert locals into index. |
 | `RETURN` (3) | Pop shadow frame. Remove locals. Queue deferred node removal. |
-| `REG_SNAPSHOT` (5) | Pop 6 continuation events. Unpack 18 registers. `shadow_regs.on_snapshot`. `world.reg_file` update. |
+| `REG_SNAPSHOT` (5) | Pop 6 continuation events from ring. Unpack 18 registers. `shadow_regs.apply_snapshot`. `world.update_regs`. |
 | `CACHE_MISS` (6) | `addr_index.lookup`. Record miss in `cache_heat`. |
 | `MODULE_LOAD` (7) | Compute relocation delta. Re-populate globals with relocated addresses. Register heap oracle module range. |
 | `TAIL_CALL` (8) | Like CALL but does not push a new shadow frame (replaces current). |
@@ -536,6 +575,24 @@ Central dispatch for all event types:
 Returns `true` if the event was "interesting" (tracked write or control
 event). Untracked writes return `false` and are not journaled (~90% of
 writes in typical workloads).
+
+### Warm-scan
+
+Engine-side BFS that reads `/proc/<pid>/mem` to discover cold data structures.
+Triggered after target quiescence (2M events + 10 consecutive idle rounds).
+
+```
+for each DWARF global with pointer fields:
+    read pointer value from /proc/<pid>/mem
+    if value is a live heap allocation:
+        resolve pointee type from type_registry
+        stm.stamp_type(value, pointee_type, field_name)
+        enqueue for recursive scan (depth-limited)
+```
+
+Emits `COLD_STAMP` and `COLD_LINK` events to the topology stream.
+Discovery statistics: globals scanned, reads, null pointers, missing
+pointee types, stamps, max depth, read errors, non-heap pointers.
 
 ### Periodic maintenance
 
@@ -625,21 +682,150 @@ Headless output sections:
 
 Displayed with K/M suffixes.
 
+## Event recording (`record.rs`)
+
+### File format
+
+```
+Bytes 0..8:    magic  = 0x4D454D5649535243 ("MEMVISRC")
+Bytes 8..12:   proto_version (u32) = 3
+Bytes 12..20:  event_count (u64, backpatched on close)
+Bytes 20..24:  reserved (u32, zero)
+Bytes 24..:    packed events, 32 bytes each
+```
+
+Each event on disk: `addr(8) + size(4) + tid(2) + seq(2) + value(8) + kind_flags(4) + rip_lo(4) = 32 bytes`.
+
+### Compound REG_SNAPSHOT recording
+
+`EventRecorder::record_reg_snapshot(header, regs)` writes 7 consecutive events:
+
+- Event 0: header (kind = REG_SNAPSHOT)
+- Events 1-6: continuation, each packing 3 register values:
+  - `addr` = `regs[i*3]`
+  - `size` = `regs[i*3+1]` (truncated to u32)
+  - `value` = `regs[i*3+2]`
+
+This mirrors the ring protocol layout. The replayer (`memvis-diff`) detects
+the header, reads 6 continuations, reconstructs the 18-register array, and
+calls `world.update_regs` + `srf.apply_snapshot`.
+
+### EventPlayer
+
+`EventPlayer::open(path)` validates magic and proto_version. `next_event()`
+reads one event. `read_batch(buf, max)` reads up to `max` events into a
+pre-allocated buffer, returning the count read.
+
+## Topology streaming (`topology.rs`)
+
+JSONL emitter for structural graph deltas. Activated by `--export-topology`.
+Each line is a self-contained JSON object.
+
+| Event type | Fields | Emitted when |
+|---|---|---|
+| `ALLOC` | seq, tid, addr, size | `on_alloc` |
+| `FREE` | seq, tid, addr, size | `on_free` (confirmed) |
+| `STAMP` | seq, addr, type_name, type_size, source, fields | STM stamp |
+| `LINK` | seq, from, from_addr, to_addr, pointee_type, edge | Pointer edge |
+| `COLD_STAMP` | addr, type_name, type_size, source, fields, depth | Warm-scan discovery |
+| `COLD_LINK` | from, from_addr, to_addr, pointee_type, edge | Warm-scan pointer |
+| `HAZARD` | seq, kind, write_addr, write_size, alloc_base, alloc_size, overflow, type_name, field_name | Visual ASan |
+| `FALSE_SHARE` | seq, cl_addr, threads, names[] | Cache-line contention |
+| `SUMMARY` | total_events, nodes, edges, stm_projections, live_allocs, hazards | End of run |
+
+Consumed by `memvis-check` for structural assertions.
+
+## Differential topology (`diff.rs`, `memvis-diff`)
+
+Replays two `.bin` recordings through `reconciler::process_event` with
+`RingOrchestrator::new_offline()`, checkpoints ASLR-invariant topology at
+configurable intervals, and reports structural divergence.
+
+### Usage
+
+```sh
+memvis-diff --baseline a.bin --subject b.bin --dwarf <elf> \
+    [--interval N] [--output diff.jsonl]
+```
+
+### Canonical stamps
+
+Each topology checkpoint captures a `BTreeSet<CanonicalStamp>`:
+
+```rust
+struct CanonicalStamp {
+    source: String,      // symbolic: "server.db", not "0x7f..."
+    type_name: String,   // DWARF type name
+    type_size: u64,
+    field_count: usize,
+}
+```
+
+Sources come from `TypeProjection::source_name` in the STM. These are
+already symbolic (e.g., `server.db`, `shared.ok`), not address-based.
+ASLR has no effect on stamp identity.
+
+### Common stamp mask
+
+Stamps present in both final checkpoints are filtered from intermediate
+diffs. This eliminates discovery-order noise (warm-scan timing, BFS
+non-determinism) while preserving intentional structural divergence.
+
+### Steady-state type histogram
+
+Final checkpoints are compared using an order-invariant `BTreeMap<type_name, count>`.
+This is immune to both ASLR and discovery order. Output shows `+N` deltas per type.
+
+### Hazard register context
+
+Each `CanonicalHazard` carries `pc` (from `ev.rip_lo`). The diff output
+includes a `HazardRegContext` with `pc`, `rax`, `rdi`, `rsi`, `rdx`, `rsp`
+from the `ShadowRegisterFile` at hazard time. JSONL output:
+
+```json
+{"hazard":"HOLE","write_size":8,"type":"?","field":"?","pc":"0x8c3cf","rax":"0x75d474c03b00",...}
+```
+
+### REG_SNAPSHOT replay
+
+The replayer detects REG_SNAPSHOT headers in the event stream, reads 6
+consecutive continuation events, reconstructs the 18-register array, and
+calls `world.update_regs` + `srf.apply_snapshot`. This provides full CPU
+context for hazard analysis during offline replay.
+
+## Structural assertions (`check.rs`, `memvis-check`)
+
+Reads a JSONL topology file and a `.assertions` file. Evaluates invariants
+against the recorded structural events. Intended for CI/CD integration.
+
+```sh
+memvis-check topo.jsonl assertions.txt
+```
+
+Exit code 0 = all assertions pass. Non-zero = at least one failure.
+
 ## Startup sequence
 
 Full startup when the user runs `memvis <target>`:
 
-1. Parse command-line arguments (`--once`, `--consumer-only`).
-2. Locate `drrun` (via `DYNAMORIO_HOME`, `MEMVIS_DRRUN`, or PATH).
-3. Locate `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
-4. Clean up stale `/dev/shm/memvis_*` from previous runs.
-5. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.
-6. Spawn the tracer: `drrun -c libmemvis_tracer.so -- <target> [args]`.
-7. Parse DWARF from the target ELF binary (globals, functions, locals, types,
-   type_registry).
-8. Poll for `/memvis_ctl` (up to 30 seconds, validating magic + proto).
-9. Discover the first thread ring and attach (validating magic + proto).
-10. Spawn the consumer on a 64 MB stack thread (required for deep DWARF
-    type resolution on complex programs).
-11. Consumer enters the main event loop (TUI or headless).
-12. On exit: send SIGTERM to tracer, reap child process, unmap all rings.
+1. Parse CLI arguments (`--once`, `--consumer-only`, `--record`, `--replay`,
+   `--export-topology`, `--min-events`).
+2. If `--replay`: spawn replay thread, call `run_replay`. No tracer needed.
+3. If `--consumer-only`: spawn consumer thread, attach to existing tracer.
+4. Otherwise (launch mode):
+   a. Locate `drrun` (via `DYNAMORIO_HOME`, `MEMVIS_DRRUN`, or PATH).
+   b. Locate `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
+   c. Clean up stale `/dev/shm/memvis_*` from previous runs.
+   d. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.
+   e. Spawn the tracer: `drrun -c libmemvis_tracer.so -- <target> [args]`.
+5. Parse DWARF from the target ELF binary (globals, functions, locals, types,
+   type_registry). ELF symtab fallback for `DW_AT_specification` globals.
+6. Poll for `/memvis_ctl` (up to 30 seconds, validating magic + proto).
+7. Discover the first thread ring and attach (validating magic + proto).
+8. Spawn the consumer on a 64 MB stack thread (deep DWARF resolution).
+9. Consumer enters the main event loop (TUI or headless).
+10. Warm-scan triggers after 2M events + 10 idle rounds (reads `/proc/<pid>/mem`).
+11. If `--record`: `EventRecorder` writes events (compound REG_SNAPSHOT).
+12. If `--export-topology`: `TopologyStream` writes JSONL.
+13. On exit: finalize recorder/topology, send SIGTERM to tracer, reap child,
+    unmap all rings.

@@ -6,270 +6,238 @@ derived from the current implementation in `tracer.c`, `memvis_bridge.h`, and
 
 ## System overview
 
-memvis consists of two cooperating OS processes connected by POSIX shared memory:
+memvis consists of two cooperating OS processes connected by POSIX shared
+memory, plus offline analysis tools that operate on recorded traces:
 
 ```
- +-------------------------------+      /dev/shm/         +-------------------------------+
- |           TRACER              | =====================> |            ENGINE             |
- |   (DynamoRIO client, C)       |  per-thread SPSC rings |   (Rust consumer + TUI)       |
- |                               |  control ring          |                               |
- |  tracer.c                     |                        |  engine/src/main.rs           |
- |  memvis_bridge.h              |                        |  engine/src/ring.rs           |
- |                               |                        |  engine/src/dwarf.rs          |
- |  inline pre/post write path   |                        |  engine/src/index.rs          |
- |  clean-call value capture     |                        |  engine/src/world.rs          |
- |  per-thread raw TLS scratch   |                        |  engine/src/shadow_regs.rs    |
- |  adaptive backpressure        |                        |  engine/src/heap_graph.rs     |
- |  tail-call detection          |                        |  engine/src/tui.rs            |
- |  selective reload detection   |                        |  engine/src/lib.rs            |
- |  allocator hooks (drwrap)     |                        |                               |
- +-------------------------------+                        +-------------------------------+
-         runs inside                                               runs as the
-      target's address space                                     memvis binary
-       (via DynamoRIO)                                         (separate process)
+ ┌───────────────────────────┐  /dev/shm/     ┌───────────────────────────────────┐
+ │         TRACER            │ =============> │             ENGINE                │
+ │  (DynamoRIO client, C)    │  SPSC rings    │  (Rust, 3 binaries)               │
+ │                           │  control ring  │                                   │
+ │  tracer.c                 │                │  memvis       main.rs  (live)     │
+ │  memvis_bridge.h          │                │  memvis-diff  diff.rs  (offline)  │
+ │                           │                │  memvis-check check.rs (CI/CD)    │
+ │  inline pre/post write    │                │                                   │
+ │  clean-call value capture │                │  reconciler.rs  (event dispatch)  │
+ │  per-thread raw TLS       │                │  record.rs      (recording I/O)   │
+ │  adaptive backpressure    │                │  topology.rs    (JSONL streaming) │
+ │  tail-call detection      │                │  dwarf.rs       (DWARF + ELF)     │
+ │  selective reload detect  │                │  world.rs       (STM, RTR, ASan)  │
+ │  allocator hooks (drwrap) │                │  ring.rs        (SHM consumer)    │
+ └───────────────────────────┘                └───────────────────────────────────┘
+       runs inside target's                         separate process(es)
+       address space (DBI)
 ```
 
 The **tracer** is a shared library (`libmemvis_tracer.so`) loaded into the
-target process by DynamoRIO. The **engine** is a standalone Rust binary
-(`memvis`) that launches the tracer, attaches to the shared memory rings, and
-consumes events.
+target by DynamoRIO. The **engine** is a Rust crate producing three binaries:
+
+| Binary | Entry point | Purpose |
+|---|---|---|
+| `memvis` | `main.rs` | Live instrumentation (TUI/headless), recording, replay |
+| `memvis-diff` | `diff.rs` | Offline ASLR-invariant differential topology comparison |
+| `memvis-check` | `check.rs` | CI/CD structural assertion engine over JSONL topology |
 
 ## Components
 
 ### Tracer (`tracer.c`, `memvis_bridge.h`)
 
-The tracer is a DynamoRIO client. DynamoRIO intercepts every basic block before
-execution and gives the tracer a chance to insert instrumentation. The tracer
-uses a **hybrid inline/clean-call** strategy:
+The tracer is a DynamoRIO client. It uses a **hybrid inline/clean-call**
+strategy. See [Tracer](tracer.md) for the full specification.
 
-- **Memory writes.** Two-phase inline instrumentation:
-  - `emit_pre_write`: Reserves a ring slot inline via raw TLS scratch
-    registers. Writes metadata (address, size, thread ID, sequence, kind,
-    RIP offset) directly into the slot. No clean call.
-  - `emit_post_write`: Captures the post-write value via a clean call to
-    `safe_read_into_slot` (guarded by `DR_TRY_EXCEPT`). Bumps sequence and
-    head counters inline. Conditionally flushes head to ring header every
-    64 events (`MEMVIS_HEAD_FLUSH_MASK = 0x3F`).
-  - **BB-exit flush**: Unconditionally flushes the cached head pointer to the
-    ring header's atomic `head` field at the end of every basic block. This
-    ensures the consumer sees events even from threads that produce fewer
-    than 64 writes per BB.
-- **Memory reads.** Buffered into a per-thread read buffer (capacity 16),
-  flushed at the end of each basic block via a single clean call.
-- **Direct calls.** Clean call to `at_call`: emits CALL event, snapshots 18
-  registers via `dr_get_mcontext` (7-slot REG_SNAPSHOT).
-- **Returns.** Clean call to `at_return`: emits RETURN event.
-- **Tail calls.** Heuristic detection: direct JMP at end of BB, target >4KB
-  away, within main module. Emits TAIL_CALL event (kind 8).
-- **Reloads.** Selective detection: `MOV reg, [mem]` where destination is a
-  callee-saved register (RBX, RBP, R12-R15). Emits RELOAD event (kind 12).
-- **Allocator hooks.** `drwrap` intercepts `malloc`, `free`, `realloc`, and
-  `calloc` in libc via `event_module_load`. Pre/post callbacks emit ALLOC
-  (kind 9) and FREE (kind 10) events. `realloc` emits FREE for the old
-  pointer in pre, ALLOC for the new pointer in post.
+Summary of instrumented event types:
 
-Each thread gets its own SPSC ring buffer allocated via `shm_open(3)`. Thread
-metadata is published to a control ring (`/memvis_ctl`) so the engine can
-discover new threads at runtime.
+| Event | Strategy | Description |
+|---|---|---|
+| Memory writes | Two-phase inline + clean call | Metadata inline, value via `safe_read_into_slot` |
+| Memory reads | Buffered clean call | Per-BB flush of 16-entry buffer |
+| Direct calls | Clean call | CALL event + 7-slot REG_SNAPSHOT (18 registers) |
+| Returns | Clean call | RETURN event |
+| Tail calls | Heuristic (JMP >4KB) | TAIL_CALL event |
+| Reloads | Selective (callee-saved) | RELOAD event |
+| Allocations | `drwrap` hooks | ALLOC/FREE events for malloc/free/realloc/calloc |
 
-**Per-thread scratch pad** (`memvis_scratch_pad_t`, 128 bytes, 2 cache lines):
-
-| Cache line | Offset | Field | Purpose |
-|---|---|---|---|
-| CL0 (hot) | 0 | `scratch[0]` | Saved EA for post-write reload |
-| | 8 | `scratch[1]` | Event slot pointer (0 = pre-write skipped) |
-| | 16 | `ring_data` | Pointer to ring data array |
-| | 24 | `ring_mask` | `capacity - 1` (power-of-two mask) |
-| | 28 | `_pad0` | Reserved |
-| | 32-63 | `_cl0_reserved[4]` | Reserved |
-| CL1 (stats) | 64 | `stat_inline_writes` | Inline write events emitted |
-| | 72 | `stat_write_slow` | Slow-path writes |
-| | 80 | `stat_reads` | Read events emitted |
-| | 88 | `stat_reloads` | Reload events emitted |
-| | 96 | `stat_calls` | Call events emitted |
-| | 104 | `stat_returns` | Return events emitted |
-| | 112 | `stat_tail_calls` | Tail-call events emitted |
-| | 120 | `stat_dropped` | Events dropped (ring full) |
-
-Stats are per-thread (zero contention). Thread exit drains pad stats into global
-atomics via `atomic_fetch_add`.
-
-Source files:
-
-| File | Role |
-|---|---|
-| `tracer.c` | DynamoRIO client. Inline write path, clean calls, TLS, allocator hooks, stats. |
-| `memvis_bridge.h` | Shared ABI. Ring protocol, event formats, control ring, scratch pad. |
+Each thread gets its own SPSC ring buffer via `shm_open(3)`. Thread metadata
+is published to a control ring (`/memvis_ctl`). See [Ring Protocol](ring-protocol.md).
 
 ### Engine (`engine/`)
 
-The engine is the consumer process. It performs eleven tasks:
+The engine is the consumer process. Its subsystems are organized into library
+modules re-exported from `lib.rs`, with three binary entry points.
 
-1. **DWARF parsing** (`dwarf.rs`). Parses the target ELF binary's
-   `.debug_info` section using `gimli`. Extracts global variables, functions,
-   local variables, and type information including struct field decomposition
-   (depth-limited to 2 levels). Builds a `type_registry` mapping struct names
-   to their full `TypeInfo` for use by the Shadow Type Map. Supports location
-   tables with PC-qualified ranges, `DW_OP_piece` fragments, and a full
-   stack-machine evaluator for complex expressions.
+#### Core modules
 
-2. **Ring orchestration** (`ring.rs`). Attaches to the control ring with
-   protocol version handshake (`MEMVIS_PROTO_VERSION = 3`). Discovers
-   per-thread data rings and drains events using batch pops (up to 20,000
-   events per ring per cycle, amortizing atomic overhead to 2 atomics per
-   ring per batch).
+| File | Module | Role |
+|---|---|---|
+| `reconciler.rs` | `reconciler` | Extracted event dispatch: `process_event`, `populate_globals`, `warm_scan` |
+| `dwarf.rs` | `dwarf` | DWARF parser + ELF symtab fallback: globals, functions, locals, types, type_registry |
+| `ring.rs` | `ring` | SHM mapping, ring consumer, orchestrator, `new_offline()` for replay |
+| `index.rs` | `index` | Two-tier interval map. O(log N) address-to-variable lookup |
+| `world.rs` | `world` | WorldState, STM, RTR, HeapAllocTracker, Visual ASan, CoW snapshots |
+| `shadow_regs.rs` | `shadow_regs` | Shadow Register File, confidence tiers, piece assembler |
+| `heap_graph.rs` | `heap_graph` | Heap object discovery, field value storage, pointer edges, type inference |
+| `record.rs` | `record` | EventRecorder (write), EventPlayer (read), compound REG_SNAPSHOT I/O |
+| `topology.rs` | `topology` | JSONL topology streamer: STAMP, LINK, HAZARD, COLD_*, SUMMARY |
+| `tui.rs` | `tui` | ratatui TUI: 6 panels, keybindings, event filters, time-travel |
+| `lib.rs` | — | Crate root. Re-exports all modules |
 
-3. **Address indexing** (`index.rs`). Two-tier sorted interval map that maps
-   memory addresses to named variables in O(log N). Tier 1 (static): globals
-   in a sorted `Vec<Interval>`, finalized once. Tier 2 (dynamic): stack
-   locals in `HashMap<FrameId, Vec<Interval>>`, O(1) frame removal. 8-slot
-   MRU cache shared across both tiers.
+#### Binary entry points
 
-4. **Shadow Register File** (`shadow_regs.rs`). Per-thread register tracking
-   with six confidence tiers: Observed, ABI-Inferred, WriteBack, Speculative,
-   Stale, Unknown. Coherence checking on every write event via
-   interval-overlap detection. Piece assembler for `DW_OP_piece`-fragmented
-   variables.
+| File | Binary | Role |
+|---|---|---|
+| `main.rs` | `memvis` | CLI shell: launch, consumer-only, record, replay, export-topology |
+| `diff.rs` | `memvis-diff` | Replay two `.bin` traces, diff ASLR-invariant topology |
+| `check.rs` | `memvis-check` | Evaluate `.assertions` against JSONL topology |
 
-5. **Heap graph** (`heap_graph.rs`). Autonomous heap object discovery via
-   write-stream clustering (window=64, radius=256B, min 3 writes). Stores
-   `last_value` per field offset for RTR consumption. Infers struct types by
-   matching observed field layouts against DWARF type definitions. Tracks
-   pointer edges. `on_free(addr, size)` purges objects within freed ranges.
+#### Engine subsystem summary
 
-6. **Shadow Type Map** (`world.rs`, `ShadowTypeMap`). Maps heap addresses to
-   authoritative DWARF type projections. Populated by two paths:
-   - **Direct stamp**: When a DWARF-typed pointer writes to a heap address,
-     the pointee's struct type is stamped onto the target.
-   - **Field propagation** (`propagate_field_write`): When a write hits an
-     address covered by an existing stamp, pointer fields trigger recursive
-     stamping of the written value.
-   `purge_range(addr, size)` removes projections when memory is freed.
+1. **DWARF parsing** (`dwarf.rs`). Parses `.debug_info` via `gimli`. Extracts
+   globals, functions, locals, type information (depth-limited to 2 levels).
+   Builds `type_registry` mapping struct names to `TypeInfo`. Supports
+   location tables, `DW_OP_piece` fragments, and a stack-machine evaluator.
+   **ELF symtab fallback**: globals with `DW_AT_specification` but no
+   `DW_AT_location` have addresses resolved from the ELF symbol table.
 
-7. **Retrospective Type Reconciliation** (`world.rs`,
-   `ShadowTypeMap::retrospective_scan`). On a fresh stamp, performs a bounded
-   BFS (fuel=64 nodes) through the HeapGraph's last-known pointer field
-   values. For each pointer field whose value is a live allocation and not
-   yet stamped, the pointee type is resolved from `type_registry` and
-   stamped. This discovers entire data structures (linked lists, trees)
-   retroactively, even if they were built before tracing began.
+2. **Event reconciler** (`reconciler.rs`). Extracted from `main.rs` for
+   library consumption by `memvis-diff`. Contains `process_event` (central
+   dispatch for all 12 event types), `populate_globals`, and `warm_scan`.
 
-8. **Allocator lifecycle** (`world.rs`, `HeapAllocTracker`). Tracks live
-   allocations in a `BTreeMap<addr, size>` for O(log N) range queries.
-   On FREE: purges STM projections and HeapGraph objects. **Orphan frees**
-   (FREE without matching ALLOC, caused by ring event drops) are counted
-   but do **not** purge — this prevents type blindness. Size-validation
-   sentinel warns when a stamped type exceeds the known allocation size.
+3. **Warm-scan** (`reconciler.rs`). Engine-side BFS over `/proc/<pid>/mem`.
+   Reads global pointer fields from the target's memory after quiescence
+   (2M events + 10 idle rounds). Discovers typed structures built before
+   tracing. Emits COLD_STAMP and COLD_LINK events to the topology stream.
 
-9. **Visual ASan** (`world.rs`, `HeapHazard`). On every heap write, checks
-   whether the write stays within a live allocation boundary (O(log N) via
-   `BTreeMap` range query). Two hazard classes:
-   - **OutOfBounds**: Write starts inside an allocation but extends past its
-     end. Reports overflow bytes, type name, and field name.
-   - **HeapHole**: Write address falls between allocations within the known
-     allocation span. Indicates use-after-free or wild write.
-   Hazards are deduplicated by address, capped at 64 entries.
+4. **Ring orchestration** (`ring.rs`). Attaches to control ring with protocol
+   handshake. Discovers per-thread data rings. Batch pops up to 20,000
+   events per ring per cycle (2 atomics per ring per batch).
+   `new_offline()` creates a dummy orchestrator for replay without SHM.
 
-10. **World state** (`world.rs`). Maintains current values of all tracked
-    variables, pointer edges, live register file, cache-line contention
-    tracker, Shadow Type Map, HeapAllocTracker, and hazard log. Uses
-    copy-on-write (`Arc::make_mut`) snapshotting for lock-free rendering.
-    Circular snapshot ring (512 entries) for time-travel.
+5. **Shadow Type Map** (`world.rs`). Maps heap addresses to DWARF type
+   projections. Three stamp paths: direct stamp, field propagation,
+   retrospective scan. `purge_range` on FREE.
 
-11. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz
-    with six panels. Headless mode (`--once`) prints final snapshot when
-    the ring goes idle for 500ms after event flow begins.
+6. **Retrospective Type Reconciliation** (`world.rs`). Bounded BFS (fuel=64)
+   from freshly-stamped addresses through HeapGraph pointer fields. Candidates
+   sorted by field name for deterministic discovery order across runs.
 
-Source files:
+7. **Visual ASan** (`world.rs`). OutOfBounds and HeapHole detection with
+   symbolic intent. Each `HeapHazard` carries `pc` and `reg_snapshot`
+   (18 registers from `ShadowRegisterFile::values()`).
 
-| File | Role |
-|---|---|
-| `engine/src/main.rs` | Entry point, event loop, headless renderer, signal handling. |
-| `engine/src/ring.rs` | SHM mapping, ring consumer, orchestrator, proto validation. |
-| `engine/src/dwarf.rs` | DWARF parser: globals, functions, locals, types, type_registry. |
-| `engine/src/index.rs` | Two-tier interval map. O(log N) address-to-variable lookup. |
-| `engine/src/world.rs` | WorldState, STM, RTR, HeapAllocTracker, Visual ASan, CoW snapshots. |
-| `engine/src/shadow_regs.rs` | Shadow Register File, confidence tiers, piece assembler. |
-| `engine/src/heap_graph.rs` | Heap object discovery, field value storage, pointer edges, GC. |
-| `engine/src/tui.rs` | ratatui TUI: panels, keybindings, event filters, time-travel. |
-| `engine/src/lib.rs` | Crate root. Re-exports all modules. |
+8. **Event recording** (`record.rs`). `EventRecorder::record()` writes 32-byte
+   events. `record_reg_snapshot()` writes header + 6 continuation events
+   carrying 18 register values. `EventPlayer` reads them back. File format:
+   24-byte header (magic + proto + count) followed by packed 32-byte events.
+
+9. **Topology streaming** (`topology.rs`). JSONL emitter for structural graph
+   deltas: ALLOC, FREE, STAMP, LINK, COLD_STAMP, COLD_LINK, HAZARD,
+   FALSE_SHARE, SUMMARY. Consumed by `memvis-check`.
+
+10. **Differential topology** (`diff.rs`). Replays two `.bin` recordings
+    through `reconciler::process_event` with `RingOrchestrator::new_offline()`.
+    Checkpoints at configurable intervals. Comparison features:
+    - Canonical stamps: `(source, type_name, type_size, field_count)`.
+    - Common stamp mask: filters discovery-order noise from intermediate diffs.
+    - Steady-state type histogram: order-invariant final-checkpoint comparison.
+    - Hazard register context: PC + RAX/RDI/RSI/RDX/RSP per hazard.
+
+11. **World state** (`world.rs`). CoW snapshots via `Arc<WorldInner>`.
+    Circular snapshot ring (512 entries) for time-travel. Cache-line
+    contention tracker. Live register file.
+
+12. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz
+    with six panels. Headless mode exits on 500ms idle timeout.
 
 ### Shared memory protocol (`memvis_bridge.h`)
 
-The bridge header defines the binary interface between the tracer and engine:
+See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 
-- **Event formats.** Two event structs are defined:
-  - `memvis_event_t` (v2): 32-byte with 64-bit `kind_flags`.
-  - `memvis_event_v3_t` (v3): 32-byte with 32-bit `kind_flags` (kind:8 |
-    flags:8 | seq_hi:16) and 32-bit `rip_lo` (app PC offset from module
-    base). Used by the inline write path for extended sequence numbers.
-- **Ring header.** 192-byte (3 cache lines) struct with `proto_version` field,
-  head and tail cursors on separate cache lines.
-- **Control ring.** Fixed-size structure (256 thread slots) with
-  `proto_version` field. Dead-slot reclamation via CAS.
-- **Build hash.** FNV-1a hash of `__DATE__ __TIME__` stored in the ctl header
-  for detecting C/Rust header mismatches.
-
-See [Ring Protocol](ring-protocol.md) for the full specification.
+- **v3 event format**: 32 bytes. `kind_flags` (u32: kind:8|flags:8|seq_hi:16)
+  + `rip_lo` (u32: app PC offset). Extended 32-bit sequence numbers.
+- **Ring header**: 192 bytes (3 cache lines). Head and tail on separate lines.
+- **Control ring**: 256 thread slots. Dead-slot reclamation via CAS.
+- **Build hash**: FNV-1a of `__DATE__ __TIME__` for C/Rust mismatch detection.
 
 ## Data flow
 
-The path of a single memory write event from target program to screen:
+### Live path (target write → screen)
 
 ```
- target program executes: *ptr = 42;
-           |
-           v
- [1] DynamoRIO intercepts the BB containing the store instruction
-           |
-           v
- [2] event_bb_insert calls emit_pre_write BEFORE the store:
-     - reserves drreg scratch registers
-     - computes EA via drutil_insert_get_mem_addr
-     - saves EA to pad.scratch[0]
-     - reserves ring slot inline (head & mask -> slot pointer)
-     - writes metadata: addr, size, tid, seq_lo, kind_flags, rip_lo
-     - saves slot pointer to pad.scratch[1]
-           |
-           v
- [3] target store executes: *ptr = 42;
-           |
-           v
- [4] emit_post_write runs AFTER the store:
-     - reloads EA from pad.scratch[0] (base reg may be stale)
-     - clean call to safe_read_into_slot (DR_TRY_EXCEPT guard)
-     - bumps per-thread seq counter and cached head
-     - conditionally flushes head to ring header (1/64 events)
-           |
-           v
- [5] at BB exit: unconditional head flush -> ring.head (release store)
-           |
-           v
- [6] engine ring.rs:batch_pop loads ring.head (acquire), reads up to
-     20K events, stores ring.tail (release) -- 2 atomics per ring
-           |
-           v
- [7] main.rs event dispatch (EVENT_WRITE path):
+ target executes: *ptr = 42;
+         │
+         ▼
+ [1] DynamoRIO intercepts BB containing the store
+         │
+         ▼
+ [2] emit_pre_write (inline, BEFORE store):
+     reserves drreg scratch, computes EA, saves to pad.scratch[0],
+     reserves ring slot, writes metadata (addr, size, tid, seq, kind, rip)
+         │
+         ▼
+ [3] target store executes
+         │
+         ▼
+ [4] emit_post_write (inline + clean call, AFTER store):
+     reloads EA from pad.scratch[0], clean call safe_read_into_slot,
+     bumps seq + cached head, conditional flush (1/64 events)
+         │
+         ▼
+ [5] BB exit: unconditional head flush → ring.head (release store)
+         │
+         ▼
+ [6] ring.rs:batch_pop: load head (acquire), read ≤20K events,
+     store tail (release) — 2 atomics per ring per batch
+         │
+         ▼
+ [7] reconciler::process_event (EVENT_WRITE path):
      a. cl_tracker.record_write(addr, tid)
      b. shadow_regs.check_coherence(addr, value, size, seq)
-     c. if heap addr:
-        - heap_graph.process_write(addr, size, value, seq, oracle)
-        - stm.propagate_field_write(addr, value, size, seq, type_registry)
-        - if new stamp: stm.retrospective_scan(value, heap_graph, allocs, registry, seq)
-        - heap_allocs.check_write_bounds(addr, size, stm) -> hazard log
-     d. addr_index.lookup(addr) -> named variable (O(log N))
-     e. world.update_value(node_id, value, insn)
-     f. if pointer: world.update_edge + stm.stamp_type + retrospective_scan
-           |
-           v
- [8] world.snapshot() -> Arc<WorldInner> (ref-count bump, zero copy)
-     TUI renders snapshot at 20 Hz
+     c. if heap: heap_graph → stm.propagate → RTR → check_write_bounds
+     d. addr_index.lookup → world.update_value + update_edge
+     e. if pointer to heap: stm.stamp_type + retrospective_scan
+         │
+         ▼
+ [8] recorder.record(ev) or recorder.record_reg_snapshot(ev, regs)
+     [optional: writes to .bin file]
+         │
+         ▼
+ [9] world.snapshot() → Arc<WorldInner> (ref-count bump)
+     TUI renders at 20 Hz
+```
+
+### Recording path (live → `.bin` → replay)
+
+```
+ live run (memvis --record trace.bin)
+         │
+         ▼
+ EventRecorder writes events to .bin (32 bytes each)
+ REG_SNAPSHOT: header + 6 continuations = 7 events (18 registers)
+         │
+         ▼
+ offline replay (memvis --replay trace.bin)
+   or    offline diff (memvis-diff --baseline a.bin --subject b.bin)
+         │
+         ▼
+ EventPlayer reads events → reconciler::process_event
+ REG_SNAPSHOT reconstructed from 7 consecutive events
+```
+
+### Warm-scan path (cold discovery)
+
+```
+ target quiesces (2M events + 10 idle rounds)
+         │
+         ▼
+ reconciler::warm_scan reads /proc/<pid>/mem
+ BFS from DWARF globals → pointer fields → typed structs
+         │
+         ▼
+ COLD_STAMP + COLD_LINK events → topology stream
+ stm.stamp_type for each discovered allocation
 ```
 
 ## Address space layout
-
-The tracer runs inside the target's address space. The engine runs in a separate
-process. They share data exclusively through POSIX shared memory:
 
 ```
 /dev/shm/memvis_ctl       Control ring (thread discovery, ~14 KB)
@@ -279,67 +247,55 @@ process. They share data exclusively through POSIX shared memory:
 /dev/shm/memvis_ring_N    Thread N data ring (max N = 255)
 ```
 
-Each data ring is `sizeof(memvis_ring_header_t) + capacity * 32` bytes. With the
-default capacity of 2^20 (1,048,576 entries), each ring is approximately 32 MB.
+Each data ring is `sizeof(memvis_ring_header_t) + capacity * 32` bytes.
+Default capacity: 2^20 (1,048,576 entries), ~32 MB per ring.
 
 ## Shared memory lifecycle
 
 | Phase | Actor | Action |
 |---|---|---|
-| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` from prior runs |
-| Startup | Tracer | Creates `/memvis_ctl`, initializes header with magic + proto_version |
-| Thread init | Tracer | Creates `/memvis_ring_N`, registers in ctl (CAS reclaim or allocate) |
-| Attach | Engine | Opens `/memvis_ctl`, validates magic + proto_version, starts polling |
-| Discovery | Engine | Opens `/memvis_ring_N` per ctl entry, validates magic + proto_version |
+| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` |
+| Startup | Tracer | Creates `/memvis_ctl`, inits header (magic + proto_version) |
+| Thread init | Tracer | Creates `/memvis_ring_N`, registers via CAS reclaim or alloc |
+| Attach | Engine | Opens `/memvis_ctl`, validates magic + proto_version |
+| Discovery | Engine | Opens `/memvis_ring_N`, validates magic + proto_version |
 | Runtime | Both | Producer writes events, consumer drains them |
-| Thread exit | Tracer | Marks thread DEAD (release store), unmaps/unlinks ring SHM |
+| Thread exit | Tracer | Marks DEAD (release store), unmaps/unlinks ring SHM |
 | Shutdown | Tracer | Unmaps and unlinks `/memvis_ctl` |
 | Shutdown | Engine | Unmaps all rings |
 
-All shared memory objects are created with mode 0600 (owner read/write only).
+All shared memory objects: mode 0600 (owner read/write only).
 
 ## Relocation
 
-PIE binaries are loaded at a random base address (ASLR). DWARF debug
-information uses ELF virtual addresses. The engine computes the relocation
-delta:
+PIE binaries load at a random base (ASLR). DWARF uses ELF virtual addresses.
 
 ```
 delta = runtime_module_base - elf_base_vaddr
 ```
 
-The tracer emits a `MODULE_LOAD` event (kind 7) containing the runtime base
-address. The engine receives this and re-populates all global variable
-addresses by adding the delta. The tracer's `event_module_load` callback
-detects libc (for allocator hook installation via `drwrap`) and captures
-the first non-system module as the main executable.
+The tracer emits `MODULE_LOAD` (kind 7) with the runtime base. The engine
+re-populates global addresses by adding the delta. The tracer's
+`event_module_load` detects libc (for `drwrap` hooks) and captures the first
+non-system module as the main executable.
 
 ## Concurrency model
 
-The tracer and engine never share mutable state directly. All communication is
-through SPSC ring buffers. Within the ring protocol:
+No shared mutable state. All communication via SPSC ring buffers.
 
-- The **producer** (tracer thread) owns `head`. Relaxed load, release store
-  after writing event data.
-- The **consumer** (engine) owns `tail`. Relaxed load, release store after
-  reading events.
-- Cross-cursor reads use acquire ordering.
+- **Producer** (tracer thread): owns `head`. Relaxed load, release store.
+- **Consumer** (engine): owns `tail`. Relaxed load, release store.
+- Cross-cursor reads: acquire ordering.
 
-There is no mutex, spinlock, or CAS in the hot path. The only CAS operations
-are:
-- `memvis_ctl_register_thread`: CAS to reclaim DEAD slots (thread creation,
-  once per thread lifetime).
-- `g_module_base_phase`: CAS 1->2 to emit MODULE_LOAD (exactly once per
-  process lifetime).
+No mutex, spinlock, or CAS in the hot path. CAS only in:
+- `memvis_ctl_register_thread` (once per thread lifetime).
+- `g_module_base_phase` CAS 1→2 (once per process lifetime).
 
 ### Head caching
 
-The tracer caches the ring head pointer in raw TLS (`MEMVIS_RAW_SLOT_HEAD`)
-to avoid atomic stores on every event. The cached head is flushed to the
-ring header's atomic `head` field:
+Cached in raw TLS (`MEMVIS_RAW_SLOT_HEAD`). Flushed to ring header:
 - Every 64 events (`head & 0x3F == 0`): conditional inline flush.
-- At every BB exit: unconditional flush (prevents stale data when a thread
-  does fewer than 64 writes in a BB then blocks).
+- Every BB exit: unconditional flush.
 
 ## Dependencies
 
@@ -350,23 +306,16 @@ ring header's atomic `head` field:
 | Tracer | drutil | (bundled) | Memory operand analysis |
 | Tracer | drreg | (bundled) | Register reservation |
 | Tracer | drwrap | (bundled) | Function wrapping (allocator hooks) |
-| Tracer | drsyms | (bundled) | Symbol lookup (allocator function resolution) |
+| Tracer | drsyms | (bundled) | Symbol lookup (allocator resolution) |
 | Engine | gimli | 0.31 | DWARF parsing |
-| Engine | object | 0.36 | ELF parsing |
+| Engine | object | 0.36 | ELF parsing (including symtab fallback) |
 | Engine | ratatui | 0.29 | Terminal UI |
 | Engine | crossterm | 0.28 | Terminal I/O |
-| Engine | libc | 0.2 | POSIX shared memory (`shm_open`, `mmap`) |
+| Engine | libc | 0.2 | POSIX shared memory, `/proc/<pid>/mem` access |
 
 ## Build
 
 ### Docker
-
-The multi-stage `Dockerfile` builds the tracer (CMake + DynamoRIO SDK) and
-engine (Cargo) in an Ubuntu 22.04 builder stage, then produces a minimal
-runtime image containing only:
-- `drrun` + required DynamoRIO `.so` files
-- `libmemvis_tracer.so`
-- `memvis` engine binary
 
 ```sh
 DOCKER_BUILDKIT=1 docker build -t memvis .
@@ -375,9 +324,7 @@ docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     memvis /app/my_program
 ```
 
-`--cap-add=SYS_PTRACE` is required because DynamoRIO uses `ptrace` for
-process attachment. The builder stage patches
-`DrMemoryFrameworkConfig.cmake` for CMake 3.28+ compatibility.
+`--cap-add=SYS_PTRACE` required for DynamoRIO process attachment.
 
 ### Manual
 
@@ -386,26 +333,38 @@ process attachment. The builder stage patches
 cmake -B build -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake
 cmake --build build -j$(nproc)
 
-# engine
+# engine (produces memvis, memvis-diff, memvis-check)
 cd engine && cargo build --release
 ```
 
 ## Invocation
 
 ```sh
-# launch mode: starts tracer + engine together (interactive TUI)
+# launch mode: tracer + engine together (interactive TUI)
 memvis <target> [args...]
 
-# headless mode: print final snapshot, exit when target finishes
+# headless: print final snapshot, exit on 500ms idle
 memvis --once <target>
 
-# consumer-only mode: engine only (tracer started separately via drrun)
+# record events for offline analysis
+memvis --record trace.bin [--once] <target>
+
+# replay recorded events (no tracer needed)
+memvis --replay trace.bin [--once] <target.elf>
+
+# stream topology deltas to JSONL
+memvis --export-topology topo.jsonl [--once] <target>
+
+# differential comparison of two recordings
+memvis-diff --baseline a.bin --subject b.bin --dwarf <target.elf> \
+    [--interval N] [--output diff.jsonl]
+
+# structural assertions (CI/CD)
+memvis-check <topology.jsonl> <assertions.txt>
+
+# consumer-only: engine attaches to already-running tracer
 memvis --consumer-only [--once] <target.elf>
 ```
-
-Headless mode exits via idle-timeout: after events begin flowing, if the
-ring stays empty for 500ms (50 consecutive 10ms polls), the engine renders
-the final snapshot and exits.
 
 | Variable | Purpose |
 |---|---|

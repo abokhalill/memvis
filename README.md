@@ -1,32 +1,79 @@
 # memvis
 
-Real-time memory observability for Linux x86-64. Instruments a target binary
+Runtime memory topology analyzer for Linux x86-64. Instruments a target binary
 via DynamoRIO, captures every memory write, function call, and return, then
 correlates events with DWARF debug information to produce a live, named,
-structure-aware view of the program's memory state — including heap type
-recovery, out-of-bounds detection, and false-sharing identification.
+structure-aware view of the program's heap layout, pointer topology, cacheline
+contention, type stability, and allocation lifetimes; without recompilation or
+source modification.
 
-No source modifications. No recompilation. Point it at a `-g` binary and watch.
+## What it answers
+
+| Question | Subsystem |
+|---|---|
+| What type lives at this heap address? | Shadow Type Map (STM) |
+| What data structures are reachable from this global? | Retrospective Type Reconciliation (RTR) |
+| Which writes exceed allocation boundaries? | Visual ASan |
+| Which cachelines have cross-thread contention? | CacheLineTracker |
+| How do two runs differ structurally? | `memvis-diff` |
+| Do topology invariants hold across commits? | `memvis-check` |
+
+## Binaries
+
+The project produces three binaries from `engine/`:
+
+| Binary | Purpose |
+|---|---|
+| `memvis` | Live instrumentation (TUI or headless), event recording, event replay |
+| `memvis-diff` | Offline differential topology comparison of two recorded traces |
+| `memvis-check` | CI/CD structural assertion engine over JSONL topology files |
 
 ## Capabilities
 
-- **Named memory map.** Every tracked address is resolved to its DWARF
-  variable name, type, struct field, and current value.
+- **Named memory map.** Every tracked address resolves to its DWARF variable
+  name, type, struct field, and current value.
 - **Shadow Type Map (STM).** Heap addresses are typed by observing pointer
-  writes from DWARF-typed globals/locals. Recursive field propagation
-  discovers nested structs.
+  writes from DWARF-typed globals/locals. Recursive field propagation discovers
+  nested structs. Projections are purged on `free()`.
 - **Retrospective Type Reconciliation (RTR).** On a new type stamp, a bounded
   BFS (fuel=64) walks pointer fields using last-known values from the heap
   graph. Discovers entire linked lists the instant a global points at the head.
+  BFS is sorted by field name for deterministic discovery order across runs.
+- **Warm-scan.** Engine-side BFS reads `/proc/<pid>/mem` to stamp cold global
+  pointer fields after target quiescence. Discovers typed data structures that
+  were built before tracing began (e.g., Redis `server` struct and all
+  reachable objects). Triggered by sustained idle after 2M events.
+- **ELF symtab fallback.** Globals with `DW_AT_specification` but no
+  `DW_AT_location` (common in C++ and large C programs) have their addresses
+  resolved from the ELF symbol table.
 - **Allocator lifecycle tracking.** `malloc`, `free`, `realloc`, `calloc`
-  hooked via `drwrap`. STM projections are purged on `free()` — no ghost types.
-  Orphan frees (FREE without matching ALLOC) are logged but do not purge,
-  preventing type blindness from dropped ring events.
-- **Visual ASan.** Real-time out-of-bounds and heap-hole (use-after-free)
-  detection with symbolic intent: reports the type, field name, allocation
-  boundary, and overflow size.
+  hooked via `drwrap`. Orphan frees (FREE without matching ALLOC) are counted
+  but do **not** purge the STM — prevents type blindness from dropped events.
+- **Visual ASan.** Real-time out-of-bounds and heap-hole detection. Reports
+  type, field name, allocation boundary, overflow size, faulting PC, and
+  register snapshot at hazard time.
 - **False-sharing detection.** Cache-line contention tracker identifies lines
-  written by multiple threads, annotated in the TUI and headless output.
+  written by multiple threads, annotated with thread count.
+- **Event recording and replay.** `--record` writes all events (including
+  compound REG_SNAPSHOT with 18 register values) to a `.bin` file.
+  `--replay` reconstructs the full world state offline.
+- **Topology streaming.** `--export-topology` emits a JSONL stream of
+  structural graph deltas: ALLOC, FREE, STAMP, LINK, COLD_STAMP, COLD_LINK,
+  HAZARD, FALSE_SHARE, and SUMMARY events.
+- **Differential topology comparison.** `memvis-diff` replays two recorded
+  traces, checkpoints ASLR-invariant topology at configurable intervals, and
+  reports structural divergence. Features:
+  - **Canonical stamps**: `(source, type_name, type_size, field_count)` — symbolic,
+    not address-based.
+  - **Common stamp mask**: stamps present in both final checkpoints are filtered
+    from intermediate diffs (eliminates discovery-order noise).
+  - **Steady-state type histogram**: order-invariant `type_name → count` comparison
+    of final checkpoints, immune to ASLR and BFS timing.
+  - **Hazard register context**: each hazard carries PC, RAX, RDI, RSI, RDX, RSP.
+  - **REG_SNAPSHOT replay**: compound events reconstructed offline with full
+    ShadowRegisterFile population.
+- **Structural assertions.** `memvis-check` evaluates invariants from a
+  `.assertions` file against a JSONL topology log. Intended for CI/CD.
 
 ## Example output
 
@@ -58,11 +105,6 @@ HEAP TYPES (Shadow Type Map: 4 projections)
 The freed nodes are absent from HEAP TYPES. The surviving chain was discovered
 entirely by RTR; no writes occurred after `g_head` was re-pointed.
 
-The interactive TUI (`ratatui`) renders the same data across six panels at
-20 Hz: memory map with STM-typed heap regions, filterable event journal,
-shadow registers with confidence bars, call stacks, heap objects, and a
-status bar with LAG and allocation metrics.
-
 ## Requirements
 
 - Linux x86-64
@@ -92,25 +134,60 @@ for DynamoRIO's process injection inside the container.
 cmake -B build -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake
 cmake --build build -j$(nproc)
 
-# engine (Rust consumer + TUI)
+# engine (Rust consumer + TUI + offline tools)
 cargo build --release --manifest-path engine/Cargo.toml
 ```
 
+This produces `engine/target/release/{memvis,memvis-diff,memvis-check}`.
+
 ## Usage
 
+### Live instrumentation
+
 ```sh
-# interactive TUI
+# interactive TUI (6 panels, 20 Hz)
 DYNAMORIO_HOME=/path/to/DynamoRIO memvis ./my_program [args...]
 
-# headless: print final snapshot to stdout, exit when target finishes
+# headless: print final snapshot to stdout, exit on 500ms idle
 DYNAMORIO_HOME=/path/to/DynamoRIO memvis --once ./my_program
 
-# consumer-only: engine attaches to an already-running tracer
+# record events for offline analysis
+DYNAMORIO_HOME=/path/to/DynamoRIO memvis --record trace.bin --once ./my_program
+
+# stream topology deltas to JSONL
+DYNAMORIO_HOME=/path/to/DynamoRIO memvis --export-topology topo.jsonl --once ./my_program
+```
+
+### Offline replay
+
+```sh
+# replay a recorded trace (headless output)
+memvis --replay trace.bin --once ./my_program
+```
+
+### Differential comparison
+
+```sh
+# compare two traces with DWARF-grade type fidelity
+memvis-diff --baseline a.bin --subject b.bin --dwarf ./my_program \
+    --interval 500000 --output diff.jsonl
+```
+
+### Structural assertions (CI/CD)
+
+```sh
+# evaluate topology invariants
+memvis-check topo.jsonl assertions.txt
+```
+
+### Consumer-only mode
+
+```sh
+# engine attaches to an already-running tracer
 memvis --consumer-only [--once] ./my_program
 ```
 
-The engine binary is at `engine/target/release/memvis`. It locates `drrun`
-and `libmemvis_tracer.so` automatically.
+### Environment variables
 
 | Variable | Purpose |
 |---|---|
@@ -135,7 +212,22 @@ and `libmemvis_tracer.so` automatically.
 | `0-9` | Filter by thread ID (Events panel) |
 | `x` | Clear all event filters |
 
-## Documentation
+## Architecture
+
+```
+ ┌───────────────────────────┐  /dev/shm/     ┌───────────────────────────┐
+ │         TRACER            │ =============> │         ENGINE            │
+ │  (DynamoRIO client, C)    │  SPSC rings    │  (Rust, 3 binaries)       │
+ │                           │  control ring  │                           │
+ │  tracer.c                 │                │  memvis      (live/TUI)   │
+ │  memvis_bridge.h          │                │  memvis-diff (offline)    │
+ │                           │                │  memvis-check (CI/CD)     │
+ └───────────────────────────┘                └───────────────────────────┘
+       runs inside                                  separate process
+    target's address space
+```
+
+See [docs/](docs/) for full specification:
 
 - [**Architecture**](docs/architecture.md) — system overview, data flow,
   concurrency model, shared memory lifecycle.
@@ -143,9 +235,9 @@ and `libmemvis_tracer.so` automatically.
   ordering, backpressure, control ring, protocol handshake.
 - [**Tracer**](docs/tracer.md) — DynamoRIO client internals, inline write
   path, value capture, allocator hooks, tail-call/reload detection.
-- [**Engine**](docs/engine.md) — DWARF parser, ring orchestrator, Shadow Type
-  Map, Retrospective Type Reconciliation, Visual ASan, heap graph, address
-  index, world state, TUI rendering.
+- [**Engine**](docs/engine.md) — DWARF parser, reconciler, Shadow Type Map,
+  RTR, warm-scan, Visual ASan, event recording, topology streaming,
+  memvis-diff, memvis-check, heap graph, world state, TUI rendering.
 
 ## License
 
