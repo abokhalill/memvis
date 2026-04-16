@@ -94,9 +94,11 @@ pub fn process_event(
                     }
                 }
                 if world.hazards.len() < 64 {
-                    if let Some(h) = world.heap_allocs.check_write_bounds(ev.addr, ev.size, &world.stm) {
+                    if let Some(mut h) = world.heap_allocs.check_write_bounds(ev.addr, ev.size, &world.stm) {
                         let dominated = world.hazards.iter().any(|prev| prev.write_addr == h.write_addr);
                         if !dominated {
+                            h.pc = ev.rip_lo as u64;
+                            h.reg_snapshot = shadow_regs.get(&ev.thread_id).map(|srf| srf.values());
                             if let Some(ref mut ts) = topo {
                                 let kind_str = match h.kind { HazardKind::OutOfBounds => "OOB", HazardKind::HeapHole => "HOLE" };
                                 ts.emit_hazard(ev.seq as u64, kind_str, h.write_addr, h.write_size, h.alloc_base, h.alloc_size, h.overflow_bytes, h.type_name.as_deref(), h.field_name.as_deref());

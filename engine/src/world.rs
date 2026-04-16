@@ -298,6 +298,8 @@ impl ShadowTypeMap {
             };
             let delta = base.wrapping_sub(hg_base);
 
+            // collect candidates, sort by field name for deterministic BFS order
+            let mut candidates: Vec<(&str, u64, &TypeInfo)> = Vec::new();
             for f in &proj.fields {
                 if !f.type_info.is_pointer || f.byte_size != 8 {
                     continue;
@@ -314,13 +316,16 @@ impl ShadowTypeMap {
                     continue;
                 }
                 let pointee_name = f.type_info.name.strip_prefix('*').unwrap_or("");
-                let pointee_ti = match type_registry.get(pointee_name) {
-                    Some(ti) => ti,
+                match type_registry.get(pointee_name) {
+                    Some(ti) => candidates.push((&f.name, field_val, ti)),
                     None => continue,
                 };
-                self.stamp_type(field_val, pointee_ti, &f.name, seq);
+            }
+            candidates.sort_by_key(|(name, _, _)| *name);
+            for (name, field_val, pointee_ti) in &candidates {
+                self.stamp_type(*field_val, pointee_ti, name, seq);
                 stamped += 1;
-                queue.push_back(field_val);
+                queue.push_back(*field_val);
             }
         }
         stamped
@@ -343,6 +348,8 @@ pub struct HeapHazard {
     pub overflow_bytes: u64,
     pub type_name: Option<String>,
     pub field_name: Option<String>,
+    pub pc: u64,
+    pub reg_snapshot: Option<[u64; REG_COUNT]>,
 }
 
 pub struct HeapAllocTracker {
@@ -436,6 +443,8 @@ impl HeapAllocTracker {
                     overflow_bytes: overflow,
                     type_name: sym.as_ref().map(|(t, _)| t.clone()),
                     field_name: sym.and_then(|(_, f)| f),
+                    pc: 0,
+                    reg_snapshot: None,
                 });
             }
             return None;
@@ -454,6 +463,8 @@ impl HeapAllocTracker {
                 overflow_bytes: 0,
                 type_name: stm.covering(addr).map(|p| p.type_info.name.clone()),
                 field_name: None,
+                pc: 0,
+                reg_snapshot: None,
             });
         }
         None

@@ -149,6 +149,10 @@ impl ShadowRegisterFile {
         &self.regs[idx]
     }
 
+    pub fn values(&self) -> [u64; REG_COUNT] {
+        std::array::from_fn(|i| self.regs[i].value)
+    }
+
     pub fn apply_snapshot(&mut self, values: &[u64; REG_COUNT], seq: u64, pc: u64) {
         for (i, &val) in values.iter().enumerate().take(REG_COUNT) {
             self.regs[i].set(

@@ -86,6 +86,18 @@ struct CanonicalHazard {
     write_size: u32,
     type_name: Option<String>,
     field_name: Option<String>,
+    pc: u64,
+}
+
+// register context at hazard time (not part of hazard identity)
+#[derive(Debug, Clone)]
+struct HazardRegContext {
+    pc: u64,
+    rax: u64,
+    rdi: u64,
+    rsi: u64,
+    rdx: u64,
+    rsp: u64,
 }
 
 #[derive(Debug, Clone)]
@@ -95,6 +107,7 @@ struct TopologyCheckpoint {
     type_histogram: BTreeMap<String, u64>,
     alloc_histogram: BTreeMap<u64, u64>,
     hazards: Vec<CanonicalHazard>,
+    hazard_regs: Vec<Option<HazardRegContext>>,
     stamp_count: usize,
     alloc_count: usize,
     hazard_count: usize,
@@ -121,14 +134,21 @@ fn take_checkpoint(seq: u64, world: &WorldState) -> TopologyCheckpoint {
         *alloc_histogram.entry(size).or_insert(0) += 1;
     }
 
-    let hazards: Vec<CanonicalHazard> = world.hazards.iter().map(|h| {
-        CanonicalHazard {
+    let mut hazards = Vec::new();
+    let mut hazard_regs = Vec::new();
+    for h in &world.hazards {
+        hazards.push(CanonicalHazard {
             kind: match h.kind { HazardKind::OutOfBounds => "OOB".into(), HazardKind::HeapHole => "HOLE".into() },
             write_size: h.write_size,
             type_name: h.type_name.clone(),
             field_name: h.field_name.clone(),
-        }
-    }).collect();
+            pc: h.pc,
+        });
+        hazard_regs.push(h.reg_snapshot.map(|r| HazardRegContext {
+            pc: h.pc,
+            rax: r[0], rdi: r[5], rsi: r[4], rdx: r[3], rsp: r[7],
+        }));
+    }
 
     let stamp_count = stamps.len();
     let alloc_count = world.heap_allocs.live_count();
@@ -140,6 +160,7 @@ fn take_checkpoint(seq: u64, world: &WorldState) -> TopologyCheckpoint {
         type_histogram,
         alloc_histogram,
         hazards,
+        hazard_regs,
         stamp_count,
         alloc_count,
         hazard_count,
@@ -250,8 +271,8 @@ struct CheckpointDiff {
     seq_b: u64,
     stamps_only_a: Vec<CanonicalStamp>,
     stamps_only_b: Vec<CanonicalStamp>,
-    hazards_only_a: Vec<CanonicalHazard>,
-    hazards_only_b: Vec<CanonicalHazard>,
+    hazards_only_a: Vec<(CanonicalHazard, Option<HazardRegContext>)>,
+    hazards_only_b: Vec<(CanonicalHazard, Option<HazardRegContext>)>,
     alloc_count_a: usize,
     alloc_count_b: usize,
     stamp_count_a: usize,
@@ -259,14 +280,41 @@ struct CheckpointDiff {
     identical: bool,
 }
 
-fn diff_checkpoints(a: &TopologyCheckpoint, b: &TopologyCheckpoint) -> CheckpointDiff {
-    let stamps_only_a: Vec<CanonicalStamp> = a.stamps.difference(&b.stamps).cloned().collect();
-    let stamps_only_b: Vec<CanonicalStamp> = b.stamps.difference(&a.stamps).cloned().collect();
+fn diff_checkpoints(
+    a: &TopologyCheckpoint,
+    b: &TopologyCheckpoint,
+    common_mask: Option<&BTreeSet<CanonicalStamp>>,
+) -> CheckpointDiff {
+    let raw_only_a: BTreeSet<CanonicalStamp> = a.stamps.difference(&b.stamps).cloned().collect();
+    let raw_only_b: BTreeSet<CanonicalStamp> = b.stamps.difference(&a.stamps).cloned().collect();
+
+    // filter out stamps that converge in the final state (discovery-order noise)
+    let (stamps_only_a, stamps_only_b): (Vec<CanonicalStamp>, Vec<CanonicalStamp>) =
+        if let Some(mask) = common_mask {
+            (
+                raw_only_a.difference(mask).cloned().collect(),
+                raw_only_b.difference(mask).cloned().collect(),
+            )
+        } else {
+            (raw_only_a.into_iter().collect(), raw_only_b.into_iter().collect())
+        };
 
     let hazards_a: BTreeSet<&CanonicalHazard> = a.hazards.iter().collect();
     let hazards_b: BTreeSet<&CanonicalHazard> = b.hazards.iter().collect();
-    let hazards_only_a: Vec<CanonicalHazard> = hazards_a.difference(&hazards_b).map(|h| (*h).clone()).collect();
-    let hazards_only_b: Vec<CanonicalHazard> = hazards_b.difference(&hazards_a).map(|h| (*h).clone()).collect();
+
+    let hazards_only_a: Vec<(CanonicalHazard, Option<HazardRegContext>)> = hazards_a.difference(&hazards_b)
+        .map(|&h| {
+            let idx = a.hazards.iter().position(|x| x == h);
+            let ctx = idx.and_then(|i| a.hazard_regs.get(i).cloned().flatten());
+            (h.clone(), ctx)
+        }).collect();
+    let hazards_only_b: Vec<(CanonicalHazard, Option<HazardRegContext>)> = hazards_b.difference(&hazards_a)
+        .map(|&h| {
+            let idx = b.hazards.iter().position(|x| x == h);
+            let ctx = idx.and_then(|i| b.hazard_regs.get(i).cloned().flatten());
+            (h.clone(), ctx)
+        }).collect();
+
 
     let identical = stamps_only_a.is_empty()
         && stamps_only_b.is_empty()
@@ -305,19 +353,25 @@ fn emit_diff_jsonl(out: &mut impl Write, diff: &CheckpointDiff) -> io::Result<()
                 r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"subject_only","source":"{}","type":"{}","type_size":{},"fields":{}}}"#,
                 diff.seq_a, diff.seq_b, s.source, s.type_name, s.type_size, s.field_count)?;
         }
-        for h in &diff.hazards_only_a {
+        for (h, ctx) in &diff.hazards_only_a {
+            let reg_str = ctx.as_ref().map(|r| format!(
+                r#","pc":"0x{:x}","rax":"0x{:x}","rdi":"0x{:x}","rsi":"0x{:x}","rdx":"0x{:x}","rsp":"0x{:x}""#,
+                r.pc, r.rax, r.rdi, r.rsi, r.rdx, r.rsp)).unwrap_or_default();
             writeln!(out,
-                r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"baseline_only","hazard":"{}","write_size":{},"type":"{}","field":"{}"}}"#,
+                r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"baseline_only","hazard":"{}","write_size":{},"type":"{}","field":"{}"{}}}"#,
                 diff.seq_a, diff.seq_b, h.kind, h.write_size,
                 h.type_name.as_deref().unwrap_or("?"),
-                h.field_name.as_deref().unwrap_or("?"))?;
+                h.field_name.as_deref().unwrap_or("?"), reg_str)?;
         }
-        for h in &diff.hazards_only_b {
+        for (h, ctx) in &diff.hazards_only_b {
+            let reg_str = ctx.as_ref().map(|r| format!(
+                r#","pc":"0x{:x}","rax":"0x{:x}","rdi":"0x{:x}","rsi":"0x{:x}","rdx":"0x{:x}","rsp":"0x{:x}""#,
+                r.pc, r.rax, r.rdi, r.rsi, r.rdx, r.rsp)).unwrap_or_default();
             writeln!(out,
-                r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"subject_only","hazard":"{}","write_size":{},"type":"{}","field":"{}"}}"#,
+                r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"subject_only","hazard":"{}","write_size":{},"type":"{}","field":"{}"{}}}"#,
                 diff.seq_a, diff.seq_b, h.kind, h.write_size,
                 h.type_name.as_deref().unwrap_or("?"),
-                h.field_name.as_deref().unwrap_or("?"))?;
+                h.field_name.as_deref().unwrap_or("?"), reg_str)?;
         }
     }
     Ok(())
@@ -352,7 +406,6 @@ fn print_steady_state(a: &TopologyCheckpoint, b: &TopologyCheckpoint) {
         eprintln!("  type histograms identical");
     }
 
-    // hazard delta
     let ha: BTreeSet<&CanonicalHazard> = a.hazards.iter().collect();
     let hb: BTreeSet<&CanonicalHazard> = b.hazards.iter().collect();
     let only_a: Vec<_> = ha.difference(&hb).collect();
@@ -360,14 +413,22 @@ fn print_steady_state(a: &TopologyCheckpoint, b: &TopologyCheckpoint) {
     if !only_a.is_empty() || !only_b.is_empty() {
         eprintln!("  hazard delta:");
         for h in &only_a {
-            eprintln!("    - [baseline] {} type={} field={}",
+            let idx = a.hazards.iter().position(|x| x == **h);
+            let ctx = idx.and_then(|i| a.hazard_regs.get(i).cloned().flatten());
+            eprint!("    - [baseline] {} type={} field={}",
                 h.kind, h.type_name.as_deref().unwrap_or("?"),
                 h.field_name.as_deref().unwrap_or("?"));
+            if let Some(r) = ctx { eprint!(" pc=0x{:x} rax=0x{:x}", r.pc, r.rax); }
+            eprintln!();
         }
         for h in &only_b {
-            eprintln!("    + [subject]  {} type={} field={}",
+            let idx = b.hazards.iter().position(|x| x == **h);
+            let ctx = idx.and_then(|i| b.hazard_regs.get(i).cloned().flatten());
+            eprint!("    + [subject]  {} type={} field={}",
                 h.kind, h.type_name.as_deref().unwrap_or("?"),
                 h.field_name.as_deref().unwrap_or("?"));
+            if let Some(r) = ctx { eprint!(" pc=0x{:x} rax=0x{:x}", r.pc, r.rax); }
+            eprintln!();
         }
     }
 }
@@ -403,20 +464,28 @@ fn print_summary(diffs: &[CheckpointDiff]) {
         }
         if !first.hazards_only_a.is_empty() {
             eprintln!("    baseline-only hazards:");
-            for h in &first.hazards_only_a {
-                eprintln!("      {} write_size={} type={} field={}",
+            for (h, ctx) in &first.hazards_only_a {
+                eprint!("      {} write_size={} type={} field={}",
                     h.kind, h.write_size,
                     h.type_name.as_deref().unwrap_or("?"),
                     h.field_name.as_deref().unwrap_or("?"));
+                if let Some(r) = ctx {
+                    eprint!(" pc=0x{:x} rax=0x{:x} rdi=0x{:x}", r.pc, r.rax, r.rdi);
+                }
+                eprintln!();
             }
         }
         if !first.hazards_only_b.is_empty() {
             eprintln!("    subject-only hazards:");
-            for h in &first.hazards_only_b {
-                eprintln!("      {} write_size={} type={} field={}",
+            for (h, ctx) in &first.hazards_only_b {
+                eprint!("      {} write_size={} type={} field={}",
                     h.kind, h.write_size,
                     h.type_name.as_deref().unwrap_or("?"),
                     h.field_name.as_deref().unwrap_or("?"));
+                if let Some(r) = ctx {
+                    eprint!(" pc=0x{:x} rax=0x{:x} rdi=0x{:x}", r.pc, r.rax, r.rdi);
+                }
+                eprintln!();
             }
         }
     }
@@ -475,10 +544,25 @@ fn main() {
         }
     };
 
+    // common stamp mask: stamps present in both final checkpoints are noise
+    let common_mask: Option<BTreeSet<CanonicalStamp>> =
+        match (checkpoints_a.last(), checkpoints_b.last()) {
+            (Some(fa), Some(fb)) => {
+                let mask: BTreeSet<CanonicalStamp> = fa.stamps.intersection(&fb.stamps).cloned().collect();
+                if mask.is_empty() { None } else {
+                    eprintln!("  common stamp mask: {} stamps filtered from intermediate diffs", mask.len());
+                    Some(mask)
+                }
+            }
+            _ => None,
+        };
+
     let pairs = checkpoints_a.len().min(checkpoints_b.len());
     let mut diffs: Vec<CheckpointDiff> = Vec::with_capacity(pairs);
     for i in 0..pairs {
-        diffs.push(diff_checkpoints(&checkpoints_a[i], &checkpoints_b[i]));
+        let is_final = i == pairs - 1;
+        let mask = if is_final { None } else { common_mask.as_ref() };
+        diffs.push(diff_checkpoints(&checkpoints_a[i], &checkpoints_b[i], mask));
     }
 
     if checkpoints_a.len() > pairs {
