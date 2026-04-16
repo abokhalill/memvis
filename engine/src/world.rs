@@ -5,6 +5,96 @@
 use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::sync::Arc;
 
+/// Key for per-thread, per-field write heatmap.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FieldHeatKey {
+    pub thread_id: u16,
+    pub type_name: String,
+    pub field_name: String,
+    pub field_offset: u64,
+}
+
+/// Per-field write heatmap: tracks how many times each thread writes to each
+/// typed field on STM-projected heap addresses. Used to produce symbolic
+/// pressure maps for cacheline contention analysis.
+#[derive(Debug, Clone)]
+pub struct FieldHeatmap {
+    counts: HashMap<FieldHeatKey, u64>,
+    /// (cl_addr, thread_id, type_name, field_name) for fields on contended cachelines
+    pub contention_hits: u64,
+}
+
+impl FieldHeatmap {
+    pub fn new() -> Self {
+        Self { counts: HashMap::with_capacity(512), contention_hits: 0 }
+    }
+
+    #[inline]
+    pub fn record(&mut self, thread_id: u16, type_name: &str, field_name: &str, field_offset: u64) {
+        let key = FieldHeatKey {
+            thread_id,
+            type_name: type_name.to_string(),
+            field_name: field_name.to_string(),
+            field_offset,
+        };
+        *self.counts.entry(key).or_insert(0) += 1;
+    }
+
+    pub fn len(&self) -> usize { self.counts.len() }
+
+    /// Return all entries sorted by write count descending.
+    pub fn top_entries(&self, limit: usize) -> Vec<(&FieldHeatKey, u64)> {
+        let mut v: Vec<_> = self.counts.iter().map(|(k, &c)| (k, c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(limit);
+        v
+    }
+
+    /// For a given cacheline address, find all fields written by different threads.
+    /// Returns groups: type_name.field_name → set of (thread_id, write_count).
+    pub fn contention_report(
+        &self,
+        cl_tracker: &CacheLineTracker,
+    ) -> Vec<ContentionEntry> {
+        // group by (type_name, field_name, field_offset)
+        let mut by_field: HashMap<(String, String, u64), Vec<(u16, u64)>> = HashMap::new();
+        for (key, &count) in &self.counts {
+            by_field.entry((key.type_name.clone(), key.field_name.clone(), key.field_offset))
+                .or_default()
+                .push((key.thread_id, count));
+        }
+        let mut result = Vec::new();
+        for ((type_name, field_name, field_offset), threads) in &by_field {
+            if threads.len() < 2 { continue; }
+            // check if any address at this offset has CL contention
+            // (we can't recover exact addresses here, so just report multi-thread fields)
+            let total: u64 = threads.iter().map(|(_, c)| c).sum();
+            let mut ts = threads.clone();
+            ts.sort_by(|a, b| b.1.cmp(&a.1));
+            result.push(ContentionEntry {
+                type_name: type_name.clone(),
+                field_name: field_name.clone(),
+                field_offset: *field_offset,
+                threads: ts,
+                total_writes: total,
+            });
+        }
+        // also check CL tracker for lines with multi-writer
+        let _ = cl_tracker; // used for future refinement
+        result.sort_by(|a, b| b.total_writes.cmp(&a.total_writes));
+        result
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ContentionEntry {
+    pub type_name: String,
+    pub field_name: String,
+    pub field_offset: u64,
+    pub threads: Vec<(u16, u64)>,
+    pub total_writes: u64,
+}
+
 use crate::dwarf::TypeInfo;
 use crate::index::NodeId;
 
@@ -492,6 +582,7 @@ pub struct WorldState {
     pub stm: ShadowTypeMap,
     pub heap_allocs: HeapAllocTracker,
     pub hazards: Vec<HeapHazard>,
+    pub field_heatmap: FieldHeatmap,
 }
 
 impl WorldState {
@@ -503,6 +594,7 @@ impl WorldState {
             stm: ShadowTypeMap::new(),
             heap_allocs: HeapAllocTracker::new(),
             hazards: Vec::new(),
+            field_heatmap: FieldHeatmap::new(),
         }
     }
 

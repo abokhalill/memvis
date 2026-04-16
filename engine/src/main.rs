@@ -385,7 +385,7 @@ fn run_headless(
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && idle_rounds >= 50 {
                 let snap = world.snapshot();
-                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, journal, *total, orch);
+                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, journal, *total, orch);
                 let _ = out.flush();
                 return;
             }
@@ -429,6 +429,7 @@ fn headless_render(
     stm: &memvis::world::ShadowTypeMap,
     heap_allocs: &memvis::world::HeapAllocTracker,
     hazards: &[memvis::world::HeapHazard],
+    field_heatmap: &memvis::world::FieldHeatmap,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -610,6 +611,34 @@ fn headless_render(
                         h.write_addr, h.write_size, sym
                     );
                 }
+            }
+        }
+    }
+
+    // field heatmap: top writes + contention report
+    if field_heatmap.len() > 0 {
+        let _ = writeln!(out, "\n FIELD WRITE HEATMAP ({} distinct entries)", field_heatmap.len());
+        let _ = writeln!(out, "  Top 20 hottest fields (thread, type.field, offset, writes):");
+        for (key, count) in field_heatmap.top_entries(20) {
+            let _ = writeln!(
+                out,
+                "    T{:<3} {}.{:<24} +0x{:<4x} {:>10} writes",
+                key.thread_id, key.type_name, key.field_name, key.field_offset, count
+            );
+        }
+        let contention = field_heatmap.contention_report(cl_tracker);
+        if !contention.is_empty() {
+            let _ = writeln!(out, "\n CROSS-THREAD FIELD CONTENTION ({} fields written by multiple threads):", contention.len());
+            for ce in contention.iter().take(20) {
+                let thread_detail: Vec<String> = ce.threads.iter()
+                    .map(|(tid, cnt)| format!("T{}={}", tid, cnt))
+                    .collect();
+                let _ = writeln!(
+                    out,
+                    "    {}.{:<24} +0x{:<4x} total={:<10} [{}]",
+                    ce.type_name, ce.field_name, ce.field_offset, ce.total_writes,
+                    thread_detail.join(", ")
+                );
             }
         }
     }
@@ -832,7 +861,7 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
     let snap = world.snapshot();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &journal, total, &orch);
+    headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, &journal, total, &orch);
     let _ = out.flush();
 }
 

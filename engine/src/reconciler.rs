@@ -67,6 +67,18 @@ pub fn process_event(
             }
             if heap_oracle.is_heap(ev.addr) {
                 heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
+                // field heatmap: attribute this write to a typed field if STM covers it
+                if let Some(covering) = world.stm.covering(ev.addr) {
+                    let offset = ev.addr - covering.base_addr;
+                    let tn = &covering.type_info.name;
+                    if let Some(field) = covering.type_info.fields.iter().find(|f| {
+                        offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
+                    }) {
+                        world.field_heatmap.record(ev.thread_id, tn, &field.name, field.byte_offset);
+                    } else {
+                        world.field_heatmap.record(ev.thread_id, tn, "<unresolved>", offset);
+                    }
+                }
                 if ev.size == 8 && ev.value != 0 {
                     if let Some(ref mut ts) = topo {
                         if let Some(covering) = world.stm.covering(ev.addr) {
