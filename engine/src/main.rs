@@ -206,8 +206,6 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             }
             orch.update_backpressure();
 
-            // warm-scan trigger: after relocation known + sustained idle
-            // (DynamoRIO makes startup slow; wait for target to finish init)
             if tick_events == 0 { warm_idle_rounds += 1; } else { warm_idle_rounds = 0; }
             if !warm_scan_done && relocation_delta.is_some() && total > 2_000_000 && warm_idle_rounds >= 10 {
                 if let (Some(ref info), Some(pid), Some(delta)) =
@@ -399,7 +397,6 @@ fn run_headless(
             world.cl_tracker_tick();
         }
 
-        // warm-scan trigger: after enough events + sustained idle (target quiescent)
         if !warm_scan_done && relocation_delta.is_some() && *total > 2_000_000 && drained == 0 && idle_rounds >= 10 {
             if let (Some(ref info), Some(pid), Some(delta)) =
                 (dwarf_info, orch.target_pid(), *relocation_delta) {

@@ -241,6 +241,10 @@ impl RingOrchestrator {
         Self::default()
     }
 
+    pub fn new_offline() -> Self {
+        Self::default()
+    }
+
     pub fn try_attach_ctl(&mut self) -> bool {
         if self.ctl.is_some() {
             return true;

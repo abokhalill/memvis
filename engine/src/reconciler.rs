@@ -336,7 +336,6 @@ fn register_fields_recursive(
         }
         let faddr = parent_base + f.byte_offset;
         let fi = *fi_counter;
-        // cap at u16::MAX fields to avoid overflow
         if fi == u16::MAX { return; }
         *fi_counter = fi + 1;
         let fid = NodeId::Field(gi, fi);
@@ -351,7 +350,6 @@ fn register_fields_recursive(
         );
         world.remove_node(fid);
         world.ensure_node(fid, &qualified, &f.type_info, faddr, f.byte_size);
-        // recurse into non-pointer compound fields (structs, arrays of structs)
         if !f.type_info.is_pointer && !f.type_info.fields.is_empty() && f.byte_size > 8 {
             register_fields_recursive(
                 &qualified,
@@ -381,10 +379,7 @@ pub struct WarmScanStats {
     pub globals_scanned: u64,
 }
 
-/// Engine-side warm-scan: reads /proc/<pid>/mem to seed-stamp cold global pointer fields.
-/// Solves the Initial State Problem — globals whose pointer values were written before
-/// memvis attached and never rewritten (e.g. server.db in Redis).
-/// BFS-walks the topology from global roots, bounded by max_reads and max_depth.
+// BFS over /proc/<pid>/mem from global roots. stamps cold pointers missed by DBI.
 pub fn warm_scan(
     info: &DwarfInfo,
     pid: u32,
@@ -401,7 +396,6 @@ pub fn warm_scan(
     let mut visited: HashSet<u64> = HashSet::new();
     let mut queue: VecDeque<(u64, TypeInfo, String, u32)> = VecDeque::new();
 
-    // seed: scan all globals for pointer fields (compile-time recursion through nested structs)
     for g in &info.globals {
         if stats.reads >= max_reads { break; }
         let base = g.addr.wrapping_add(delta);
@@ -412,8 +406,6 @@ pub fn warm_scan(
         );
     }
 
-    // BFS through heap. Stamp even non-heap pointers (bss/data globals that point
-    // into other global regions) to capture cross-global edges as well.
     while let Some((target_addr, pointee_ti, source_name, depth)) = queue.pop_front() {
         if stats.reads >= max_reads { break; }
         if depth > max_depth { continue; }
@@ -471,8 +463,6 @@ fn scan_ptr_fields(
                     if ptr == 0 { stats.null_ptrs += 1; continue; }
                     let pointee_name = f.type_info.name.strip_prefix('*').unwrap_or("");
                     let qualified = format!("{}.{}", source, f.name);
-                    // prefer the registry's canonical (deep) type; fall back to
-                    // the pointer's synthetic <pointee> field carried in f.type_info.
                     let pointee_ti_opt = type_registry.get(pointee_name)
                         .cloned()
                         .or_else(|| f.type_info.fields.iter()
@@ -492,8 +482,6 @@ fn scan_ptr_fields(
                 Ok(_) | Err(_) => stats.read_errors += 1,
             }
         } else if !f.type_info.is_pointer && !f.type_info.fields.is_empty() {
-            // compile-time recursion into nested struct/array fields (no memory read)
-            // bounded by a conservative depth (same budget as BFS walk depth)
             if depth <= 6 {
                 scan_ptr_fields(
                     mem, faddr, &f.type_info,

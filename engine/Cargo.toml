@@ -13,6 +13,10 @@ path = "src/main.rs"
 name = "memvis-check"
 path = "src/check.rs"
 
+[[bin]]
+name = "memvis-diff"
+path = "src/diff.rs"
+
 [dependencies]
 libc = "0.2"
 gimli = "0.31"

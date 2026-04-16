@@ -463,8 +463,6 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
     let mut globals = Vec::new();
     let mut functions = BTreeMap::new();
     let mut type_registry: HashMap<String, TypeInfo> = HashMap::new();
-    // spec globals: variables with DW_AT_specification but no DW_AT_location.
-    // keyed by name → TypeInfo; address resolved from ELF symtab after DWARF pass.
     let mut spec_globals: HashMap<String, TypeInfo> = HashMap::new();
 
     let mut iter = dw.units();
@@ -478,7 +476,6 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                 if let Some(g) = try_extract_global(&dw, &unit, entry) {
                     globals.push(g);
                 } else if let Some((name, ti)) = try_extract_spec_global(&dw, &unit, entry) {
-                    // prefer richest definition when multiple CUs emit the same spec
                     spec_globals
                         .entry(name)
                         .and_modify(|existing| {
@@ -495,9 +492,6 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                     functions.insert(f.low_pc, f);
                 }
             } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
-                // harvest canonical struct/union types into the global registry.
-                // resolve the struct DIE itself (it IS the type); prefer the richest
-                // definition when multiple CUs declare the same name.
                 if let Some(ti) = resolve_type_at(&dw, &unit, entry.offset(), 0) {
                     if !ti.name.is_empty() && ti.name != "<anon>" && !ti.is_pointer && ti.byte_size > 0 && !ti.fields.is_empty() {
                         let entry_fields = ti.fields.len();
@@ -515,9 +509,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         extract_locals(&dw, &unit, &mut functions)?;
     }
 
-    // ── ELF symtab fallback for spec globals ──────────────────────────────
-    // Variables like Redis `server` have DW_AT_specification but no DW_AT_location;
-    // GCC puts the address only in the ELF symbol table.
+    // resolve spec globals via ELF symtab
     if !spec_globals.is_empty() {
         let existing_names: std::collections::HashSet<String> =
             globals.iter().map(|g| g.name.clone()).collect();
@@ -559,8 +551,6 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         type_registry.len()
     );
 
-    // supplementary pass: harvest types reachable through globals/locals
-    // (catches typedef-only paths the DIE walker missed)
     fn register_recursive(ti: &TypeInfo, reg: &mut HashMap<String, TypeInfo>) {
         if !ti.fields.is_empty() && ti.byte_size > 0 && !ti.name.is_empty() && !ti.is_pointer {
             reg.entry(ti.name.clone())
@@ -851,18 +841,15 @@ fn try_extract_global<'a>(
     })
 }
 
-/// Extract a global variable that uses DW_AT_specification (no DW_AT_location).
-/// Returns (name, type_info) — address will be resolved from the ELF symbol table.
+// DW_AT_specification without DW_AT_location; address resolved from ELF symtab.
 fn try_extract_spec_global<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
     entry: &DebuggingInformationEntry<R<'a>>,
 ) -> Option<(String, TypeInfo)> {
-    // must NOT have DW_AT_location (those are handled by try_extract_global)
     if entry.attr_value(gimli::DW_AT_location).ok().flatten().is_some() {
         return None;
     }
-    // must have DW_AT_specification pointing at a declaration DIE
     let spec_offset = match entry.attr_value(gimli::DW_AT_specification).ok().flatten()? {
         AttributeValue::UnitRef(off) => off,
         _ => return None,
