@@ -44,7 +44,6 @@ impl EventRecorder {
         Ok(Self { writer, count: 0 })
     }
 
-    /// Record a single event. Only call for "interesting" events.
     pub fn record(&mut self, ev: &Event) -> io::Result<()> {
         self.writer.write_all(&ev.addr.to_le_bytes())?;
         self.writer.write_all(&ev.size.to_le_bytes())?;
@@ -57,7 +56,25 @@ impl EventRecorder {
         Ok(())
     }
 
-    /// Finalize: backpatch event count and flush.
+    // write header + 6 continuation events carrying 18 registers.
+    // mirrors the ring protocol: cont[i] = { addr=regs[i*3], size=regs[i*3+1] as u32, value=regs[i*3+2] }
+    pub fn record_reg_snapshot(&mut self, header: &Event, regs: &[u64; 18]) -> io::Result<()> {
+        self.record(header)?;
+        for i in 0..6usize {
+            let cont = Event {
+                addr: regs[i * 3],
+                size: regs[i * 3 + 1] as u32,
+                thread_id: header.thread_id,
+                seq: header.seq,
+                value: regs[i * 3 + 2],
+                kind_flags: header.kind_flags,
+                rip_lo: 0,
+            };
+            self.record(&cont)?;
+        }
+        Ok(())
+    }
+
     pub fn finish(mut self) -> io::Result<u64> {
         self.writer.flush()?;
         let file = self.writer.into_inner()?;

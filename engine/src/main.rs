@@ -168,7 +168,11 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                         &mut topo,
                     );
                     if let Some(ref mut rec) = recorder {
-                        let _ = rec.record(ev);
+                        if ev_kind == EVENT_REG_SNAPSHOT {
+                            let _ = rec.record_reg_snapshot(ev, &world.regs());
+                        } else {
+                            let _ = rec.record(ev);
+                        }
                     }
                     if interesting {
                         journal.push_back(JournalEntry {

@@ -92,6 +92,7 @@ struct CanonicalHazard {
 struct TopologyCheckpoint {
     seq: u64,
     stamps: BTreeSet<CanonicalStamp>,
+    type_histogram: BTreeMap<String, u64>,
     alloc_histogram: BTreeMap<u64, u64>,
     hazards: Vec<CanonicalHazard>,
     stamp_count: usize,
@@ -108,6 +109,11 @@ fn take_checkpoint(seq: u64, world: &WorldState) -> TopologyCheckpoint {
             type_size: proj.type_info.byte_size,
             field_count: proj.type_info.fields.len(),
         });
+    }
+
+    let mut type_histogram: BTreeMap<String, u64> = BTreeMap::new();
+    for s in &stamps {
+        *type_histogram.entry(s.type_name.clone()).or_insert(0) += 1;
     }
 
     let mut alloc_histogram: BTreeMap<u64, u64> = BTreeMap::new();
@@ -131,6 +137,7 @@ fn take_checkpoint(seq: u64, world: &WorldState) -> TopologyCheckpoint {
     TopologyCheckpoint {
         seq,
         stamps,
+        type_histogram,
         alloc_histogram,
         hazards,
         stamp_count,
@@ -176,13 +183,33 @@ fn replay_to_checkpoints(
         let got = player.read_batch(&mut batch, 4096)?;
         if got == 0 { break; }
 
-        for ev in &batch {
+        let mut i = 0;
+        while i < batch.len() {
+            let ev = &batch[i];
             seq += 1;
-
             let ev_kind = ev.kind();
+
             if ev_kind == reconciler::EVENT_REG_SNAPSHOT {
+                // reconstruct register array from header + 6 continuations
+                if i + 6 < batch.len() {
+                    let mut regs = [0u64; 18];
+                    for s in 0..6usize {
+                        let c = &batch[i + 1 + s];
+                        regs[s * 3] = c.addr;
+                        regs[s * 3 + 1] = c.size as u64;
+                        regs[s * 3 + 2] = c.value;
+                    }
+                    world.update_regs(regs, ev.addr);
+                    let srf = shadow_regs.entry(ev.thread_id).or_default();
+                    srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
+                    seq += 6;
+                    i += 7;
+                } else {
+                    i += 1;
+                }
                 continue;
             }
+
             reconciler::process_event(
                 ev, 0, &orch,
                 &mut world, &mut addr_index, dwarf_info,
@@ -204,6 +231,7 @@ fn replay_to_checkpoints(
                 checkpoints.push(take_checkpoint(seq, &world));
                 next_checkpoint += interval;
             }
+            i += 1;
         }
     }
 
@@ -293,6 +321,55 @@ fn emit_diff_jsonl(out: &mut impl Write, diff: &CheckpointDiff) -> io::Result<()
         }
     }
     Ok(())
+}
+
+fn print_steady_state(a: &TopologyCheckpoint, b: &TopologyCheckpoint) {
+    eprintln!("\n── Steady-State (final checkpoint) ──────────────");
+    eprintln!("  baseline: seq={} stamps={} allocs={} hazards={}",
+        a.seq, a.stamp_count, a.alloc_count, a.hazards.len());
+    eprintln!("  subject:  seq={} stamps={} allocs={} hazards={}",
+        b.seq, b.stamp_count, b.alloc_count, b.hazards.len());
+
+    // type histogram delta: immune to discovery order and ASLR
+    let mut delta: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
+    for (name, &count) in &a.type_histogram {
+        delta.entry(name).or_insert((0, 0)).0 = count as i64;
+    }
+    for (name, &count) in &b.type_histogram {
+        delta.entry(name).or_insert((0, 0)).1 = count as i64;
+    }
+    let mut diffs_found = false;
+    for (name, (ca, cb)) in &delta {
+        if ca != cb {
+            if !diffs_found {
+                eprintln!("  type histogram delta (A vs B):");
+                diffs_found = true;
+            }
+            eprintln!("    {:+4} {:+4}  {}", ca, cb, name);
+        }
+    }
+    if !diffs_found {
+        eprintln!("  type histograms identical");
+    }
+
+    // hazard delta
+    let ha: BTreeSet<&CanonicalHazard> = a.hazards.iter().collect();
+    let hb: BTreeSet<&CanonicalHazard> = b.hazards.iter().collect();
+    let only_a: Vec<_> = ha.difference(&hb).collect();
+    let only_b: Vec<_> = hb.difference(&ha).collect();
+    if !only_a.is_empty() || !only_b.is_empty() {
+        eprintln!("  hazard delta:");
+        for h in &only_a {
+            eprintln!("    - [baseline] {} type={} field={}",
+                h.kind, h.type_name.as_deref().unwrap_or("?"),
+                h.field_name.as_deref().unwrap_or("?"));
+        }
+        for h in &only_b {
+            eprintln!("    + [subject]  {} type={} field={}",
+                h.kind, h.type_name.as_deref().unwrap_or("?"),
+                h.field_name.as_deref().unwrap_or("?"));
+        }
+    }
 }
 
 fn print_summary(diffs: &[CheckpointDiff]) {
@@ -430,6 +507,11 @@ fn main() {
             let _ = emit_diff_jsonl(&mut out, d);
         }
         let _ = out.flush();
+    }
+
+    // steady-state: compare final checkpoints (order-invariant type histogram)
+    if let (Some(final_a), Some(final_b)) = (checkpoints_a.last(), checkpoints_b.last()) {
+        print_steady_state(final_a, final_b);
     }
 
     print_summary(&diffs);
