@@ -5,6 +5,7 @@ pub mod index;
 pub mod ring;
 pub mod shadow_regs;
 pub mod tui;
+pub mod reconciler;
 pub mod record;
 pub mod topology;
 pub mod world;
