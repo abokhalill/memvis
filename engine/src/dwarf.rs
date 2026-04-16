@@ -1213,11 +1213,30 @@ fn resolve_type_at<'a>(
             format!("{}[]", elem_name)
         };
 
+        // synthesize per-index fields so the field walker can recurse into
+        // compound array elements (e.g. server.db[16] = redisDb[]).
+        // capped at 64 elements to avoid explosion on large arrays like
+        // lookup tables or counters[1024].
+        let mut fields = Vec::new();
+        if let Some(ref et) = elem_type {
+            if elem_size > 0 && byte_size > 0 && !et.fields.is_empty() {
+                let n = (byte_size / elem_size).min(64);
+                for i in 0..n {
+                    fields.push(FieldInfo {
+                        name: format!("[{}]", i),
+                        byte_offset: i * elem_size,
+                        byte_size: elem_size,
+                        type_info: et.clone(),
+                    });
+                }
+            }
+        }
+
         Some(TypeInfo {
             name: arr_name,
             byte_size,
             is_pointer: false,
-            fields: Vec::new(),
+            fields,
         })
     } else {
         None

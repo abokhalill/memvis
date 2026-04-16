@@ -301,24 +301,65 @@ pub fn populate_globals(
         if g.type_info.is_pointer {
             continue;
         }
-        for (fi, f) in g.type_info.fields.iter().enumerate() {
-            if f.byte_size == 0 || f.name == "<pointee>" {
-                continue;
-            }
-            let faddr = base + f.byte_offset;
-            let fid = NodeId::Field(gi, fi as u16);
-            let qualified = format!("{}.{}", g.name, f.name);
-            addr_index.insert_field(
-                faddr,
-                f.byte_size,
-                qualified.clone(),
-                f.type_info.clone(),
-                gi,
-                fi as u16,
-            );
-            world.remove_node(fid);
-            world.ensure_node(fid, &qualified, &f.type_info, faddr, f.byte_size);
-        }
+        let mut fi_counter: u16 = 0;
+        register_fields_recursive(
+            &g.name,
+            base,
+            &g.type_info,
+            gi,
+            &mut fi_counter,
+            addr_index,
+            world,
+            0,
+        );
     }
     addr_index.finalize();
+}
+
+fn register_fields_recursive(
+    parent_name: &str,
+    parent_base: u64,
+    parent_type: &crate::dwarf::TypeInfo,
+    gi: u32,
+    fi_counter: &mut u16,
+    addr_index: &mut AddressIndex,
+    world: &mut WorldState,
+    depth: u32,
+) {
+    if depth > 3 { return; }
+    for f in &parent_type.fields {
+        if f.byte_size == 0 || f.name == "<pointee>" {
+            continue;
+        }
+        let faddr = parent_base + f.byte_offset;
+        let fi = *fi_counter;
+        // cap at u16::MAX fields to avoid overflow
+        if fi == u16::MAX { return; }
+        *fi_counter = fi + 1;
+        let fid = NodeId::Field(gi, fi);
+        let qualified = format!("{}.{}", parent_name, f.name);
+        addr_index.insert_field(
+            faddr,
+            f.byte_size,
+            qualified.clone(),
+            f.type_info.clone(),
+            gi,
+            fi,
+        );
+        world.remove_node(fid);
+        world.ensure_node(fid, &qualified, &f.type_info, faddr, f.byte_size);
+        // recurse into non-pointer compound fields (structs, arrays of structs)
+        if !f.type_info.is_pointer && !f.type_info.fields.is_empty() && f.byte_size > 8 {
+            register_fields_recursive(
+                &qualified,
+                faddr,
+                &f.type_info,
+                gi,
+                fi_counter,
+                addr_index,
+                world,
+                depth + 1,
+            );
+        }
+    }
 }
