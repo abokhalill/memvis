@@ -9,6 +9,10 @@ authors = ["Yousef Mahmoud <yosefkhalil610@gmail.com>"]
 name = "memvis"
 path = "src/main.rs"
 
+[[bin]]
+name = "memvis-check"
+path = "src/check.rs"
+
 [dependencies]
 libc = "0.2"
 gimli = "0.31"

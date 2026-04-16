@@ -67,6 +67,18 @@ fn process_event(
             }
             if heap_oracle.is_heap(ev.addr) {
                 heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
+                // emit LINK for pointer field writes within STM-covered heap regions
+                if ev.size == 8 && ev.value != 0 {
+                    if let Some(ref mut ts) = topo {
+                        if let Some(covering) = world.stm.covering(ev.addr) {
+                            let offset = ev.addr - covering.base_addr;
+                            if let Some(field) = covering.type_info.fields.iter().find(|f| f.byte_offset == offset && f.type_info.is_pointer) {
+                                let pointee = field.type_info.name.strip_prefix('*').unwrap_or(&field.type_info.name);
+                                ts.emit_link(ev.seq as u64, &covering.type_info.name, ev.addr, ev.value, pointee, &field.name);
+                            }
+                        }
+                    }
+                }
                 if let Some(ref info) = dwarf_info {
                     let before = world.stm.len();
                     world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq as u64, &info.type_registry);
@@ -74,7 +86,6 @@ fn process_event(
                     if after > before {
                         world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
                     }
-                    // emit STAMP for any new STM projections
                     if after > before {
                         if let Some(ref mut ts) = topo {
                             if let Some(proj) = world.stm.lookup(ev.value) {
