@@ -42,6 +42,21 @@ impl FieldHeatmap {
 
     pub fn len(&self) -> usize { self.counts.len() }
 
+    // TSV export for divergence analysis: type\tfield\toffset\tthread\twrites
+    pub fn export_tsv(&self, path: &std::path::Path) -> std::io::Result<()> {
+        use std::io::Write;
+        let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
+        writeln!(f, "type\tfield\toffset\tthread\twrites")?;
+        let mut entries: Vec<_> = self.counts.iter().collect();
+        entries.sort_by(|a, b| a.0.type_name.cmp(&b.0.type_name)
+            .then(a.0.field_offset.cmp(&b.0.field_offset))
+            .then(a.0.thread_id.cmp(&b.0.thread_id)));
+        for (k, &c) in &entries {
+            writeln!(f, "{}\t{}\t{}\t{}\t{}", k.type_name, k.field_name, k.field_offset, k.thread_id, c)?;
+        }
+        f.flush()
+    }
+
     /// Return all entries sorted by write count descending.
     pub fn top_entries(&self, limit: usize) -> Vec<(&FieldHeatKey, u64)> {
         let mut v: Vec<_> = self.counts.iter().map(|(k, &c)| (k, c)).collect();
@@ -51,7 +66,7 @@ impl FieldHeatmap {
     }
 
     /// For a given cacheline address, find all fields written by different threads.
-    /// Returns groups: type_name.field_name → set of (thread_id, write_count).
+    /// Returns groups: type_name.field_name -> set of (thread_id, write_count).
     pub fn contention_report(
         &self,
         cl_tracker: &CacheLineTracker,
@@ -947,6 +962,8 @@ mod tests {
             name: name.into(),
             byte_size: sz,
             is_pointer: ptr,
+            is_volatile: false,
+            is_atomic: false,
             fields: Vec::new(),
         }
     }
