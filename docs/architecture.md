@@ -10,31 +10,33 @@ memvis consists of two cooperating OS processes connected by POSIX shared
 memory, plus offline analysis tools that operate on recorded traces:
 
 ```
- ┌───────────────────────────┐  /dev/shm/     ┌───────────────────────────────────┐
+ ┌───────────────────────────┐   /dev/shm/    ┌───────────────────────────────────┐
  │         TRACER            │ =============> │             ENGINE                │
- │  (DynamoRIO client, C)    │  SPSC rings    │  (Rust, 3 binaries)               │
+ │  (DynamoRIO client, C)    │  SPSC rings    │        (Rust, 4 binaries)         │
  │                           │  control ring  │                                   │
  │  tracer.c                 │                │  memvis       main.rs  (live)     │
- │  memvis_bridge.h          │                │  memvis-diff  diff.rs  (offline)  │
- │                           │                │  memvis-check check.rs (CI/CD)    │
- │  inline pre/post write    │                │                                   │
- │  clean-call value capture │                │  reconciler.rs  (event dispatch)  │
- │  per-thread raw TLS       │                │  record.rs      (recording I/O)   │
- │  adaptive backpressure    │                │  topology.rs    (JSONL streaming) │
- │  tail-call detection      │                │  dwarf.rs       (DWARF + ELF)     │
- │  selective reload detect  │                │  world.rs       (STM, RTR, ASan)  │
- │  allocator hooks (drwrap) │                │  ring.rs        (SHM consumer)    │
+ │  memvis_bridge.h          │                │  memvis-lint  lint.rs  (static)   │
+ │                           │                │  memvis-diff  diff.rs  (offline)  │
+ │  inline pre/post write    │                │  memvis-check check.rs (CI/CD)    │
+ │  clean-call value capture │                │                                   │
+ │  per-thread raw TLS       │                │  reconciler.rs  (event dispatch)  │
+ │  adaptive backpressure    │                │  record.rs      (recording I/O)   │
+ │  tail-call detection      │                │  topology.rs    (JSONL streaming) │
+ │  selective reload detect  │                │  dwarf.rs       (DWARF + ELF)     │
+ │  allocator hooks (drwrap) │                │  world.rs       (STM, RTR, ASan)  │
+ │                           │                │  ring.rs        (SHM consumer)    │
  └───────────────────────────┘                └───────────────────────────────────┘
        runs inside target's                         separate process(es)
        address space (DBI)
 ```
 
 The **tracer** is a shared library (`libmemvis_tracer.so`) loaded into the
-target by DynamoRIO. The **engine** is a Rust crate producing three binaries:
+target by DynamoRIO. The **engine** is a Rust crate producing four binaries:
 
 | Binary | Entry point | Purpose |
 |---|---|---|
 | `memvis` | `main.rs` | Live instrumentation (TUI/headless), recording, replay |
+| `memvis-lint` | `lint.rs` | Static cacheline false-sharing detector with divergence report |
 | `memvis-diff` | `diff.rs` | Offline ASLR-invariant differential topology comparison |
 | `memvis-check` | `check.rs` | CI/CD structural assertion engine over JSONL topology |
 
@@ -63,7 +65,7 @@ is published to a control ring (`/memvis_ctl`). See [Ring Protocol](ring-protoco
 ### Engine (`engine/`)
 
 The engine is the consumer process. Its subsystems are organized into library
-modules re-exported from `lib.rs`, with three binary entry points.
+modules re-exported from `lib.rs`, with four binary entry points.
 
 #### Core modules
 
@@ -85,7 +87,8 @@ modules re-exported from `lib.rs`, with three binary entry points.
 
 | File | Binary | Role |
 |---|---|---|
-| `main.rs` | `memvis` | CLI shell: launch, consumer-only, record, replay, export-topology |
+| `main.rs` | `memvis` | CLI shell: launch, consumer-only, record, replay, export-topology, export-heatmap |
+| `lint.rs` | `memvis-lint` | Static cacheline lint: struct analysis, divergence report, diff mode |
 | `diff.rs` | `memvis-diff` | Replay two `.bin` traces, diff ASLR-invariant topology |
 | `check.rs` | `memvis-check` | Evaluate `.assertions` against JSONL topology |
 
@@ -95,6 +98,9 @@ modules re-exported from `lib.rs`, with three binary entry points.
    globals, functions, locals, type information (depth-limited to 2 levels).
    Builds `type_registry` mapping struct names to `TypeInfo`. Supports
    location tables, `DW_OP_piece` fragments, and a stack-machine evaluator.
+   Tracks `DW_TAG_volatile_type` and `DW_TAG_atomic_type` qualifiers
+   (`is_volatile`, `is_atomic` on `TypeInfo`) and `DW_AT_alignment` on
+   struct members (`alignment` on `FieldInfo`).
    **ELF symtab fallback**: globals with `DW_AT_specification` but no
    `DW_AT_location` have addresses resolved from the ELF symbol table.
 
@@ -333,7 +339,7 @@ docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 cmake -B build -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake
 cmake --build build -j$(nproc)
 
-# engine (produces memvis, memvis-diff, memvis-check)
+# engine (produces memvis, memvis-lint, memvis-diff, memvis-check)
 cd engine && cargo build --release
 ```
 
@@ -354,6 +360,13 @@ memvis --replay trace.bin [--once] <target.elf>
 
 # stream topology deltas to JSONL
 memvis --export-topology topo.jsonl [--once] <target>
+
+# export field write heatmap for divergence analysis
+memvis --export-heatmap heat.tsv [--once] <target>
+
+# static cacheline lint
+memvis-lint <binary> --struct <name>
+memvis-lint <binary> --struct <name> --heatmap heat.tsv
 
 # differential comparison of two recordings
 memvis-diff --baseline a.bin --subject b.bin --dwarf <target.elf> \

@@ -1,14 +1,15 @@
 # Engine
 
-The engine is a Rust crate (`engine/`) that produces three binaries:
+The engine is a Rust crate (`engine/`) that produces four binaries:
 
 | Binary | Entry point | Purpose |
 |---|---|---|
 | `memvis` | `main.rs` | Live instrumentation (TUI/headless), event recording, event replay |
+| `memvis-lint` | `lint.rs` | Static cacheline false-sharing detector with divergence report |
 | `memvis-diff` | `diff.rs` | Offline ASLR-invariant differential topology comparison |
 | `memvis-check` | `check.rs` | CI/CD structural assertion engine over JSONL topology files |
 
-All three share the same library modules via `lib.rs`. This document covers
+All four share the same library modules via `lib.rs`. This document covers
 each subsystem. All claims are derived from the current `engine/src/` source.
 
 ## Subsystems
@@ -28,7 +29,7 @@ each subsystem. All claims are derived from the current `engine/src/` source.
 |  orchestrator    |   |  reconciler.rs   |   |    world.rs      |
 |  ring.rs         |   |  process_event   |   |  Arc<WorldInner> |
 +------------------+   |  warm_scan       |   +--------+---------+
-         |              +---+---------+----+            |
+         |             +---+---------+----+            |
    EventPlayer              |         |          CoW snapshot
    record.rs         AddressIndex  ShadowRegs          |
          |           index.rs     shadow_regs.rs       v
@@ -72,16 +73,31 @@ tables.
 
 ### Type resolution
 
-`resolve_type_at` follows `DW_AT_type` through typedefs, const/volatile
+`resolve_type_at` follows `DW_AT_type` through typedefs, const/volatile/atomic
 qualifiers, pointers, structs, unions, and arrays. Peels up to 8 levels of
 indirection. Caps struct field extraction at depth 2.
+
+Qualifier tracking: `DW_TAG_volatile_type` and `DW_TAG_atomic_type` set
+`is_volatile` / `is_atomic` on the resolved `TypeInfo` instead of discarding
+the qualifier. This provides ground-truth write-intent signals to downstream
+consumers (e.g., `memvis-lint`).
 
 ```rust
 pub struct TypeInfo {
     pub name: String,
     pub byte_size: u64,
     pub is_pointer: bool,
+    pub is_volatile: bool,  // DW_TAG_volatile_type in type chain
+    pub is_atomic: bool,    // DW_TAG_atomic_type (C11 _Atomic)
     pub fields: Vec<FieldInfo>,
+}
+
+pub struct FieldInfo {
+    pub name: String,
+    pub byte_offset: u64,
+    pub byte_size: u64,
+    pub type_info: TypeInfo,
+    pub alignment: u64,     // DW_AT_alignment on member, 0 if absent
 }
 ```
 
@@ -804,12 +820,77 @@ memvis-check topo.jsonl assertions.txt
 
 Exit code 0 = all assertions pass. Non-zero = at least one failure.
 
+## Static cacheline lint (`lint.rs`, `memvis-lint`)
+
+`memvis-lint` is a pure static analysis tool. It reads DWARF from a compiled
+binary and maps struct fields to cacheline boundaries, warning on layouts
+likely to cause false-sharing.
+
+### Recursive sub-struct flattening
+
+Nested structs and unions are recursively expanded into leaf fields with
+dotted paths (e.g., `bstate.timeout`, `pending_cmds.head`). Union variants
+are emitted at the same offset. Depth-capped at 8 to match the DWARF parser.
+
+### Three-tier structural intent analysis
+
+When no annotation file is provided, the linter classifies fields using
+three tiers ordered by certainty:
+
+| Tier | Signal | Source | Severity |
+|---|---|---|---|
+| 1 | `is_volatile` / `is_atomic` | `DW_TAG_volatile_type`, `DW_TAG_atomic_type` | Warning |
+| 2 | `alignment >= cacheline_size` | `DW_AT_alignment` on member | Warning |
+| 3a | Lock-keyword name match | Field name contains `lock`, `mutex`, etc. | Warning |
+| 3b | Scalar adjacent to pointer | Small scalar shares CL with pointer field | Info |
+
+Tier 1 is compiler ground truth. Tier 2 detects alignment-intent violations
+(developer intended isolation but other fields leaked onto the line). Tier 3
+is a heuristic fallback. Earlier tiers short-circuit via `continue`.
+
+### Union overlap check
+
+Fields at identical offsets (union variants) with conflicting volatile/atomic
+qualifiers are flagged as type-confused contention.
+
+### Annotation support
+
+An annotation file maps fields to writer groups (`field = group`, one per
+line). When annotations are present, the linter warns on cachelines where
+multiple writer groups collide. Annotation lookup tries the full dotted
+path first, then falls back to the leaf field name.
+
+### Divergence report (`--heatmap`)
+
+Overlays lint predictions with runtime observations from a heatmap TSV
+(exported by `memvis --export-heatmap`). Classifies each cacheline:
+
+| Class | Lint | Heatmap | Meaning |
+|---|---|---|---|
+| **Confirmed** | Flagged | Multi-thread writes observed | Ship the fix |
+| **Silent Killer** | Clean | Multi-thread writes observed | Needs annotation or qualifier |
+| **False Alarm** | Flagged | No cross-thread writes | Safe to suppress |
+
+### CLI
+
+```sh
+memvis-lint <binary> --struct <name>           # single struct analysis
+memvis-lint <binary> --all                     # all structs with warnings
+memvis-lint <binary> --list                    # list available struct types
+memvis-lint <binary> --struct <name> --json    # JSON output for CI/CD
+memvis-lint <old> <new> --struct <name> --diff # field migration diff
+memvis-lint <binary> --struct <name> --heatmap heat.tsv  # divergence report
+memvis-lint <binary> --struct <name> --annotations ann.txt --cacheline 64
+```
+
+Exit code 1 if any warnings are emitted (CI/CD gatekeeper).
+
 ## Startup sequence
 
 Full startup when the user runs `memvis <target>`:
 
 1. Parse CLI arguments (`--once`, `--consumer-only`, `--record`, `--replay`,
-   `--export-topology`, `--min-events`).
+   `--export-topology`, `--export-heatmap`, `--min-events`).
 2. If `--replay`: spawn replay thread, call `run_replay`. No tracer needed.
 3. If `--consumer-only`: spawn consumer thread, attach to existing tracer.
 4. Otherwise (launch mode):
