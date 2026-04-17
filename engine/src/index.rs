@@ -342,6 +342,8 @@ mod tests {
             name: name.into(),
             byte_size: sz,
             is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
             fields: Vec::new(),
         }
     }
