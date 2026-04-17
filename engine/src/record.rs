@@ -1,20 +1,13 @@
 // SPDX-License-Identifier: MIT
-//! Persistent event recording and replay.
-//!
-//! File format (little-endian):
-//!   Bytes 0..8:   magic  = 0x4D454D5649535243 ("MEMVISRC")
-//!   Bytes 8..12:  proto_version (u32)
-//!   Bytes 12..20: event_count (u64, backpatched on close)
-//!   Bytes 20..24: reserved (u32, zero)
-//!   Bytes 24..:   packed events, 24 bytes each:
-//!     u64 addr
-//!     u32 size
-//!     u16 thread_id
-//!     u16 seq
-//!     u64 value
-//!     u32 kind_flags (kind:8 | flags:8 | seq_hi:16)
-//!
-//! Total header: 24 bytes. Each event: 24 bytes (stripped of ring padding).
+// event recording and replay.
+//
+// wire format (little-endian):
+//   [0..8]   magic 0x4D454D5649535243
+//   [8..12]  proto_version u32
+//   [12..20] event_count u64 (backpatched on close)
+//   [20..24] reserved u32
+//   [24..]   packed events, 32 bytes each:
+//            addr:u64 size:u32 tid:u16 seq:u16 value:u64 kind_flags:u32 rip_lo:u32
 
 use std::fs::File;
 use std::io::{self, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
@@ -22,11 +15,10 @@ use std::path::Path;
 
 use crate::ring::Event;
 
-const RECORD_MAGIC: u64 = 0x4D454D5649535243; // "MEMVISRC"
+const RECORD_MAGIC: u64 = 0x4D454D5649535243;
 const PROTO_VERSION: u32 = 3;
 const HEADER_SIZE: u64 = 24;
 
-/// Writer for recording events to disk.
 pub struct EventRecorder {
     writer: BufWriter<File>,
     count: u64,
@@ -36,11 +28,10 @@ impl EventRecorder {
     pub fn create(path: &Path) -> io::Result<Self> {
         let file = File::create(path)?;
         let mut writer = BufWriter::with_capacity(256 * 1024, file);
-        // write header
         writer.write_all(&RECORD_MAGIC.to_le_bytes())?;
         writer.write_all(&PROTO_VERSION.to_le_bytes())?;
-        writer.write_all(&0u64.to_le_bytes())?; // event_count placeholder
-        writer.write_all(&0u32.to_le_bytes())?; // reserved
+        writer.write_all(&0u64.to_le_bytes())?;
+        writer.write_all(&0u32.to_le_bytes())?;
         Ok(Self { writer, count: 0 })
     }
 
@@ -56,8 +47,7 @@ impl EventRecorder {
         Ok(())
     }
 
-    // write header + 6 continuation events carrying 18 registers.
-    // mirrors the ring protocol: cont[i] = { addr=regs[i*3], size=regs[i*3+1] as u32, value=regs[i*3+2] }
+    // header + 6 continuation events carrying 18 registers (3 per cont event).
     pub fn record_reg_snapshot(&mut self, header: &Event, regs: &[u64; 18]) -> io::Result<()> {
         self.record(header)?;
         for i in 0..6usize {
@@ -78,7 +68,6 @@ impl EventRecorder {
     pub fn finish(mut self) -> io::Result<u64> {
         self.writer.flush()?;
         let file = self.writer.into_inner()?;
-        // backpatch event_count at offset 12
         let mut file = file;
         file.seek(SeekFrom::Start(12))?;
         file.write_all(&self.count.to_le_bytes())?;
@@ -87,13 +76,11 @@ impl EventRecorder {
     }
 }
 
-/// Reader for replaying recorded events.
 pub struct EventPlayer {
     reader: BufReader<File>,
     remaining: u64,
 }
 
-// Packed event size on disk: addr(8) + size(4) + tid(2) + seq(2) + value(8) + kind_flags(4) + rip_lo(4) = 32
 const DISK_EVENT_SIZE: usize = 32;
 
 impl EventPlayer {
@@ -101,7 +88,6 @@ impl EventPlayer {
         let file = File::open(path)?;
         let mut reader = BufReader::with_capacity(256 * 1024, file);
 
-        // read and validate header
         let mut hdr = [0u8; HEADER_SIZE as usize];
         reader.read_exact(&mut hdr)?;
 
@@ -131,7 +117,6 @@ impl EventPlayer {
         self.remaining
     }
 
-    /// Read the next event. Returns None at EOF.
     pub fn next_event(&mut self) -> io::Result<Option<Event>> {
         if self.remaining == 0 {
             return Ok(None);
@@ -154,7 +139,6 @@ impl EventPlayer {
         }))
     }
 
-    /// Read a batch of events into a buffer. Returns count read.
     pub fn read_batch(&mut self, buf: &mut Vec<Event>, max: usize) -> io::Result<usize> {
         let mut count = 0;
         for _ in 0..max {
