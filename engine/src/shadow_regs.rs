@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // shadow register file + DW_OP_piece assembler.
 
 use crate::dwarf::{ExprStep, FunctionMeta, LocationPiece};

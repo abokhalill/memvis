@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // jsonl topology streamer: emits structural graph deltas for external consumption.
 
 use std::fs::File;

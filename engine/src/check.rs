@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // memvis-check: structural assertion engine for CI/CD pipelines.
 // reads a JSONL topology file + .assertions file, evaluates invariants.
 

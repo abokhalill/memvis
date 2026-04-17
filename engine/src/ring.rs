@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 #[cfg(target_arch = "x86_64")]
 use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};

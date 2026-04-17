@@ -1,4 +1,4 @@
-/* SPDX-License-Identifier: MIT */
+/* SPDX-License-Identifier: Apache-2.0 */
 
 
 /* Ghost v3 tracer. Inline write events, clean call CALL/RET. */

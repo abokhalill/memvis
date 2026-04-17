@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // dwarf parser. extracts globals, subprograms, locals from elf.
 // single pass over compilation units. all allocations at startup.
 

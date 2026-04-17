@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 // Two tier addr->variable index. statics: sorted vec, O(log N). dynamics: HashMap<FrameId>, O(1) removal.
 

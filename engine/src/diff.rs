@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // memvis-diff: Replay two .bin recordings, diff ASLR-invariant topology at checkpoints.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};

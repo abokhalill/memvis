@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 // Core event reconciler: process_event + populate_globals, extracted for library consumers.
 

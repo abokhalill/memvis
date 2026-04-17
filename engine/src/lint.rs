@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 
 // This binary reads DWARF, maps struct fields to cacheline boundaries, and warns on cross group sharing.
 

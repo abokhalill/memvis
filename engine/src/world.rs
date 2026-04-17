@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // world state: variables, pointer edges, register file, cache miss tracking.
 // arc-wrapped inner for cow snapshotting - mutation clones only when shared.
 

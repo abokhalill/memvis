@@ -1,4 +1,4 @@
-// SPDX-License-Identifier: MIT
+// SPDX-License-Identifier: Apache-2.0
 // heap graph: pointer-chasing type reconstructor, passive from write stream.
 
 use std::collections::{BTreeMap, HashMap, VecDeque};
