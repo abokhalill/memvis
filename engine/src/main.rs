@@ -19,7 +19,7 @@ use memvis::world::{ShadowStack, SnapshotRing, WorldState, REG_COUNT};
 // process_event and populate_globals are in memvis::reconciler (library crate).
 // this file is just a thin CLI shell over the library.
 
-fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>) {
+fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
     let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
@@ -96,6 +96,12 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             match ts.finish() {
                 Ok(n) => eprintln!("memvis: topology: {} lines", n),
                 Err(e) => eprintln!("memvis: topology finalize error: {}", e),
+            }
+        }
+        if let Some(ref hp) = heatmap_path {
+            match world.field_heatmap.export_tsv(std::path::Path::new(hp)) {
+                Ok(()) => eprintln!("memvis: heatmap exported to {}", hp),
+                Err(e) => eprintln!("memvis: heatmap export error: {}", e),
             }
         }
         return;
@@ -955,7 +961,7 @@ fn install_signal_handlers() {
     }
 }
 
-fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>) {
+fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
         eprintln!("memvis: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
@@ -990,7 +996,7 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
                 eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
-                run(orch, dwarf_info, once, min_events, record_path, topo_path);
+                run(orch, dwarf_info, once, min_events, record_path, topo_path, heatmap_path);
                 return;
             }
         }
@@ -998,7 +1004,7 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path
     }
 }
 
-fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>) {
+fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
     let drrun = match find_drrun() {
         Some(p) => p,
         None => {
@@ -1055,7 +1061,7 @@ fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, rec
     let target_owned = target.to_string();
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_consumer(Some(&target_owned), once, min_events, record_path, topo_path))
+        .spawn(move || run_consumer(Some(&target_owned), once, min_events, record_path, topo_path, heatmap_path))
         .expect("memvis: failed to spawn consumer thread");
     let _ = handle.join();
 
@@ -1076,6 +1082,7 @@ fn print_usage() {
     eprintln!("  memvis --record <file> [--once] <target>  Record events to file");
     eprintln!("  memvis --replay <file> [--once] <target.elf>  Replay recorded events");
     eprintln!("  memvis --export-topology <file.jsonl> [--once] <target>  Stream graph deltas");
+    eprintln!("  memvis --export-heatmap <file.tsv> [--once] <target>  Export field write heatmap");
     eprintln!("  memvis --consumer-only [--once] <target.elf>");
     eprintln!("                                    Consumer-only (tracer started separately)");
     eprintln!();
@@ -1111,6 +1118,10 @@ fn main() {
         .windows(2)
         .find(|w| w[0] == "--export-topology")
         .map(|w| w[1].clone());
+    let heatmap_path: Option<String> = args
+        .windows(2)
+        .find(|w| w[0] == "--export-heatmap")
+        .map(|w| w[1].clone());
 
     // --replay mode: read events from file, no tracer needed
     if let Some(ref rp) = replay_path {
@@ -1139,14 +1150,12 @@ fn main() {
             .cloned();
         let handle = thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events, record_path, topo_path))
+            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events, record_path, topo_path, heatmap_path))
             .expect("memvis: failed to spawn consumer thread");
         let _ = handle.join();
         return;
     }
 
-    // launcher mode: memvis [--once] [--record <file>] <target> [target_args...]
-    // find the target: first positional arg that isn't a flag or flag value
     let mut skip_next = false;
     let mut target_idx = None;
     for (i, a) in args.iter().enumerate().skip(1) {
@@ -1154,7 +1163,7 @@ fn main() {
             skip_next = false;
             continue;
         }
-        if a == "--min-events" || a == "--record" || a == "--replay" || a == "--export-topology" {
+        if a == "--min-events" || a == "--record" || a == "--replay" || a == "--export-topology" || a == "--export-heatmap" {
             skip_next = true;
             continue;
         }
@@ -1177,5 +1186,5 @@ fn main() {
     let target = &args[target_idx];
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(target, &target_args, once, min_events, record_path, topo_path);
+    launch(target, &target_args, once, min_events, record_path, topo_path, heatmap_path);
 }
