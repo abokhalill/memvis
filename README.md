@@ -15,16 +15,19 @@ source modification.
 | What data structures are reachable from this global? | Retrospective Type Reconciliation (RTR) |
 | Which writes exceed allocation boundaries? | Visual ASan |
 | Which cachelines have cross-thread contention? | CacheLineTracker |
+| Which struct layouts cause false-sharing? | `memvis-lint` |
+| Does predicted contention match observed reality? | `memvis-lint --heatmap` |
 | How do two runs differ structurally? | `memvis-diff` |
 | Do topology invariants hold across commits? | `memvis-check` |
 
 ## Binaries
 
-The project produces three binaries from `engine/`:
+The project produces four binaries from `engine/`:
 
 | Binary | Purpose |
 |---|---|
 | `memvis` | Live instrumentation (TUI or headless), event recording, event replay |
+| `memvis-lint` | Static cacheline false-sharing detector with divergence report |
 | `memvis-diff` | Offline differential topology comparison of two recorded traces |
 | `memvis-check` | CI/CD structural assertion engine over JSONL topology files |
 
@@ -54,9 +57,23 @@ The project produces three binaries from `engine/`:
   register snapshot at hazard time.
 - **False-sharing detection.** Cache-line contention tracker identifies lines
   written by multiple threads, annotated with thread count.
+- **Static cacheline lint.** `memvis-lint` reads DWARF from a compiled binary
+  and maps struct fields to cacheline boundaries. Three-tier structural intent
+  analysis: volatile/atomic from DWARF qualifiers (ground truth), alignment-
+  intent violation from `DW_AT_alignment`, scalar-vs-pointer adjacency
+  heuristic. Recursive sub-struct/union flattening with dotted field paths.
+  Union overlap check for mixed-qualifier type-confused contention.
+- **Divergence report.** `memvis-lint --heatmap` overlays static lint
+  predictions with runtime heatmap observations (exported via
+  `memvis --export-heatmap`). Classifies each cacheline as Confirmed
+  (lint + hardware agree), Silent Killer (hardware-only), or False Alarm
+  (lint-only). Closes the loop between static prediction and dynamic
+  measurement.
 - **Event recording and replay.** `--record` writes all events (including
   compound REG_SNAPSHOT with 18 register values) to a `.bin` file.
   `--replay` reconstructs the full world state offline.
+- **Heatmap export.** `--export-heatmap` writes per-thread, per-field write
+  counts as a TSV file for offline divergence analysis with `memvis-lint`.
 - **Topology streaming.** `--export-topology` emits a JSONL stream of
   structural graph deltas: ALLOC, FREE, STAMP, LINK, COLD_STAMP, COLD_LINK,
   HAZARD, FALSE_SHARE, and SUMMARY events.
@@ -138,7 +155,7 @@ cmake --build build -j$(nproc)
 cargo build --release --manifest-path engine/Cargo.toml
 ```
 
-This produces `engine/target/release/{memvis,memvis-diff,memvis-check}`.
+This produces `engine/target/release/{memvis,memvis-lint,memvis-diff,memvis-check}`.
 
 ## Usage
 
@@ -180,6 +197,26 @@ memvis-diff --baseline a.bin --subject b.bin --dwarf ./my_program \
 memvis-check topo.jsonl assertions.txt
 ```
 
+### Static cacheline lint
+
+```sh
+# analyze a single struct for false-sharing
+memvis-lint ./my_program --struct my_struct
+
+# all structs with warnings
+memvis-lint ./my_program --all
+
+# field migration diff between two builds
+memvis-lint ./old_binary ./new_binary --struct my_struct --diff
+
+# divergence report: overlay lint predictions with runtime heatmap
+memvis --once --export-heatmap heat.tsv ./my_program
+memvis-lint ./my_program --struct my_struct --heatmap heat.tsv
+
+# JSON output for CI/CD
+memvis-lint ./my_program --struct my_struct --json
+```
+
 ### Consumer-only mode
 
 ```sh
@@ -217,10 +254,11 @@ memvis --consumer-only [--once] ./my_program
 ```
  ┌───────────────────────────┐  /dev/shm/     ┌───────────────────────────┐
  │         TRACER            │ =============> │         ENGINE            │
- │  (DynamoRIO client, C)    │  SPSC rings    │  (Rust, 3 binaries)       │
+ │  (DynamoRIO client, C)    │  SPSC rings    │  (Rust, 4 binaries)       │
  │                           │  control ring  │                           │
  │  tracer.c                 │                │  memvis      (live/TUI)   │
- │  memvis_bridge.h          │                │  memvis-diff (offline)    │
+ │  memvis_bridge.h          │                │  memvis-lint (static)     │
+ │                           │                │  memvis-diff (offline)    │
  │                           │                │  memvis-check (CI/CD)     │
  └───────────────────────────┘                └───────────────────────────┘
        runs inside                                  separate process
@@ -237,8 +275,9 @@ See [docs/](docs/) for full specification:
   path, value capture, allocator hooks, tail-call/reload detection.
 - [**Engine**](docs/engine.md) — DWARF parser, reconciler, Shadow Type Map,
   RTR, warm-scan, Visual ASan, event recording, topology streaming,
-  memvis-diff, memvis-check, heap graph, world state, TUI rendering.
+  memvis-lint, memvis-diff, memvis-check, heap graph, world state, TUI
+  rendering.
 
 ## License
 
-[MIT](LICENSE)
+[Apache License 2.0](LICENSE)
