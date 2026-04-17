@@ -368,6 +368,7 @@ pub struct FieldInfo {
     pub byte_offset: u64,
     pub byte_size: u64,
     pub type_info: TypeInfo,
+    pub alignment: u64, // DW_AT_alignment on member, 0 if absent
 }
 
 #[derive(Debug, Clone)]
@@ -375,6 +376,8 @@ pub struct TypeInfo {
     pub name: String,
     pub byte_size: u64,
     pub is_pointer: bool,
+    pub is_volatile: bool,
+    pub is_atomic: bool,
     pub fields: Vec<FieldInfo>,
 }
 
@@ -824,6 +827,8 @@ fn try_extract_global<'a>(
         name: "<unknown>".into(),
         byte_size: 0,
         is_pointer: false,
+        is_volatile: false,
+        is_atomic: false,
         fields: Vec::new(),
     });
 
@@ -1046,6 +1051,8 @@ fn try_extract_local<'a>(
         name: "<unknown>".into(),
         byte_size: 0,
         is_pointer: false,
+        is_volatile: false,
+        is_atomic: false,
         fields: Vec::new(),
     });
 
@@ -1109,16 +1116,26 @@ fn extract_struct_fields<'a>(
                 name: "<unknown>".into(),
                 byte_size: 0,
                 is_pointer: false,
+                is_volatile: false,
+                is_atomic: false,
                 fields: Vec::new(),
             });
 
         let byte_size = type_info.byte_size;
+
+        let alignment = entry
+            .attr_value(gimli::DW_AT_alignment)
+            .ok()
+            .flatten()
+            .and_then(|v| v.udata_value())
+            .unwrap_or(0);
 
         fields.push(FieldInfo {
             name,
             byte_offset,
             byte_size,
             type_info,
+            alignment,
         });
     }
 
@@ -1163,6 +1180,8 @@ fn resolve_type_at<'a>(
             name,
             byte_size,
             is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
             fields: Vec::new(),
         })
     } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
@@ -1180,6 +1199,8 @@ fn resolve_type_at<'a>(
             name,
             byte_size,
             is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
             fields,
         })
     } else if tag == gimli::DW_TAG_pointer_type {
@@ -1210,6 +1231,7 @@ fn resolve_type_at<'a>(
                 byte_offset: 0,
                 byte_size: pt.byte_size,
                 type_info: pt.clone(),
+                alignment: 0,
             }],
             _ => Vec::new(),
         };
@@ -1218,11 +1240,14 @@ fn resolve_type_at<'a>(
             name: pointee_name,
             byte_size,
             is_pointer: true,
+            is_volatile: false,
+            is_atomic: false,
             fields,
         })
     } else if tag == gimli::DW_TAG_typedef
         || tag == gimli::DW_TAG_const_type
         || tag == gimli::DW_TAG_volatile_type
+        || tag == gimli::DW_TAG_atomic_type
         || tag == gimli::DW_TAG_restrict_type
     {
         let typedef_name = attr_name(dwarf, unit, &entry);
@@ -1231,6 +1256,12 @@ fn resolve_type_at<'a>(
             _ => return None,
         };
         let mut resolved = resolve_type_at(dwarf, unit, inner_ref, depth + 1)?;
+        if tag == gimli::DW_TAG_volatile_type {
+            resolved.is_volatile = true;
+        }
+        if tag == gimli::DW_TAG_atomic_type {
+            resolved.is_atomic = true;
+        }
         if let Some(td_name) = typedef_name {
             if resolved.name == "<anon>" || resolved.name.is_empty() {
                 resolved.name = td_name;
@@ -1309,6 +1340,7 @@ fn resolve_type_at<'a>(
                         byte_offset: i * elem_size,
                         byte_size: elem_size,
                         type_info: et.clone(),
+                        alignment: 0,
                     });
                 }
             }
@@ -1318,6 +1350,8 @@ fn resolve_type_at<'a>(
             name: arr_name,
             byte_size,
             is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
             fields,
         })
     } else {
