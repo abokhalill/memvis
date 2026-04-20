@@ -196,29 +196,44 @@ impl ThreadRing {
 
     #[inline]
     pub fn consume_batch(&self, out: &mut [Event]) -> usize {
+        // kind=5 REG_SNAPSHOT opens a 7-slot atomic run; never split it across batches
+        // or the engine's per-batch iterator mistakes continuations for headers.
+        const EVENT_REG_SNAPSHOT: u8 = 5;
         let hdr = self.header();
         let mask = (hdr.capacity - 1) as u64;
         let data = unsafe { hdr.data() };
         let t = hdr.tail.load(Ordering::Relaxed);
         let h = hdr.head.load(Ordering::Acquire);
         let avail = h.saturating_sub(t).min(hdr.capacity as u64) as usize;
-        let n = avail.min(out.len());
-        if n == 0 {
+        let cap = avail.min(out.len());
+        if cap == 0 {
             return 0;
         }
-        let mut i = 0;
-        while i < n {
+        let mut n = 0usize;
+        let mut snap_tail: u8 = 0;
+        while n < cap {
             #[cfg(target_arch = "x86_64")]
-            if i + 8 < n {
+            if n + 8 < cap {
                 unsafe {
                     _mm_prefetch(
-                        data.add(((t + (i + 8) as u64) & mask) as usize) as *const i8,
+                        data.add(((t + (n + 8) as u64) & mask) as usize) as *const i8,
                         _MM_HINT_T0,
                     );
                 }
             }
-            out[i] = unsafe { ptr::read_volatile(data.add(((t + i as u64) & mask) as usize)) };
-            i += 1;
+            let ev: Event = unsafe {
+                ptr::read_volatile(data.add(((t + n as u64) & mask) as usize))
+            };
+            if snap_tail == 0 && ev.kind() == EVENT_REG_SNAPSHOT {
+                if n + 7 > cap {
+                    break;
+                }
+                snap_tail = 6;
+            } else if snap_tail > 0 {
+                snap_tail -= 1;
+            }
+            out[n] = ev;
+            n += 1;
         }
         hdr.tail.store(t + n as u64, Ordering::Release);
         n
