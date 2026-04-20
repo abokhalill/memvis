@@ -516,7 +516,7 @@ impl HeapAllocTracker {
         self.allocs
             .range((Bound::Unbounded, Bound::Included(&addr)))
             .next_back()
-            .filter(|(&base, &sz)| addr < base + sz)
+            .filter(|(&base, &sz)| addr < base.saturating_add(sz))
             .map(|(&base, &sz)| (base, sz))
     }
 
@@ -528,10 +528,13 @@ impl HeapAllocTracker {
         write_size: u32,
         stm: &ShadowTypeMap,
     ) -> Option<HeapHazard> {
-        let end = addr + write_size as u64;
+        // addr is untrusted tracer input; checked_add avoids wrap-around
+        // producing a false "in-bounds" verdict for writes that straddle u64::MAX.
+        let end = addr.checked_add(write_size as u64)?;
         if let Some((base, alloc_sz)) = self.containing_alloc(addr) {
-            if end > base + alloc_sz {
-                let overflow = end - (base + alloc_sz);
+            let alloc_end = base.saturating_add(alloc_sz);
+            if end > alloc_end {
+                let overflow = end - alloc_end;
                 let sym = stm.covering(addr).map(|p| {
                     let off = addr - p.base_addr;
                     let field = p.type_info.fields.iter()
