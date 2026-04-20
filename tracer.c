@@ -84,6 +84,7 @@ static _Atomic uint64_t g_stat_reg_snaps    = 0;
 static _Atomic uint64_t g_stat_rdbuf_flushes = 0;
 static _Atomic uint64_t g_stat_inline_writes = 0;
 static _Atomic uint64_t g_stat_reloads       = 0;
+static _Atomic uint64_t g_stat_tail_calls    = 0;
 static _Atomic uint64_t g_stat_allocs        = 0;
 static _Atomic uint64_t g_stat_frees         = 0;
 
@@ -1351,6 +1352,7 @@ event_thread_exit(void *drcontext)
         atomic_fetch_add_explicit(&g_stat_reloads,       pad->stat_reloads,        memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_calls,         pad->stat_calls,          memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_returns,       pad->stat_returns,        memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_stat_tail_calls,    pad->stat_tail_calls,     memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_dropped,       pad->stat_dropped,        memory_order_relaxed);
         dr_thread_free(drcontext, pad, sizeof(memvis_scratch_pad_t));
     }
@@ -1370,6 +1372,7 @@ event_exit(void)
     dr_printf("memvis:   reads:   %llu\n", (unsigned long long)atomic_load(&g_stat_reads));
     dr_printf("memvis:   calls:   %llu\n", (unsigned long long)atomic_load(&g_stat_calls));
     dr_printf("memvis:   returns: %llu\n", (unsigned long long)atomic_load(&g_stat_returns));
+    dr_printf("memvis:   tcalls:  %llu\n", (unsigned long long)atomic_load(&g_stat_tail_calls));
     dr_printf("memvis:   reloads: %llu\n", (unsigned long long)atomic_load(&g_stat_reloads));
     dr_printf("memvis:   dropped: %llu\n", (unsigned long long)atomic_load(&g_stat_dropped));
     dr_printf("memvis:   regsnap: %llu\n", (unsigned long long)atomic_load(&g_stat_reg_snaps));
