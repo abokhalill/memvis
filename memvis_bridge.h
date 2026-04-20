@@ -182,7 +182,7 @@ static inline int memvis_push_ex_flags(memvis_ring_header_t *ring,
                                         uint64_t addr, uint32_t size,
                                         uint64_t value, uint8_t kind,
                                         uint8_t flags,
-                                        uint16_t thread_id, uint16_t seq)
+                                        uint16_t thread_id, uint32_t seq)
 {
     const uint32_t mask = ring->capacity - 1;
     memvis_event_v3_t *data = memvis_ring_data_v3(ring);
@@ -202,9 +202,9 @@ static inline int memvis_push_ex_flags(memvis_ring_header_t *ring,
     data[idx].addr       = addr;
     data[idx].size       = size;
     data[idx].thread_id  = thread_id;
-    data[idx].seq_lo     = seq;
+    data[idx].seq_lo     = (uint16_t)(seq & 0xFFFF);
     data[idx].value      = value;
-    data[idx].kind_flags = memvis_v3_make_kf(kind, flags, 0);
+    data[idx].kind_flags = memvis_v3_make_kf(kind, flags, (uint16_t)(seq >> 16));
     data[idx].rip_lo     = 0;
 
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
@@ -214,14 +214,14 @@ static inline int memvis_push_ex_flags(memvis_ring_header_t *ring,
 static inline int memvis_push_ex(memvis_ring_header_t *ring,
                                   uint64_t addr, uint32_t size,
                                   uint64_t value, uint8_t kind,
-                                  uint16_t thread_id, uint16_t seq)
+                                  uint16_t thread_id, uint32_t seq)
 {
     return memvis_push_ex_flags(ring, addr, size, value, kind, 0, thread_id, seq);
 }
 
 static inline int memvis_push(memvis_ring_header_t *ring,
                                uint64_t addr, uint32_t size, uint64_t value,
-                               uint16_t thread_id, uint16_t seq)
+                               uint16_t thread_id, uint32_t seq)
 {
     return memvis_push_ex(ring, addr, size, value, MEMVIS_EVENT_WRITE, thread_id, seq);
 }
@@ -229,7 +229,7 @@ static inline int memvis_push(memvis_ring_header_t *ring,
 static inline int memvis_push_reg_snapshot(memvis_ring_header_t *ring,
                                             uint64_t insn_counter,
                                             const uint64_t regs[MEMVIS_REG_COUNT],
-                                            uint16_t thread_id, uint16_t seq)
+                                            uint16_t thread_id, uint32_t seq)
 {
     const uint32_t mask = ring->capacity - 1;
     memvis_event_v3_t *data = memvis_ring_data_v3(ring);
@@ -239,9 +239,11 @@ static inline int memvis_push_reg_snapshot(memvis_ring_header_t *ring,
     if (h - t + MEMVIS_REG_SNAPSHOT_SLOTS > ring->capacity)
         return -1;
 
-    uint32_t kf = memvis_v3_make_kf(MEMVIS_EVENT_REG_SNAPSHOT, 0, 0);
+    uint16_t seq_lo = (uint16_t)(seq & 0xFFFF);
+    uint16_t seq_hi = (uint16_t)(seq >> 16);
+    uint32_t kf = memvis_v3_make_kf(MEMVIS_EVENT_REG_SNAPSHOT, 0, seq_hi);
     uint64_t idx = h & mask;
-    data[idx] = (memvis_event_v3_t){ insn_counter, 0, thread_id, seq, 0, kf, 0 };
+    data[idx] = (memvis_event_v3_t){ insn_counter, 0, thread_id, seq_lo, 0, kf, 0 };
     for (int s = 0; s < 6; s++) {
         idx = (h + 1 + s) & mask;
         data[idx] = (memvis_event_v3_t){ regs[s*3], (uint32_t)regs[s*3+1], thread_id, 0,
@@ -256,7 +258,7 @@ static inline int memvis_push_cache_miss(memvis_ring_header_t *ring,
                                           uint64_t miss_addr,
                                           uint32_t cache_level,
                                           uint64_t sample_ip,
-                                          uint16_t thread_id, uint16_t seq)
+                                          uint16_t thread_id, uint32_t seq)
 {
     return memvis_push_ex(ring, miss_addr, cache_level, sample_ip,
                           MEMVIS_EVENT_CACHE_MISS, thread_id, seq);
@@ -304,7 +306,7 @@ static inline uint32_t memvis_ring_fill_eighths(memvis_ring_header_t *ring)
 static inline int memvis_push_sampled(memvis_ring_header_t *ring,
                                        uint64_t addr, uint32_t size,
                                        uint64_t value, uint8_t kind,
-                                       uint16_t thread_id, uint16_t seq)
+                                       uint16_t thread_id, uint32_t seq)
 {
     if (kind == MEMVIS_EVENT_READ &&
         atomic_load_explicit(&ring->backpressure, memory_order_relaxed))
@@ -314,7 +316,7 @@ static inline int memvis_push_sampled(memvis_ring_header_t *ring,
 
 static inline void memvis_push_overflow(memvis_ring_header_t *ring,
                                          uint64_t insn_counter,
-                                         uint16_t thread_id, uint16_t seq)
+                                         uint16_t thread_id, uint32_t seq)
 {
     memvis_push_ex(ring, insn_counter, 0, 0, MEMVIS_EVENT_OVERFLOW, thread_id, seq);
 }

@@ -590,9 +590,11 @@ static inline uint16_t tls_thread_id(void *drcontext) {
     return (uint16_t)(uintptr_t)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_THREAD_ID]);
 }
 
-static inline uint16_t tls_next_seq(void *drcontext) {
-    uint16_t s = (uint16_t)(uintptr_t)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ]);
-    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ], (void *)(uintptr_t)(uint16_t)(s + 1));
+// 32-bit seq: seq_lo -> event.seq_lo, seq_hi -> top 16 of event.kind_flags.
+// u16 was ~1.3ms of distance at 50M ev/s; wrapped stamps poisoned SRF/STM.
+static inline uint32_t tls_next_seq(void *drcontext) {
+    uint32_t s = (uint32_t)(uintptr_t)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ]);
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ], (void *)(uintptr_t)(s + 1));
     return s;
 }
 
@@ -607,7 +609,7 @@ static inline void maybe_emit_module_load(void *drcontext, memvis_ring_header_t 
                                                   memory_order_acq_rel, memory_order_relaxed))
         return;
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, g_module_base, 0, 0, MEMVIS_EVENT_MODULE_LOAD, tid, seq);
     sync_head_cache(drcontext);
     dr_printf("memvis: emitted MODULE_LOAD base=0x%llx (tid=%u seq=%u)\n",
@@ -669,7 +671,7 @@ flush_read_buf(void)
     memvis_scratch_pad_t *pad = tls_pad(drcontext);
     uint32_t n = buf->count;
     for (uint32_t i = 0; i < n; i++) {
-        uint16_t seq = tls_next_seq(drcontext);
+        uint32_t seq = tls_next_seq(drcontext);
         int rc = memvis_push_sampled(ring, buf->entries[i].addr,
                                       buf->entries[i].size, 0,
                                       MEMVIS_EVENT_READ, tid, seq);
@@ -696,7 +698,7 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
     maybe_emit_module_load(drcontext, ring);
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, callee_pc, 0, frame_base, MEMVIS_EVENT_CALL, tid, seq);
     sync_head_cache(drcontext);
     memvis_scratch_pad_t *pad = tls_pad(drcontext);
@@ -726,7 +728,7 @@ at_call(uint64_t callee_pc, uint64_t frame_base)
         regs[MEMVIS_REG_R15]    = (uint64_t)mc.r15;
         regs[MEMVIS_REG_RIP]    = (uint64_t)mc.pc;
         regs[MEMVIS_REG_RFLAGS] = (uint64_t)mc.xflags;
-        uint16_t rseq = tls_next_seq(drcontext);
+        uint32_t rseq = tls_next_seq(drcontext);
         memvis_push_reg_snapshot(ring, ic + 8, regs, tid, rseq);
         sync_head_cache(drcontext);
         atomic_fetch_add_explicit(&g_stat_reg_snaps, 1, memory_order_relaxed);
@@ -746,7 +748,7 @@ at_reload(uint64_t src_addr, uint32_t size, uint32_t dest_reg_idx)
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     uint64_t val = safe_read_value(src_addr, size);
     uint8_t flags = (uint8_t)(dest_reg_idx & 0xFF);
     memvis_push_ex_flags(ring, src_addr, size, val,
@@ -802,7 +804,7 @@ at_return(uint64_t retaddr)
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, retaddr, 0, 0, MEMVIS_EVENT_RETURN, tid, seq);
     sync_head_cache(drcontext);
     { memvis_scratch_pad_t *pad = tls_pad(drcontext); if (pad) pad->stat_returns++; }
@@ -821,7 +823,7 @@ at_tail_call(uint64_t target_pc, uint64_t frame_base)
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) { drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_GUARD], NULL); return; }
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, target_pc, 0, frame_base, MEMVIS_EVENT_TAIL_CALL, tid, seq);
     sync_head_cache(drcontext);
     { memvis_scratch_pad_t *pad = tls_pad(drcontext); if (pad) pad->stat_tail_calls++; }
@@ -1127,7 +1129,7 @@ wrap_malloc_post(void *wrapctx, void *user_data)
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, ptr, (uint32_t)size, size,
                    MEMVIS_EVENT_ALLOC, tid, seq);
     sync_head_cache(drcontext);
@@ -1154,7 +1156,7 @@ wrap_realloc_pre(void *wrapctx, void **user_data)
         memvis_ring_header_t *ring = tls_ring(drcontext);
         if (ring) {
             uint16_t tid = tls_thread_id(drcontext);
-            uint16_t seq = tls_next_seq(drcontext);
+            uint32_t seq = tls_next_seq(drcontext);
             memvis_push_ex(ring, (uint64_t)(uintptr_t)old_ptr, 0, 0,
                            MEMVIS_EVENT_FREE, tid, seq);
             sync_head_cache(drcontext);
@@ -1176,7 +1178,7 @@ wrap_realloc_post(void *wrapctx, void *user_data)
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, ptr, (uint32_t)size, size,
                    MEMVIS_EVENT_ALLOC, tid, seq);
     sync_head_cache(drcontext);
@@ -1193,7 +1195,7 @@ wrap_free_pre(void *wrapctx, void **user_data)
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
     uint16_t tid = tls_thread_id(drcontext);
-    uint16_t seq = tls_next_seq(drcontext);
+    uint32_t seq = tls_next_seq(drcontext);
     memvis_push_ex(ring, (uint64_t)(uintptr_t)ptr, 0, 0,
                    MEMVIS_EVENT_FREE, tid, seq);
     sync_head_cache(drcontext);
