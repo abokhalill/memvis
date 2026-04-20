@@ -68,11 +68,18 @@ impl HeapOracle {
         {
             return false;
         }
-        (0x1000..0x0000_8000_0000_0000).contains(&addr)
+        Self::in_user_range(addr)
     }
 
     fn is_plausible_ptr(&self, val: u64) -> bool {
-        (0x1000..0x0000_8000_0000_0000).contains(&val)
+        Self::in_user_range(val)
+    }
+
+    // linux user VA: 47-bit w/ 4-level paging, 56-bit w/ 5-level (5.14+ or LA57).
+    // 56-bit window covers both; kernel half (MSB set) still excluded.
+    #[inline]
+    fn in_user_range(addr: u64) -> bool {
+        (0x1000..0x0100_0000_0000_0000).contains(&addr)
     }
 }
 
