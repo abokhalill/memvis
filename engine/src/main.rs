@@ -14,7 +14,7 @@ use memvis::shadow_regs::ShadowRegisterFile;
 use memvis::record::{EventPlayer, EventRecorder};
 use memvis::topology::TopologyStream;
 use memvis::tui::{self, AppState, JournalEntry};
-use memvis::world::{ShadowStack, SnapshotRing, WorldState, REG_COUNT};
+use memvis::world::{ShadowStack, SnapshotRing, WorldState};
 
 // process_event and populate_globals are in memvis::reconciler (library crate).
 // this file is just a thin CLI shell over the library.
@@ -146,19 +146,42 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                 if got == 0 { break; }
                 tick_events += got;
 
-                for &(ri, ref ev) in &batch_buf {
+                let mut i = 0;
+                while i < batch_buf.len() {
+                    let (ri, ev) = batch_buf[i];
+                    let ev_kind = ev.kind();
+
+                    // snapshots live fully inside batch_buf; ring side pop_n raced.
+                    if ev_kind == EVENT_REG_SNAPSHOT {
+                        let slice_end = (i + 7).min(batch_buf.len());
+                        let mut events7: [memvis::ring::Event; 7] = [memvis::ring::Event::zero(); 7];
+                        let take = slice_end - i;
+                        for s in 0..take { events7[s] = batch_buf[i + s].1; }
+                        let consumed = reconciler::apply_reg_snapshot(
+                            &events7[..take], &mut world, &mut shadow_regs,
+                        ).max(1);
+                        if let Some(ref mut rec) = recorder {
+                            let _ = rec.record_reg_snapshot(&ev, &world.regs());
+                        }
+                        total += consumed as u64;
+                        world.inc_insn_counter();
+                        let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
+                        *exp = ev.seq.wrapping_add(1);
+                        i += consumed;
+                        continue;
+                    }
+
                     total += 1;
                     world.inc_insn_counter();
 
-                    let ev_kind = ev.kind();
                     let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
-                    if ev.seq != *exp && ev_kind != EVENT_REG_SNAPSHOT {
+                    if ev.seq != *exp {
                         seq_gaps += 1;
                     }
                     *exp = ev.seq.wrapping_add(1);
 
                     let interesting = reconciler::process_event(
-                        ev,
+                        &ev,
                         ri,
                         &orch,
                         &mut world,
@@ -174,11 +197,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                         &mut topo,
                     );
                     if let Some(ref mut rec) = recorder {
-                        if ev_kind == EVENT_REG_SNAPSHOT {
-                            let _ = rec.record_reg_snapshot(ev, &world.regs());
-                        } else {
-                            let _ = rec.record(ev);
-                        }
+                        let _ = rec.record(&ev);
                     }
                     if interesting {
                         journal.push_back(JournalEntry {
@@ -196,6 +215,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                     if ev_kind == EVENT_CALL {
                         need_finalize = true;
                     }
+                    i += 1;
                 }
             } // while tick_events < TICK_BUDGET
 
@@ -338,13 +358,33 @@ fn run_headless(
             tick_events += got;
             drained += got;
 
-            for &(ri, ref ev) in &batch_buf {
+            let mut i = 0;
+            while i < batch_buf.len() {
+                let (ri, ev) = batch_buf[i];
+                let ev_kind = ev.kind();
+
+                if ev_kind == EVENT_REG_SNAPSHOT {
+                    let slice_end = (i + 7).min(batch_buf.len());
+                    let mut events7: [memvis::ring::Event; 7] = [memvis::ring::Event::zero(); 7];
+                    let take = slice_end - i;
+                    for s in 0..take { events7[s] = batch_buf[i + s].1; }
+                    let consumed = reconciler::apply_reg_snapshot(
+                        &events7[..take], world, shadow_regs,
+                    ).max(1);
+                    if let Some(ref mut rec) = recorder {
+                        let _ = rec.record_reg_snapshot(&ev, &world.regs());
+                    }
+                    *total += consumed as u64;
+                    world.inc_insn_counter();
+                    i += consumed;
+                    continue;
+                }
+
                 *total += 1;
                 world.inc_insn_counter();
 
-                let ev_kind = ev.kind();
                 let interesting = reconciler::process_event(
-                    ev,
+                    &ev,
                     ri,
                     orch,
                     world,
@@ -360,7 +400,7 @@ fn run_headless(
                     recorder_topo,
                 );
                 if let Some(ref mut rec) = recorder {
-                    let _ = rec.record(ev);
+                    let _ = rec.record(&ev);
                 }
                 if interesting {
                     journal.push_back(JournalEntry {
@@ -378,6 +418,7 @@ fn run_headless(
                 if ev_kind == EVENT_CALL {
                     need_finalize = true;
                 }
+                i += 1;
             }
         }
 
@@ -775,32 +816,20 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
         let mut i = 0;
         while i < event_buf.len() {
             let ev = &event_buf[i];
-            total += 1;
-            world.inc_insn_counter();
             let ev_kind = ev.kind();
 
-            // REG_SNAPSHOT: consume 6 continuation events inline (no ring access)
             if ev_kind == EVENT_REG_SNAPSHOT {
-                if i + 6 < event_buf.len() {
-                    let cont = &event_buf[i + 1..i + 7];
-                    let valid = cont.iter().all(|c| c.kind() == EVENT_REG_SNAPSHOT);
-                    if valid {
-                        let mut regs = [0u64; REG_COUNT];
-                        for s in 0..6usize {
-                            regs[s * 3] = cont[s].addr;
-                            regs[s * 3 + 1] = cont[s].size as u64;
-                            regs[s * 3 + 2] = cont[s].value;
-                        }
-                        world.update_regs(regs, ev.addr);
-                        let srf = shadow_regs.entry(ev.thread_id).or_default();
-                        srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
-                    }
-                    i += 7; // skip header + 6 continuations
-                } else {
-                    i += 1; // incomplete snapshot at buffer boundary, skip
-                }
+                let consumed = reconciler::apply_reg_snapshot(
+                    &event_buf[i..], &mut world, &mut shadow_regs,
+                ).max(1);
+                total += consumed as u64;
+                world.inc_insn_counter();
+                i += consumed;
                 continue;
             }
+
+            total += 1;
+            world.inc_insn_counter();
 
             let interesting = reconciler::process_event(
                 ev,

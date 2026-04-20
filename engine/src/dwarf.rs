@@ -206,14 +206,7 @@ fn eval_stack_machine(
             }
             ExprStep::Addr(a) => stack.push(*a),
             ExprStep::CFA => stack.push(compute_cfa(regs)),
-            ExprStep::Deref(_size) => {
-                // generic DW_OP_deref requires reading target memory, which
-                // this evaluator does not have. silently leaving the address
-                // on the stack produced wrong results for any composite
-                // expression past the [BReg,Deref] fast path at decode_expression.
-                // bail cleanly so callers fall through to other resolution paths.
-                return None;
-            }
+            ExprStep::Deref(_size) => return None,
             ExprStep::Plus => {
                 if stack.len() < 2 {
                     return None;

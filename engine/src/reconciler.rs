@@ -25,6 +25,37 @@ pub const EVENT_ALLOC: u8 = 9;
 pub const EVENT_FREE: u8 = 10;
 pub const EVENT_RELOAD: u8 = 12;
 
+/// REG_SNAPSHOT is 7 contiguous ring slots (header + 6 continuations carrying
+/// regs[0..18] packed 3/slot). returns slots consumed: 7 on success, 1 on
+/// short/corrupt tail so callers advance past the header.
+pub fn apply_reg_snapshot(
+    events: &[Event],
+    world: &mut WorldState,
+    shadow_regs: &mut HashMap<u16, ShadowRegisterFile>,
+) -> usize {
+    if events.is_empty() || events[0].kind() != EVENT_REG_SNAPSHOT {
+        return 0;
+    }
+    if events.len() < 7 {
+        return 1;
+    }
+    let cont = &events[1..7];
+    if !cont.iter().all(|c| c.kind() == EVENT_REG_SNAPSHOT) {
+        return 1;
+    }
+    let header = &events[0];
+    let mut regs = [0u64; REG_COUNT];
+    for s in 0..6usize {
+        regs[s * 3] = cont[s].addr;
+        regs[s * 3 + 1] = cont[s].size as u64;
+        regs[s * 3 + 2] = cont[s].value;
+    }
+    world.update_regs(regs, header.addr);
+    let srf = shadow_regs.entry(header.thread_id).or_default();
+    srf.apply_snapshot(&regs, header.seq as u64, header.addr);
+    7
+}
+
 #[inline]
 #[allow(clippy::too_many_arguments)]
 pub fn process_event(
@@ -229,21 +260,8 @@ pub fn process_event(
             true
         }
         EVENT_REG_SNAPSHOT => {
-            let mut cont = [Event::zero(); 6];
-            if orch.rings[ring_idx].pop_n(6, &mut cont) {
-                let valid = cont.iter().all(|c| c.kind() == EVENT_REG_SNAPSHOT);
-                if valid {
-                    let mut regs = [0u64; REG_COUNT];
-                    for s in 0..6usize {
-                        regs[s * 3] = cont[s].addr;
-                        regs[s * 3 + 1] = cont[s].size as u64;
-                        regs[s * 3 + 2] = cont[s].value;
-                    }
-                    world.update_regs(regs, ev.addr);
-                    let srf = shadow_regs.entry(ev.thread_id).or_default();
-                    srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
-                }
-            }
+            // handled by apply_reg_snapshot() on the drained batch; see note there.
+            let _ = (orch, ring_idx);
             true
         }
         EVENT_CACHE_MISS => {

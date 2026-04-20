@@ -528,8 +528,7 @@ impl HeapAllocTracker {
         write_size: u32,
         stm: &ShadowTypeMap,
     ) -> Option<HeapHazard> {
-        // addr is untrusted tracer input; checked_add avoids wrap-around
-        // producing a false "in-bounds" verdict for writes that straddle u64::MAX.
+        // addr is tracer-supplied; wrap would yield a false in-bounds verdict.
         let end = addr.checked_add(write_size as u64)?;
         if let Some((base, alloc_sz)) = self.containing_alloc(addr) {
             let alloc_end = base.saturating_add(alloc_sz);
