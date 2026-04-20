@@ -178,10 +178,11 @@ static inline size_t memvis_shm_size(uint32_t capacity) {
     return sizeof(memvis_ring_header_t) + (size_t)capacity * sizeof(memvis_event_t);
 }
 
-static inline int memvis_push_ex(memvis_ring_header_t *ring,
-                                  uint64_t addr, uint32_t size,
-                                  uint64_t value, uint8_t kind,
-                                  uint16_t thread_id, uint16_t seq)
+static inline int memvis_push_ex_flags(memvis_ring_header_t *ring,
+                                        uint64_t addr, uint32_t size,
+                                        uint64_t value, uint8_t kind,
+                                        uint8_t flags,
+                                        uint16_t thread_id, uint16_t seq)
 {
     const uint32_t mask = ring->capacity - 1;
     memvis_event_v3_t *data = memvis_ring_data_v3(ring);
@@ -203,11 +204,19 @@ static inline int memvis_push_ex(memvis_ring_header_t *ring,
     data[idx].thread_id  = thread_id;
     data[idx].seq_lo     = seq;
     data[idx].value      = value;
-    data[idx].kind_flags = memvis_v3_make_kf(kind, 0, 0);
+    data[idx].kind_flags = memvis_v3_make_kf(kind, flags, 0);
     data[idx].rip_lo     = 0;
 
     atomic_store_explicit(&ring->head, h + 1, memory_order_release);
     return 0;
+}
+
+static inline int memvis_push_ex(memvis_ring_header_t *ring,
+                                  uint64_t addr, uint32_t size,
+                                  uint64_t value, uint8_t kind,
+                                  uint16_t thread_id, uint16_t seq)
+{
+    return memvis_push_ex_flags(ring, addr, size, value, kind, 0, thread_id, seq);
 }
 
 static inline int memvis_push(memvis_ring_header_t *ring,

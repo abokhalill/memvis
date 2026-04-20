@@ -747,10 +747,9 @@ at_reload(uint64_t src_addr, uint32_t size, uint32_t dest_reg_idx)
     uint16_t tid = tls_thread_id(drcontext);
     uint16_t seq = tls_next_seq(drcontext);
     uint64_t val = safe_read_value(src_addr, size);
-    uint8_t kind = MEMVIS_EVENT_RELOAD;
     uint8_t flags = (uint8_t)(dest_reg_idx & 0xFF);
-    uint64_t kf = (uint64_t)kind | ((uint64_t)flags << 8);
-    memvis_push_ex(ring, src_addr, size, val, kf, tid, seq);
+    memvis_push_ex_flags(ring, src_addr, size, val,
+                         MEMVIS_EVENT_RELOAD, flags, tid, seq);
     sync_head_cache(drcontext);
     { memvis_scratch_pad_t *pad = tls_pad(drcontext); if (pad) pad->stat_reloads++; }
 
