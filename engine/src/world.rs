@@ -600,6 +600,7 @@ pub struct WorldState {
     pub heap_allocs: HeapAllocTracker,
     pub hazards: Vec<HeapHazard>,
     pub field_heatmap: FieldHeatmap,
+    pub bb_hits: HashMap<u32, u64>,
 }
 
 impl WorldState {
@@ -612,6 +613,7 @@ impl WorldState {
             heap_allocs: HeapAllocTracker::new(),
             hazards: Vec::new(),
             field_heatmap: FieldHeatmap::new(),
+            bb_hits: HashMap::new(),
         }
     }
 
@@ -629,6 +631,11 @@ impl WorldState {
     }
     pub fn inc_insn_counter(&mut self) {
         self.cow().insn_counter += 1;
+    }
+
+    pub fn record_bb_entry(&mut self, rip_lo: u32) {
+        *self.bb_hits.entry(rip_lo).or_insert(0) += 1;
+        self.inc_insn_counter();
     }
 
     pub fn ensure_node(
@@ -1031,5 +1038,21 @@ mod tests {
         assert!(sr.insn <= 4);
 
         assert!(ring.find_by_insn(0).is_none());
+    }
+
+    #[test]
+    fn test_bb_entry_hits() {
+        let mut ws = WorldState::new();
+        assert_eq!(ws.insn_counter(), 0);
+        assert!(ws.bb_hits.is_empty());
+
+        ws.record_bb_entry(0x1234);
+        ws.record_bb_entry(0x1234);
+        ws.record_bb_entry(0x5678);
+
+        assert_eq!(ws.insn_counter(), 3);
+        assert_eq!(ws.bb_hits.len(), 2);
+        assert_eq!(ws.bb_hits[&0x1234], 2);
+        assert_eq!(ws.bb_hits[&0x5678], 1);
     }
 }

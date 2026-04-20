@@ -133,6 +133,20 @@ across 2M single-threaded events.
 with release ordering. This ensures the consumer sees events even from
 threads that produce fewer than 64 writes per BB.
 
+### BB_ENTRY (Kind 11)
+
+Emitted once at the head of every basic block, fully inline — no clean
+call, no EA computation. The BB start PC is a JIT-time constant embedded
+as two 32-bit immediate stores. Uses the same raw TLS seq/head/flush
+machinery as writes.
+
+Fields: `addr` = BB start PC, `size` = 0, `value` = 0, `rip_lo` =
+PC offset from module base. Only emitted for BBs within the main module
+address range.
+
+~30 meta-instructions per BB entry. Engine-side: `world.record_bb_entry(rip_lo)`
+increments per-BB hit counter and `insn_counter`.
+
 ### Calls
 
 For each direct `call` instruction:
@@ -343,6 +357,8 @@ failures (0.025%) are cross-thread TOCTOU on shared memory, not capture bugs.
   Clean call fallback only for `sz > 8`.
 - **Head caching**: release store deferred to every 64th event or BB exit.
 - **Read buffering**: amortizes clean-call overhead to 1-per-BB-flush.
+- **BB_ENTRY**: ~30 meta-instructions per BB head. Fully inline, no clean call.
+  PC is JIT-time constant (two imm32 stores). Same seq/head/flush tail as writes.
 - **Backpressure**: relaxed load, same cache line as ring metadata.
 - **Ring push**: 1 relaxed load (head) + 1 acquire load (tail) + plain stores
   + 1 release store (head). TSO: release store is a plain `mov`.

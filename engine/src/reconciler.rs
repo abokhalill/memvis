@@ -23,6 +23,7 @@ pub const EVENT_CACHE_MISS: u8 = 6;
 pub const EVENT_MODULE_LOAD: u8 = 7;
 pub const EVENT_ALLOC: u8 = 9;
 pub const EVENT_FREE: u8 = 10;
+pub const EVENT_BB_ENTRY: u8 = 11;
 pub const EVENT_RELOAD: u8 = 12;
 
 /// REG_SNAPSHOT is 7 contiguous ring slots (header + 6 continuations carrying
@@ -300,6 +301,10 @@ pub fn process_event(
             }
             true
         }
+        EVENT_BB_ENTRY => {
+            world.record_bb_entry(ev.rip_lo);
+            true
+        }
         EVENT_MODULE_LOAD => {
             heap_oracle.add_module(ev.addr, ev.value);
             if relocation_delta.is_none() {
@@ -522,5 +527,117 @@ fn scan_ptr_fields(
                 );
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::heap_graph::{HeapGraph, HeapOracle};
+    use crate::index::AddressIndex;
+    use crate::ring::{Event, RingOrchestrator};
+    use crate::shadow_regs::ShadowRegisterFile;
+    use crate::world::{ShadowStack, WorldState};
+    use std::collections::{HashMap, VecDeque};
+
+    fn make_bb_entry_event(rip_lo: u32) -> Event {
+        Event {
+            addr: 0x4000_0000 + rip_lo as u64,
+            size: 0,
+            thread_id: 0,
+            seq: 1,
+            value: 0,
+            kind_flags: EVENT_BB_ENTRY as u32,
+            rip_lo,
+        }
+    }
+
+    fn make_unknown_event() -> Event {
+        Event {
+            addr: 0,
+            size: 0,
+            thread_id: 0,
+            seq: 0,
+            value: 0,
+            kind_flags: 0xFF,
+            rip_lo: 0,
+        }
+    }
+
+    #[test]
+    fn test_process_event_bb_entry() {
+        let orch = RingOrchestrator::new();
+        let mut world = WorldState::new();
+        let mut addr_index = AddressIndex::new();
+        let dwarf_info: Option<DwarfInfo> = None;
+        let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
+        let mut next_frame_id: u64 = 0;
+        let mut relocation_delta: Option<u64> = None;
+        let mut returned_frames: VecDeque<u64> = VecDeque::new();
+        let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
+        let mut heap_graph = HeapGraph::new();
+        let mut heap_oracle = HeapOracle::new();
+        let mut topo: Option<TopologyStream> = None;
+
+        let ev = make_bb_entry_event(0xABCD);
+        let accepted = process_event(
+            &ev, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &mut stacks, &mut next_frame_id, &mut relocation_delta,
+            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
+            &mut heap_oracle, &mut topo,
+        );
+        assert!(accepted, "BB_ENTRY must return true, not fall through to _ => false");
+        assert_eq!(world.insn_counter(), 1);
+        assert_eq!(world.bb_hits[&0xABCD], 1);
+
+        // second hit to same BB
+        let ev2 = make_bb_entry_event(0xABCD);
+        let accepted2 = process_event(
+            &ev2, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &mut stacks, &mut next_frame_id, &mut relocation_delta,
+            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
+            &mut heap_oracle, &mut topo,
+        );
+        assert!(accepted2);
+        assert_eq!(world.insn_counter(), 2);
+        assert_eq!(world.bb_hits[&0xABCD], 2);
+
+        // different BB
+        let ev3 = make_bb_entry_event(0x1234);
+        process_event(
+            &ev3, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &mut stacks, &mut next_frame_id, &mut relocation_delta,
+            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
+            &mut heap_oracle, &mut topo,
+        );
+        assert_eq!(world.bb_hits.len(), 2);
+        assert_eq!(world.bb_hits[&0x1234], 1);
+    }
+
+    #[test]
+    fn test_process_event_unknown_kind_rejected() {
+        let orch = RingOrchestrator::new();
+        let mut world = WorldState::new();
+        let mut addr_index = AddressIndex::new();
+        let dwarf_info: Option<DwarfInfo> = None;
+        let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
+        let mut next_frame_id: u64 = 0;
+        let mut relocation_delta: Option<u64> = None;
+        let mut returned_frames: VecDeque<u64> = VecDeque::new();
+        let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
+        let mut heap_graph = HeapGraph::new();
+        let mut heap_oracle = HeapOracle::new();
+        let mut topo: Option<TopologyStream> = None;
+
+        let ev = make_unknown_event();
+        let accepted = process_event(
+            &ev, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &mut stacks, &mut next_frame_id, &mut relocation_delta,
+            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
+            &mut heap_oracle, &mut topo,
+        );
+        assert!(!accepted, "unknown kind must return false");
+        assert_eq!(world.insn_counter(), 0);
+        assert!(world.bb_hits.is_empty());
     }
 }

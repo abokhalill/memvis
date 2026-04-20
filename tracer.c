@@ -159,7 +159,217 @@ typedef struct {
     bool     has_reads;
     bool     value_inline;
     bool     value_is_imm;
+    bool     bb_emitted;
 } instru_data_t;
+
+static _Atomic uint64_t g_stat_bb_entries = 0;
+
+/* fully inline BB_ENTRY (kind 11). no clean call, no EA; PC is JIT-time const. */
+static void
+emit_bb_entry(void *drcontext, instrlist_t *bb, instr_t *where, app_pc bb_pc)
+{
+    if (g_module_base == 0)
+        return;
+    uint64_t pc64 = (uint64_t)(ptr_uint_t)bb_pc;
+    if (pc64 < g_module_base || pc64 >= g_module_end)
+        return;
+    uint32_t rip_offset = (uint32_t)(pc64 - g_module_base);
+    atomic_fetch_add_explicit(&g_stat_bb_entries, 1, memory_order_relaxed);
+
+    reg_id_t scratch;
+    if (drreg_reserve_register(drcontext, bb, where, NULL, &scratch) != DRREG_SUCCESS)
+        return;
+    reg_id_t scratch2;
+    if (drreg_reserve_register(drcontext, bb, where, NULL, &scratch2) != DRREG_SUCCESS) {
+        drreg_unreserve_register(drcontext, bb, where, scratch);
+        return;
+    }
+
+    instr_t *skip_label = INSTR_CREATE_label(drcontext);
+    instr_t *no_flush   = INSTR_CREATE_label(drcontext);
+
+    drreg_reserve_aflags(drcontext, bb, where);
+
+    /* ring null check */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_RING))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_test(drcontext,
+            opnd_create_reg(scratch), opnd_create_reg(scratch)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
+
+    /* backpressure check */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_BP))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_test(drcontext,
+            opnd_create_reg(scratch), opnd_create_reg(scratch)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jcc(drcontext, OP_jnz, opnd_create_instr(skip_label)));
+
+    /* scratch = pad ptr */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+
+    /* slot = ring_data + (head & mask) * 32 */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch2),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_HEAD))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_and(drcontext,
+            opnd_create_reg(scratch2),
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_RING_MASK)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_shl(drcontext,
+            opnd_create_reg(scratch2),
+            OPND_CREATE_INT8(5)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_add(drcontext,
+            opnd_create_reg(scratch2),
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_RING_DATA)));
+
+    /* scratch2 = slot ptr. write event fields. */
+    /* addr = bb_pc (64-bit imm via two 32-bit stores) */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_ADDR, OPSZ_4),
+            OPND_CREATE_INT32((int)(uint32_t)(pc64 & 0xFFFFFFFFULL))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_ADDR + 4, OPSZ_4),
+            OPND_CREATE_INT32((int)(uint32_t)(pc64 >> 32))));
+
+    /* size = 0 */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_SIZE, OPSZ_4),
+            OPND_CREATE_INT32(0)));
+
+    /* thread_id | seq_lo packed into 4 bytes at offset 12 */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SEQ))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_shl(drcontext,
+            opnd_create_reg(scratch),
+            OPND_CREATE_INT8(16)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_or(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_TID))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_THREAD_ID, OPSZ_4),
+            opnd_create_reg(reg_64_to_32(scratch))));
+
+    /* kind_flags = BB_ENTRY | (seq_hi << 16) */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SEQ))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_shr(drcontext,
+            opnd_create_reg(scratch),
+            OPND_CREATE_INT8(16)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_shl(drcontext,
+            opnd_create_reg(scratch),
+            OPND_CREATE_INT8(16)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_or(drcontext,
+            opnd_create_reg(scratch),
+            OPND_CREATE_INT32(MEMVIS_EVENT_BB_ENTRY)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_KIND_FLAGS, OPSZ_4),
+            opnd_create_reg(reg_64_to_32(scratch))));
+
+    /* rip_lo */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_RIP_LO, OPSZ_4),
+            OPND_CREATE_INT32((int)rip_offset)));
+
+    /* value = 0 */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_VALUE, OPSZ_4),
+            OPND_CREATE_INT32(0)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch2, DR_REG_NULL, 0, OFF_EV3_VALUE + 4, OPSZ_4),
+            OPND_CREATE_INT32(0)));
+
+    /* seq++ */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SEQ))));
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_add(drcontext,
+            opnd_create_reg(scratch), OPND_CREATE_INT32(1)));
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_store(drcontext,
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SEQ)),
+            opnd_create_reg(scratch)));
+
+    /* head++ */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_HEAD))));
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_add(drcontext,
+            opnd_create_reg(scratch), OPND_CREATE_INT32(1)));
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_store(drcontext,
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_HEAD)),
+            opnd_create_reg(scratch)));
+
+    /* conditional head flush */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_test(drcontext,
+            opnd_create_reg(scratch),
+            OPND_CREATE_INT32(MEMVIS_HEAD_FLUSH_MASK)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jcc(drcontext, OP_jnz, opnd_create_instr(no_flush)));
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch2),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_RING))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            OPND_CREATE_MEMPTR(scratch2, OFF_RING_HEAD),
+            opnd_create_reg(scratch)));
+
+    instrlist_meta_preinsert(bb, where, no_flush);
+    instrlist_meta_preinsert(bb, where, skip_label);
+
+    drreg_unreserve_aflags(drcontext, bb, where);
+    drreg_unreserve_register(drcontext, bb, where, scratch2);
+    drreg_unreserve_register(drcontext, bb, where, scratch);
+}
 
 static void
 emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
@@ -899,6 +1109,7 @@ event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb,
     data->has_reads = false;
     data->value_is_imm = false;
     data->value_inline = false;
+    data->bb_emitted = false;
     for (instr_t *i = instrlist_first_app(bb); i != NULL; i = instr_get_next_app(i)) {
         if (instr_reads_memory(i)) { data->has_reads = true; break; }
     }
@@ -928,6 +1139,11 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
 {
     (void)tag; (void)for_trace; (void)translating;
     instru_data_t *data = (instru_data_t *)user_data;
+
+    if (!data->bb_emitted) {
+        data->bb_emitted = true;
+        emit_bb_entry(drcontext, bb, instr, instr_get_app_pc(instr));
+    }
 
     handle_pending_post_write(drcontext, bb, instr, data);
 
@@ -1435,6 +1651,7 @@ event_exit(void)
     dr_printf("memvis:   allocs:  %llu\n", (unsigned long long)atomic_load(&g_stat_allocs));
     dr_printf("memvis:   frees:   %llu\n", (unsigned long long)atomic_load(&g_stat_frees));
     dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
+    dr_printf("memvis:   bb_entr: %llu\n", (unsigned long long)atomic_load(&g_stat_bb_entries));
     dr_printf("memvis: --- JIT site breakdown ---\n");
     dr_printf("memvis:   imm_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_imm_sites));
     dr_printf("memvis:   gpr_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_gpr_sites));
