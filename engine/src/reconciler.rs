@@ -366,7 +366,7 @@ fn register_fields_recursive(
     world: &mut WorldState,
     depth: u32,
 ) {
-    if depth > 3 { return; }
+    if depth > 6 { return; }
     for f in &parent_type.fields {
         if f.byte_size == 0 || f.name == "<pointee>" {
             continue;

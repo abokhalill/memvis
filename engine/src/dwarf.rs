@@ -7,7 +7,7 @@ use gimli::{
     Unit, UnitOffset,
 };
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 
 type R<'a> = EndianSlice<'a, LittleEndian>;
@@ -491,7 +491,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                     functions.insert(f.low_pc, f);
                 }
             } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
-                if let Some(ti) = resolve_type_at(&dw, &unit, entry.offset(), 0) {
+                if let Some(ti) = resolve_type_at(&dw, &unit, entry.offset(), 0, &mut HashSet::new()) {
                     if !ti.name.is_empty() && ti.name != "<anon>" && !ti.is_pointer && ti.byte_size > 0 && !ti.fields.is_empty() {
                         let entry_fields = ti.fields.len();
                         type_registry
@@ -1066,8 +1066,9 @@ fn extract_struct_fields<'a>(
     unit: &Unit<R<'a>>,
     struct_offset: UnitOffset,
     parent_depth: u32,
+    visited: &mut HashSet<UnitOffset>,
 ) -> Vec<FieldInfo> {
-    if parent_depth >= 4 {
+    if parent_depth >= 8 {
         return Vec::new();
     }
 
@@ -1107,7 +1108,7 @@ fn extract_struct_fields<'a>(
                 _ => None,
             });
         let type_info = type_ref
-            .and_then(|off| resolve_type_at(dwarf, unit, off, parent_depth + 1))
+            .and_then(|off| resolve_type_at(dwarf, unit, off, parent_depth + 1, visited))
             .unwrap_or(TypeInfo {
                 name: "<unknown>".into(),
                 byte_size: 0,
@@ -1147,7 +1148,8 @@ fn resolve_type<'a>(
         AttributeValue::UnitRef(offset) => offset,
         _ => return None,
     };
-    resolve_type_at(dwarf, unit, type_ref, 0)
+    let mut visited = HashSet::new();
+    resolve_type_at(dwarf, unit, type_ref, 0, &mut visited)
 }
 
 fn resolve_type_at<'a>(
@@ -1155,8 +1157,9 @@ fn resolve_type_at<'a>(
     unit: &Unit<R<'a>>,
     offset: UnitOffset,
     depth: u32,
+    visited: &mut HashSet<UnitOffset>,
 ) -> Option<TypeInfo> {
-    if depth > 8 {
+    if depth > 16 || !visited.insert(offset) {
         return None;
     }
 
@@ -1189,7 +1192,7 @@ fn resolve_type_at<'a>(
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
-        let fields = extract_struct_fields(dwarf, unit, offset, depth);
+        let fields = extract_struct_fields(dwarf, unit, offset, depth, visited);
 
         Some(TypeInfo {
             name,
@@ -1212,7 +1215,7 @@ fn resolve_type_at<'a>(
             .ok()
             .flatten()
             .and_then(|v| match v {
-                AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1),
+                AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1, visited),
                 _ => None,
             });
 
@@ -1251,7 +1254,7 @@ fn resolve_type_at<'a>(
             AttributeValue::UnitRef(off) => off,
             _ => return None,
         };
-        let mut resolved = resolve_type_at(dwarf, unit, inner_ref, depth + 1)?;
+        let mut resolved = resolve_type_at(dwarf, unit, inner_ref, depth + 1, visited)?;
         if tag == gimli::DW_TAG_volatile_type {
             resolved.is_volatile = true;
         }
@@ -1277,7 +1280,7 @@ fn resolve_type_at<'a>(
             .ok()
             .flatten()
             .and_then(|v| match v {
-                AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1),
+                AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1, visited),
                 _ => None,
             });
         let elem_name = elem_type
