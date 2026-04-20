@@ -101,15 +101,18 @@ were tested and all failed (see Design Decisions below).
 **Phase 2: `emit_post_write` (inline + clean call, AFTER the store)**
 
 1. Load `pad.scratch[1]`. If 0 → skip (pre-write was skipped).
-2. **Value capture** (three tiers, selected at JIT time):
+2. **Value capture** (two tiers, selected at JIT time):
    - **Cat-A (imm)**: value already written in pre-write. No action.
-   - **Cat-B GPR (vector 7)**: inline EA re-read. Load EA from
-     `pad.scratch[0]` via raw TLS, `mov_ld` from `[EA]`, store into
-     `slot->value`. All meta-instructions — bypasses drreg entirely.
-     ~10 cycles. The app just wrote to `[EA]` so the page is hot.
+   - **Cat-B (vector 7, generalized)**: inline EA re-read for ALL writes
+     where `sz ≤ 8`. Load EA from `pad.scratch[0]` via raw TLS, 8-byte
+     `mov_ld` from `[EA]`, store into `slot->value`. Engine masks to
+     actual size via `ev.size`. All meta-instructions — bypasses drreg
+     entirely. ~10 cycles. Covers GPR-sourced, RMW, LOCK, and all other
+     ≤ 8-byte stores. The app just committed to `[EA]` so the cache
+     line is hot.
    - **Cat-B fallback**: clean call to `safe_read_into_slot(EA, size, slot)`.
-     `DR_TRY_EXCEPT`-guarded `memcpy`. ~100 cycles. Used for RMW, REP,
-     LOCK, or instructions where no GPR source was identified.
+     `DR_TRY_EXCEPT`-guarded `memcpy`. ~100 cycles. Only used for
+     `sz > 8` (REP MOVS/STOS, wide writes).
 3. Increment `pad->stat_inline_writes` inline.
 4. Increment per-thread `seq` counter (raw TLS).
 5. Increment cached `head` counter (raw TLS).
@@ -316,47 +319,30 @@ printed at process exit via `dr_printf`.
 
 ## Design decisions
 
-### Value capture: why clean call wins
+### Value capture: vector 7 (inline EA re-read)
 
-Six inline value capture approaches were tested. All fail under DynamoRIO's
-block builder:
+Six inline value capture approaches were tested and failed under DynamoRIO's
+block builder (drreg lazy-restore corruption, block truncation, encoder
+ambiguity). The 23x write count drop (14K→631) is the diagnostic signal of
+silent block truncation.
 
-| # | Approach | Failure mode |
-|---|---|---|
-| 1 | drreg-managed MOV | Corrupts lazy-restore state → exit SIGSEGV |
-| 2 | Manual RAX spill to raw TLS | Implicit operand collision (CMPXCHG/XADD) |
-| 3 | `dr_save_reg`/`dr_restore_reg` | wr_fast drops 14K→631, exit crash |
-| 4 | PUSH [EA] / POP [slot] | DynamoRIO mangles meta PUSH/POP for shadow stack |
-| 5 | MOVQ XMM0 relay | wr_fast drops 14K→631 (encoder ambiguity) |
-| 6 | Manual R11 spill to private pad | wr_fast drops to 11 (block truncation) |
+**Vector 7** bypasses drreg entirely: after the app store, load EA from
+`pad.scratch[0]` via raw TLS, 8-byte `mov_ld` from `[EA]`, store into
+`slot->value`. All meta-instructions — mangler-invisible. Works for all
+writes where `sz ≤ 8` (GPR-sourced, RMW, LOCK, etc). The `sz > 8` case
+(REP MOVS/STOS) falls back to `safe_read_into_slot` clean call.
 
-**Root cause**: Any meta-instruction that loads from an application-computed
-effective address causes DynamoRIO's block builder to either truncate the
-basic block or corrupt drreg's lazy-restore state machine. The register
-choice, spill mechanism, and instruction encoding are irrelevant.
-
-**Diagnostic signal**: The 23x write count drop (14K→631 or worse) is the
-fingerprint of silent block truncation.
-
-**Production answer**: Clean call (`safe_read_into_slot`) with
-`DR_TRY_EXCEPT` is the only proven-stable value capture mechanism under DBI.
-Pre-write metadata (addr, size, tid, seq, kind, rip) remains fully inline —
-only the 8-byte value read goes through the clean call.
+CCC audit verified: 0 failures across 2M single-threaded events. Multi-threaded
+failures (0.025%) are cross-thread TOCTOU on shared memory, not capture bugs.
 
 ## Performance characteristics
 
-- **Inline metadata**: 13 meta-instructions per write (pre-write path). No
-  clean call, no context save/restore. Compiles to ~15 x86-64 instructions.
-- **Value capture**: 1 clean call per write (~50-150 cycles context
-  save/restore). `safe_read_into_slot` performs a single `memcpy` for writes
-  ≤8 bytes; larger writes store `value = 0`.
-- **Head caching**: Defers atomic store to every 64th event or BB exit,
-  reducing release stores from 1-per-event to ~1-per-BB.
-- **Read buffering**: Amortizes clean_call overhead from 1-per-read to
-  1-per-BB-flush.
-- **Backpressure**: Relaxed load of `backpressure` flag is essentially free
-  (same cache line as ring metadata). Shedding reads under pressure avoids
-  stalling the target.
-- **Ring push** (`memvis_push_ex`): 1 relaxed load (head) + 1 acquire load
-  (tail) + plain stores + 1 release store (head). On x86-64 under TSO, the
-  release store is a plain `mov` (no `mfence` or `lock` prefix).
+- **Inline metadata**: ~13 meta-instructions per write (pre-write). No clean
+  call, no context save/restore.
+- **Value capture**: ~6 meta-instructions (vector 7, post-write) for `sz ≤ 8`.
+  Clean call fallback only for `sz > 8`.
+- **Head caching**: release store deferred to every 64th event or BB exit.
+- **Read buffering**: amortizes clean-call overhead to 1-per-BB-flush.
+- **Backpressure**: relaxed load, same cache line as ring metadata.
+- **Ring push**: 1 relaxed load (head) + 1 acquire load (tail) + plain stores
+  + 1 release store (head). TSO: release store is a plain `mov`.

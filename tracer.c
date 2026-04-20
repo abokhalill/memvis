@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: Apache-2.0 */
 
 
-/* Ghost v3 tracer. Inline write events, clean call CALL/RET. */
+/* Ghost v3 tracer. Inline writes, clean call control flow */
 
 #include <stddef.h>
 
@@ -90,7 +90,7 @@ static _Atomic uint64_t g_stat_frees         = 0;
 static _Atomic uint64_t g_stat_gpr_captures  = 0;
 static _Atomic uint64_t g_stat_clean_reads   = 0;
 
-/* JIT-time counters: how many instrumentation sites took each path */
+/* JIT-time site counters */
 static _Atomic uint64_t g_jit_gpr_sites      = 0;
 static _Atomic uint64_t g_jit_clean_sites    = 0;
 static _Atomic uint64_t g_jit_imm_sites      = 0;
@@ -147,18 +147,18 @@ map_ctl_ring(void)
     DR_ASSERT(g_ctl != MAP_FAILED);
     if (g_ctl->magic != MEMVIS_CTL_MAGIC)
         memvis_ctl_init(g_ctl);
-    /* publish target PID so engine can /proc/<pid>/mem warm-scan globals */
+    /* target PID for engine warm scan */
     g_ctl->target_pid = (uint32_t)dr_get_process_id();
 }
 
-/* per-BB state. reg_addr reserved at instr N, unreserved at N+1. */
+/* per BB instrumentation state; reg_addr lives across the app store */
 typedef struct {
     reg_id_t reg_addr;
-    reg_id_t src_reg;    /* GPR source for post-write capture; DR_REG_NULL if N/A */
+    reg_id_t src_reg;
     uint32_t write_sz;
     bool     has_reads;
-    bool     value_inline; /* CCC: value captured inline, skip clean call */
-    bool     value_is_imm;  /* CCC: value was an immediate (audit-safe) */
+    bool     value_inline;
+    bool     value_is_imm;
 } instru_data_t;
 
 static void
@@ -175,7 +175,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
 
     drreg_reserve_aflags(drcontext, bb, where);
 
-    /* save EA to pad.scratch[0] */
+    /* EA -> pad.scratch[0] */
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -227,7 +227,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
             opnd_create_reg(reg_addr),
             OPND_CREATE_MEMPTR(scratch, OFF_PAD_RING_DATA)));
 
-    /* reg_addr = slot ptr; recover EA from pad.scratch[0] */
+    /* recover EA; reg_addr now holds slot ptr */
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -297,7 +297,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 OFF_EV3_RIP_LO, OPSZ_4),
             OPND_CREATE_INT32((int)rip_offset)));
 
-    /* imm only Cat-A; GPR inline capture unsound (drreg lazy spill) */
+    /* imm value: written inline at JIT time */
     if (has_imm) {
         uint32_t lo = (uint32_t)(imm_val & 0xFFFFFFFFULL);
         uint32_t hi = (uint32_t)(imm_val >> 32);
@@ -313,7 +313,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 OPND_CREATE_INT32((int)hi)));
     }
 
-    /* save slot ptr to pad.scratch[1] for post-write */
+    /* slot ptr -> pad.scratch[1] for post-write */
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
             opnd_create_reg(scratch),
@@ -333,7 +333,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jmp(drcontext, opnd_create_instr(done_label)));
 
-    /* skip path: pad.scratch[1] = 0, restore EA */
+    /* skip: zero scratch[1], restore EA */
     instrlist_meta_preinsert(bb, where, skip_label);
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
@@ -358,7 +358,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
 }
 
 #ifdef MEMVIS_CCC_AUDIT
-/* self contained audit; reads EA/slot/counter from pad. immune to drreg respill. */
+/* shadow audit: re-reads [EA] and compares against slot->value */
 static void
 ccc_audit_verify(uint32_t size)
 {
@@ -445,24 +445,19 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
 
-    if (!value_inline && src_reg != DR_REG_NULL) {
-        /* vector 7: manual EA re-read. bypasses drreg entirely.
-         * all meta-instructions; mangler ignores them. EA was just written
-         * by the app store so the page is hot — fault risk is negligible. */
+    if (!value_inline && sz <= 8) {
+        /* vector 7: inline EA re-read, all meta-instrs, drreg-free */
         atomic_fetch_add_explicit(&g_jit_gpr_sites, 1, memory_order_relaxed);
 
-        /* scratch = pad ptr (from raw TLS) */
         instrlist_meta_preinsert(bb, where,
             XINST_CREATE_load(drcontext,
                 opnd_create_reg(scratch),
                 dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
                     RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
-        /* reg_addr = EA from pad.scratch[0] */
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_ld(drcontext,
                 opnd_create_reg(reg_addr),
                 OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0)));
-        /* scratch = slot ptr from pad.scratch[1] */
         instrlist_meta_preinsert(bb, where,
             XINST_CREATE_load(drcontext,
                 opnd_create_reg(scratch),
@@ -473,13 +468,11 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 opnd_create_reg(scratch),
                 OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1)));
 
-        /* sized read from [EA] into reg_addr.
-         * use 8-byte read; engine masks to actual size via ev.size. */
+        /* read [EA]; engine masks to ev.size */
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_ld(drcontext,
                 opnd_create_reg(reg_addr),
                 OPND_CREATE_MEMPTR(reg_addr, 0)));
-        /* store captured value into slot->value */
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_st(drcontext,
                 OPND_CREATE_MEMPTR(scratch, OFF_EV3_VALUE),
@@ -489,7 +482,7 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
             (void *)ccc_count_gpr, false, 0);
 #endif
     } else if (!value_inline) {
-        /* Cat-B fallback: no GPR source identified, safe_read via clean call */
+        /* sz > 8: clean-call fallback (REP/wide) */
         atomic_fetch_add_explicit(&g_jit_clean_sites, 1, memory_order_relaxed);
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_ld(drcontext,
@@ -514,7 +507,7 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     }
 
 #ifdef MEMVIS_CCC_AUDIT
-    if ((value_inline && !value_is_imm) || src_reg != DR_REG_NULL) {
+    if (!value_is_imm) {
         dr_insert_clean_call(drcontext, bb, where,
             (void *)ccc_audit_verify, false, 1,
             OPND_CREATE_INT32((int)sz));
@@ -654,8 +647,7 @@ static inline uint16_t tls_thread_id(void *drcontext) {
     return (uint16_t)(uintptr_t)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_THREAD_ID]);
 }
 
-// 32-bit seq: seq_lo -> event.seq_lo, seq_hi -> top 16 of event.kind_flags.
-// u16 was ~1.3ms of distance at 50M ev/s; wrapped stamps poisoned SRF/STM.
+/* 32-bit seq split across seq_lo (low 16) and kind_flags (high 16) */
 static inline uint32_t tls_next_seq(void *drcontext) {
     uint32_t s = (uint32_t)(uintptr_t)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ]);
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ], (void *)(uintptr_t)(s + 1));
@@ -958,7 +950,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                                  instr_get_app_pc(instr)));
     }
 
-    /* tail-call heuristic: end-of-BB direct JMP, target >4KB away */
+    /* tail-call heuristic: end-of-BB JMP, target >4KB away */
     if (instr_is_ubr(instr) && !instr_is_call(instr) &&
         drmgr_is_last_instr(drcontext, instr) && g_module_base != 0) {
         app_pc target = instr_get_branch_target_pc(instr);
@@ -978,7 +970,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
         }
     }
 
-    /* inline write path. RIP filter: main module only. */
+    /* inline write path; main module only */
     if (instr_writes_memory(instr)) {
         app_pc pc = instr_get_app_pc(instr);
         bool in_main = g_module_base != 0 &&
@@ -1073,7 +1065,6 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                     }
                 }
 
-                /* GPR capture deferred to emit_post_write; imm captured in emit_pre_write */
                 bool vi = ccc_has_imm;
 
                 emit_pre_write(drcontext, bb, instr,
@@ -1218,7 +1209,7 @@ wrap_realloc_pre(void *wrapctx, void **user_data)
     size_t new_sz  = (size_t)drwrap_get_arg(wrapctx, 1);
     *user_data = old_ptr;
     void *drcontext = drwrap_get_drcontext(wrapctx);
-    /* emit FREE for old_ptr now, ALLOC in post */
+    /* free old_ptr now, alloc in post */
     if (old_ptr != NULL) {
         memvis_ring_header_t *ring = tls_ring(drcontext);
         if (ring) {
@@ -1270,7 +1261,7 @@ wrap_free_pre(void *wrapctx, void **user_data)
     *user_data = NULL;
 }
 
-/* kind: 0=malloc, 1=free, 2=calloc, 3=realloc */
+/* 0=malloc 1=free 2=calloc 3=realloc */
 static void
 try_wrap_one(const module_data_t *mod, const char *sym, int kind)
 {
@@ -1288,7 +1279,6 @@ try_wrap_one(const module_data_t *mod, const char *sym, int kind)
     dr_printf("memvis: wrapped %s @ %p\n", sym, (void *)func_pc);
 }
 
-/* tier 1: canonical libc names */
 static void
 wrap_alloc_funcs(const module_data_t *mod)
 {
@@ -1298,26 +1288,22 @@ wrap_alloc_funcs(const module_data_t *mod)
     try_wrap_one(mod, "realloc", 3);
 }
 
-/* tier 2: known foreign allocator prefixes (same ABI: size in RDI, ret in RAX) */
+/* foreign allocator prefixes (same ABI) */
 static void
 wrap_alloc_funcs_foreign(const module_data_t *mod, const char *tag)
 {
-    /* jemalloc */
     try_wrap_one(mod, "je_malloc",  0);
     try_wrap_one(mod, "je_free",    1);
     try_wrap_one(mod, "je_calloc",  2);
     try_wrap_one(mod, "je_realloc", 3);
-    /* tcmalloc */
     try_wrap_one(mod, "tc_malloc",  0);
     try_wrap_one(mod, "tc_free",    1);
     try_wrap_one(mod, "tc_calloc",  2);
     try_wrap_one(mod, "tc_realloc", 3);
-    /* mimalloc */
     try_wrap_one(mod, "mi_malloc",  0);
     try_wrap_one(mod, "mi_free",    1);
     try_wrap_one(mod, "mi_calloc",  2);
     try_wrap_one(mod, "mi_realloc", 3);
-    /* also try the standard names — foreign allocators often alias them */
     try_wrap_one(mod, "malloc",  0);
     try_wrap_one(mod, "free",    1);
     try_wrap_one(mod, "calloc",  2);
