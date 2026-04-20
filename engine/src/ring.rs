@@ -19,7 +19,7 @@ pub struct Event {
     pub addr: u64,
     pub size: u32,
     pub thread_id: u16,
-    pub seq: u16,
+    pub seq: u16,       
     pub value: u64,
     pub kind_flags: u32,
     pub rip_lo: u32,
@@ -30,6 +30,12 @@ impl Event {
     #[inline(always)]
     pub fn kind(&self) -> u8 {
         (self.kind_flags & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub fn seq32(&self) -> u32 {
+        let hi = self.kind_flags >> 16;
+        (hi << 16) | (self.seq as u32)
     }
 
     pub fn zero() -> Self {

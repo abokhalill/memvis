@@ -86,18 +86,18 @@ pub fn process_event(
                     };
                     let func = info.func_containing(elf_pc);
                     let srf = shadow_regs.entry(ev.thread_id).or_default();
-                    srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq as u64, func);
+                    srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq32() as u64, func);
                 }
             }
             if cl_writers.count_ones() > 1 {
                 for (&tid, srf) in shadow_regs.iter_mut() {
                     if tid != ev.thread_id {
-                        srf.check_coherence(ev.addr, ev.value, ev.size, ev.seq as u64);
+                        srf.check_coherence(ev.addr, ev.value, ev.size, ev.seq32() as u64);
                     }
                 }
             }
             if heap_oracle.is_heap(ev.addr) {
-                heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq as u64, heap_oracle);
+                heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq32() as u64, heap_oracle);
                 // field heatmap: attribute this write to a typed field if STM covers it
                 if let Some(covering) = world.stm.covering(ev.addr) {
                     let offset = ev.addr - covering.base_addr;
@@ -116,22 +116,22 @@ pub fn process_event(
                             let offset = ev.addr - covering.base_addr;
                             if let Some(field) = covering.type_info.fields.iter().find(|f| f.byte_offset == offset && f.type_info.is_pointer) {
                                 let pointee = field.type_info.name.strip_prefix('*').unwrap_or(&field.type_info.name);
-                                ts.emit_link(ev.seq as u64, &covering.type_info.name, ev.addr, ev.value, pointee, &field.name);
+                                ts.emit_link(ev.seq32() as u64, &covering.type_info.name, ev.addr, ev.value, pointee, &field.name);
                             }
                         }
                     }
                 }
                 if let Some(ref info) = dwarf_info {
                     let before = world.stm.len();
-                    world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq as u64, &info.type_registry);
+                    world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq32() as u64, &info.type_registry);
                     let after = world.stm.len();
                     if after > before {
-                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
+                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq32() as u64);
                     }
                     if after > before {
                         if let Some(ref mut ts) = topo {
                             if let Some(proj) = world.stm.lookup(ev.value) {
-                                ts.emit_stamp(ev.seq as u64, ev.value, &proj.type_info.name, proj.type_info.byte_size, &proj.source_name, proj.type_info.fields.len());
+                                ts.emit_stamp(ev.seq32() as u64, ev.value, &proj.type_info.name, proj.type_info.byte_size, &proj.source_name, proj.type_info.fields.len());
                             }
                         }
                     }
@@ -144,7 +144,7 @@ pub fn process_event(
                             h.reg_snapshot = shadow_regs.get(&ev.thread_id).map(|srf| srf.values());
                             if let Some(ref mut ts) = topo {
                                 let kind_str = match h.kind { HazardKind::OutOfBounds => "OOB", HazardKind::HeapHole => "HOLE" };
-                                ts.emit_hazard(ev.seq as u64, kind_str, h.write_addr, h.write_size, h.alloc_base, h.alloc_size, h.overflow_bytes, h.type_name.as_deref(), h.field_name.as_deref());
+                                ts.emit_hazard(ev.seq32() as u64, kind_str, h.write_addr, h.write_size, h.alloc_base, h.alloc_size, h.overflow_bytes, h.type_name.as_deref(), h.field_name.as_deref());
                             }
                             world.hazards.push(h);
                         }
@@ -172,10 +172,10 @@ pub fn process_event(
                                 let pointee_name = h_type.name.strip_prefix('*').unwrap_or("");
                                 if let Some(pointee_ti) = info.type_registry.get(pointee_name) {
                                     world.heap_allocs.check_size(ev.value, pointee_ti);
-                                    if world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq as u64) {
-                                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq as u64);
+                                    if world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq32() as u64) {
+                                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq32() as u64);
                                         if let Some(ref mut ts) = topo {
-                                            ts.emit_stamp(ev.seq as u64, ev.value, &pointee_ti.name, pointee_ti.byte_size, &h_name, pointee_ti.fields.len());
+                                            ts.emit_stamp(ev.seq32() as u64, ev.value, &pointee_ti.name, pointee_ti.byte_size, &h_name, pointee_ti.fields.len());
                                         }
                                     }
                                 }
@@ -183,7 +183,7 @@ pub fn process_event(
                         }
                         if let Some(ref mut ts) = topo {
                             let pointee_name = h_type.name.strip_prefix('*').unwrap_or(&h_type.name);
-                            ts.emit_link(ev.seq as u64, &h_name, ev.addr, ev.value, pointee_name, &h_name);
+                            ts.emit_link(ev.seq32() as u64, &h_name, ev.addr, ev.value, pointee_name, &h_name);
                         }
                     }
                 }
@@ -194,7 +194,7 @@ pub fn process_event(
         EVENT_CALL => {
             {
                 let srf = shadow_regs.entry(ev.thread_id).or_default();
-                srf.on_call(ev.addr, ev.value, ev.seq as u64);
+                srf.on_call(ev.addr, ev.value, ev.seq32() as u64);
             }
             heap_oracle.update_stack(ev.thread_id, ev.value);
             if let Some(ref info) = dwarf_info {
@@ -243,7 +243,7 @@ pub fn process_event(
         EVENT_RETURN => {
             {
                 let srf = shadow_regs.entry(ev.thread_id).or_default();
-                srf.on_return(ev.seq as u64, ev.addr);
+                srf.on_return(ev.seq32() as u64, ev.addr);
             }
             let tid = ev.thread_id;
             if let Some(stack) = stacks.get_mut(&tid) {
@@ -273,7 +273,7 @@ pub fn process_event(
         EVENT_RELOAD => {
             let reg_idx = ((ev.kind_flags >> 8) & 0xFF) as usize;
             let srf = shadow_regs.entry(ev.thread_id).or_default();
-            srf.on_reload(reg_idx, ev.value, ev.addr, ev.size, ev.seq as u64, ev.addr);
+            srf.on_reload(reg_idx, ev.value, ev.addr, ev.size, ev.seq32() as u64, ev.addr);
             true
         }
         EVENT_ALLOC => {
@@ -284,7 +284,7 @@ pub fn process_event(
                 heap_graph.on_free(ptr, old_size);
             }
             if let Some(ref mut ts) = topo {
-                ts.emit_alloc(ev.seq as u64, ev.thread_id, ptr, size);
+                ts.emit_alloc(ev.seq32() as u64, ev.thread_id, ptr, size);
             }
             true
         }
@@ -295,7 +295,7 @@ pub fn process_event(
                 world.stm.purge_range(ptr, old_size);
                 heap_graph.on_free(ptr, old_size);
                 if let Some(ref mut ts) = topo {
-                    ts.emit_free(ev.seq as u64, ev.thread_id, ptr, old_size);
+                    ts.emit_free(ev.seq32() as u64, ev.thread_id, ptr, old_size);
                 }
             }
             true

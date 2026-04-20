@@ -222,7 +222,7 @@ fn replay_to_checkpoints(
                     }
                     world.update_regs(regs, ev.addr);
                     let srf = shadow_regs.entry(ev.thread_id).or_default();
-                    srf.apply_snapshot(&regs, ev.seq as u64, ev.addr);
+                    srf.apply_snapshot(&regs, ev.seq32() as u64, ev.addr);
                     seq += 6;
                     i += 7;
                 } else {

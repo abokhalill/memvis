@@ -28,7 +28,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
     let mut relocation_delta: Option<u64> = None;
     let mut returned_frames: VecDeque<FrameId> = VecDeque::with_capacity(64);
-    let mut expected_seq: HashMap<u16, u16> = HashMap::new();
+    let mut expected_seq: HashMap<u16, u32> = HashMap::new();
     let mut seq_gaps: u64 = 0;
     let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
     let mut heap_graph = HeapGraph::new();
@@ -165,8 +165,9 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                         }
                         total += consumed as u64;
                         world.inc_insn_counter();
-                        let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
-                        *exp = ev.seq.wrapping_add(1);
+                        let s32 = ev.seq32();
+                        let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
+                        *exp = s32.wrapping_add(1);
                         i += consumed;
                         continue;
                     }
@@ -174,11 +175,12 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                     total += 1;
                     world.inc_insn_counter();
 
-                    let exp = expected_seq.entry(ev.thread_id).or_insert(ev.seq);
-                    if ev.seq != *exp {
+                    let s32 = ev.seq32();
+                    let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
+                    if s32 != *exp {
                         seq_gaps += 1;
                     }
-                    *exp = ev.seq.wrapping_add(1);
+                    *exp = s32.wrapping_add(1);
 
                     let interesting = reconciler::process_event(
                         &ev,
