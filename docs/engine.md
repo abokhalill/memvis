@@ -153,8 +153,9 @@ The orchestrator manages all shared memory connections to the tracer.
 ### Structures
 
 - **`MappedShm`**: RAII wrapper around `shm_open` + `mmap`/`munmap`.
-- **`ThreadRing`**: A single thread's ring buffer. Provides `pop`, `pop_n`,
-  `peek`, `batch_pop`, and `fill` methods.
+- **`ThreadRing`**: A single thread's ring buffer. Exposes `pop_n` and
+  `consume_batch` (snapshot-atomic: a REG_SNAPSHOT header is never returned
+  without its 6 continuations).
 - **`RingOrchestrator`**: Manages the control ring and a vector of
   `ThreadRing`s. Provides `try_attach_ctl`, `poll_new_rings`,
   `batch_drain`, `merge_pop`, `total_fill`, and `update_backpressure`.
@@ -580,7 +581,7 @@ live engine and `memvis-diff`. Contains three public functions:
 | `READ` (1) | Journal only (no state mutation). |
 | `CALL` (2) | DWARF function lookup (relocated PC). Push shadow frame. Insert locals into index. |
 | `RETURN` (3) | Pop shadow frame. Remove locals. Queue deferred node removal. |
-| `REG_SNAPSHOT` (5) | Pop 6 continuation events from ring. Unpack 18 registers. `shadow_regs.apply_snapshot`. `world.update_regs`. |
+| `REG_SNAPSHOT` (5) | Handled by caller via `reconciler::apply_reg_snapshot` over the drained 7-slot run. `process_event`'s arm is a no-op. `ring::consume_batch` enforces snapshot atomicity so the run never straddles a batch. |
 | `CACHE_MISS` (6) | `addr_index.lookup`. Record miss in `cache_heat`. |
 | `MODULE_LOAD` (7) | Compute relocation delta. Re-populate globals with relocated addresses. Register heap oracle module range. |
 | `TAIL_CALL` (8) | Like CALL but does not push a new shadow frame (replaces current). |
