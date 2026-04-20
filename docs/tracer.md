@@ -32,7 +32,7 @@ DynamoRIO assigns TLS field indices dynamically. The tracer stores them in
 |---|---|---|
 | 0 | `TLS_SLOT_GUARD` | Reentrancy guard (prevents recursive clean calls) |
 | 1 | `TLS_SLOT_THREAD_ID` | Logical thread ID (u16, assigned sequentially) |
-| 2 | `TLS_SLOT_SEQ` | Per-thread event sequence counter (u16, wraps) |
+| 2 | `TLS_SLOT_SEQ` | Per-thread event sequence counter (u32, stored as `uintptr_t`) |
 | 3 | `TLS_SLOT_RING` | Pointer to this thread's ring header |
 | 4 | `TLS_SLOT_CTL_IDX` | Index in the control ring's thread array |
 | 5 | `TLS_SLOT_RDBUF` | Pointer to the per-thread read buffer |

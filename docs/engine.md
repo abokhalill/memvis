@@ -625,10 +625,11 @@ true (every 10,000 heap events with objects present).
 
 ### Sequence tracking
 
-Each event carries a per-thread 16-bit sequence number. The engine tracks
-the expected next sequence per thread and increments `seq_gaps` on
-mismatches. Gaps indicate dropped events (ring overflow) and are displayed
-in the TUI header.
+Each event carries a per-thread 32-bit sequence number (seq_lo in the wire
+field, seq_hi in kind_flags[16..31]; reconstructed via `Event::seq32()`).
+The engine tracks the expected next sequence per thread and increments
+`seq_gaps` on mismatches. Gaps indicate dropped events (ring overflow) and
+are displayed in the TUI header.
 
 ## Rendering
 
