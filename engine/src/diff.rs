@@ -211,23 +211,11 @@ fn replay_to_checkpoints(
             let ev_kind = ev.kind();
 
             if ev_kind == reconciler::EVENT_REG_SNAPSHOT {
-                // reconstruct register array from header + 6 continuations
-                if i + 6 < batch.len() {
-                    let mut regs = [0u64; 18];
-                    for s in 0..6usize {
-                        let c = &batch[i + 1 + s];
-                        regs[s * 3] = c.addr;
-                        regs[s * 3 + 1] = c.size as u64;
-                        regs[s * 3 + 2] = c.value;
-                    }
-                    world.update_regs(regs, ev.addr);
-                    let srf = shadow_regs.entry(ev.thread_id).or_default();
-                    srf.apply_snapshot(&regs, ev.seq32() as u64, ev.addr);
-                    seq += 6;
-                    i += 7;
-                } else {
-                    i += 1;
-                }
+                let consumed = reconciler::apply_reg_snapshot(
+                    &batch[i..], &mut world, &mut shadow_regs,
+                ).max(1);
+                seq += consumed as u64 - 1; // outer seq+=1 already counted header
+                i += consumed;
                 continue;
             }
 
