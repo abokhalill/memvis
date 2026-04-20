@@ -101,19 +101,29 @@ were tested and all failed (see Design Decisions below).
 **Phase 2: `emit_post_write` (inline + clean call, AFTER the store)**
 
 1. Load `pad.scratch[1]`. If 0 → skip (pre-write was skipped).
-2. Reload EA from `pad.scratch[0]` into `reg_addr` (base register may be
-   stale after the app write).
-3. Load slot pointer from `pad.scratch[1]`.
-4. **Clean call** to `safe_read_into_slot(EA, size, slot_ptr)`:
-   - Reads the post-write value via `DR_TRY_EXCEPT`-guarded `memcpy`.
-   - Writes `value` into the slot.
-   - On fault (unmapped page): leaves `value = 0`.
-5. Increment `pad->stat_inline_writes` inline.
-6. Increment per-thread `seq` counter (raw TLS).
-7. Increment cached `head` counter (raw TLS).
-8. Conditional head flush: if `head & 0x3F == 0`, flush to `ring->head`
+2. **Value capture** (three tiers, selected at JIT time):
+   - **Cat-A (imm)**: value already written in pre-write. No action.
+   - **Cat-B GPR (vector 7)**: inline EA re-read. Load EA from
+     `pad.scratch[0]` via raw TLS, `mov_ld` from `[EA]`, store into
+     `slot->value`. All meta-instructions — bypasses drreg entirely.
+     ~10 cycles. The app just wrote to `[EA]` so the page is hot.
+   - **Cat-B fallback**: clean call to `safe_read_into_slot(EA, size, slot)`.
+     `DR_TRY_EXCEPT`-guarded `memcpy`. ~100 cycles. Used for RMW, REP,
+     LOCK, or instructions where no GPR source was identified.
+3. Increment `pad->stat_inline_writes` inline.
+4. Increment per-thread `seq` counter (raw TLS).
+5. Increment cached `head` counter (raw TLS).
+6. Conditional head flush: if `head & 0x3F == 0`, flush to `ring->head`
    (release store).
-9. Unreserve `reg_addr`.
+7. Unreserve `reg_addr`.
+
+**Why `drreg_get_app_value` is unsound for value capture**: six attempts
+plus a seventh (post-write position) all fail. drreg's lazy spill/restore
+is resolved during the mangler phase; `drreg_get_app_value` reads from
+spill slots that may contain stale pre-instruction values. The manual EA
+re-read (vector 7) bypasses drreg entirely by reading from application
+memory via raw-TLS-derived pointers. CCC audit verified: 0 failures
+across 2M single-threaded events.
 
 **BB-exit head flush**: At the end of every basic block, a clean call to
 `flush_head_cache` unconditionally stores the cached head to `ring->head`

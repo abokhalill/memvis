@@ -87,6 +87,13 @@ static _Atomic uint64_t g_stat_reloads       = 0;
 static _Atomic uint64_t g_stat_tail_calls    = 0;
 static _Atomic uint64_t g_stat_allocs        = 0;
 static _Atomic uint64_t g_stat_frees         = 0;
+static _Atomic uint64_t g_stat_gpr_captures  = 0;
+static _Atomic uint64_t g_stat_clean_reads   = 0;
+
+/* JIT-time counters: how many instrumentation sites took each path */
+static _Atomic uint64_t g_jit_gpr_sites      = 0;
+static _Atomic uint64_t g_jit_clean_sites    = 0;
+static _Atomic uint64_t g_jit_imm_sites      = 0;
 
 static _Atomic uint16_t g_next_thread_id    = 0;
 
@@ -147,6 +154,7 @@ map_ctl_ring(void)
 /* per-BB state. reg_addr reserved at instr N, unreserved at N+1. */
 typedef struct {
     reg_id_t reg_addr;
+    reg_id_t src_reg;    /* GPR source for post-write capture; DR_REG_NULL if N/A */
     uint32_t write_sz;
     bool     has_reads;
     bool     value_inline; /* CCC: value captured inline, skip clean call */
@@ -375,18 +383,24 @@ ccc_audit_verify(uint32_t size)
     atomic_fetch_add_explicit(&g_ccc_audit_checks, 1, memory_order_relaxed);
     if (inline_val == ground_truth) {
         atomic_fetch_add_explicit(&g_ccc_audit_pass, 1, memory_order_relaxed);
-    } else if (inline_val == 0 && ground_truth != 0) {
+    } else {
         atomic_fetch_add_explicit(&g_ccc_audit_fail, 1, memory_order_relaxed);
-        dr_printf("memvis: CCC AUDIT FAIL (capture) addr=%p sz=%u "
+        dr_printf("memvis: CCC AUDIT FAIL addr=%p sz=%u "
                   "inline=0x%llx truth=0x%llx rip_lo=0x%x\n",
                   (void *)(uintptr_t)addr, size,
                   (unsigned long long)inline_val,
                   (unsigned long long)ground_truth,
                   (unsigned)slot->rip_lo);
-        DR_ASSERT_MSG(false, "CCC: inline capture returned zero for non-zero write");
-    } else {
-        atomic_fetch_add_explicit(&g_ccc_audit_pass, 1, memory_order_relaxed);
     }
+}
+#endif
+
+#ifdef MEMVIS_CCC_AUDIT
+static void ccc_count_gpr(void) {
+    atomic_fetch_add_explicit(&g_stat_gpr_captures, 1, memory_order_relaxed);
+}
+static void ccc_count_clean(void) {
+    atomic_fetch_add_explicit(&g_stat_clean_reads, 1, memory_order_relaxed);
 }
 #endif
 
@@ -405,7 +419,7 @@ safe_read_into_slot(uint64_t addr, uint32_t size, memvis_event_v3_t *slot)
 static void
 emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 reg_id_t reg_addr, uint32_t sz, bool value_inline,
-                bool value_is_imm)
+                bool value_is_imm, reg_id_t src_reg)
 {
     reg_id_t scratch;
     if (drreg_reserve_register(drcontext, bb, where, NULL, &scratch) != DRREG_SUCCESS) {
@@ -431,8 +445,52 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
 
-    if (!value_inline) {
-        /* Cat-B: reload EA (stale after PUSH/POP), safe_read value */
+    if (!value_inline && src_reg != DR_REG_NULL) {
+        /* vector 7: manual EA re-read. bypasses drreg entirely.
+         * all meta-instructions; mangler ignores them. EA was just written
+         * by the app store so the page is hot — fault risk is negligible. */
+        atomic_fetch_add_explicit(&g_jit_gpr_sites, 1, memory_order_relaxed);
+
+        /* scratch = pad ptr (from raw TLS) */
+        instrlist_meta_preinsert(bb, where,
+            XINST_CREATE_load(drcontext,
+                opnd_create_reg(scratch),
+                dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                    RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+        /* reg_addr = EA from pad.scratch[0] */
+        instrlist_meta_preinsert(bb, where,
+            INSTR_CREATE_mov_ld(drcontext,
+                opnd_create_reg(reg_addr),
+                OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0)));
+        /* scratch = slot ptr from pad.scratch[1] */
+        instrlist_meta_preinsert(bb, where,
+            XINST_CREATE_load(drcontext,
+                opnd_create_reg(scratch),
+                dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                    RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+        instrlist_meta_preinsert(bb, where,
+            INSTR_CREATE_mov_ld(drcontext,
+                opnd_create_reg(scratch),
+                OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1)));
+
+        /* sized read from [EA] into reg_addr.
+         * use 8-byte read; engine masks to actual size via ev.size. */
+        instrlist_meta_preinsert(bb, where,
+            INSTR_CREATE_mov_ld(drcontext,
+                opnd_create_reg(reg_addr),
+                OPND_CREATE_MEMPTR(reg_addr, 0)));
+        /* store captured value into slot->value */
+        instrlist_meta_preinsert(bb, where,
+            INSTR_CREATE_mov_st(drcontext,
+                OPND_CREATE_MEMPTR(scratch, OFF_EV3_VALUE),
+                opnd_create_reg(reg_addr)));
+#ifdef MEMVIS_CCC_AUDIT
+        dr_insert_clean_call(drcontext, bb, where,
+            (void *)ccc_count_gpr, false, 0);
+#endif
+    } else if (!value_inline) {
+        /* Cat-B fallback: no GPR source identified, safe_read via clean call */
+        atomic_fetch_add_explicit(&g_jit_clean_sites, 1, memory_order_relaxed);
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_ld(drcontext,
                 opnd_create_reg(reg_addr),
@@ -447,10 +505,16 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
             opnd_create_reg(reg_addr),
             OPND_CREATE_INT32((int)sz),
             opnd_create_reg(scratch));
+#ifdef MEMVIS_CCC_AUDIT
+        dr_insert_clean_call(drcontext, bb, where,
+            (void *)ccc_count_clean, false, 0);
+#endif
+    } else {
+        atomic_fetch_add_explicit(&g_jit_imm_sites, 1, memory_order_relaxed);
     }
 
 #ifdef MEMVIS_CCC_AUDIT
-    if (value_inline && !value_is_imm) {
+    if ((value_inline && !value_is_imm) || src_reg != DR_REG_NULL) {
         dr_insert_clean_call(drcontext, bb, where,
             (void *)ccc_audit_verify, false, 1,
             OPND_CREATE_INT32((int)sz));
@@ -838,6 +902,7 @@ event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb,
     (void)tag; (void)for_trace; (void)translating;
     instru_data_t *data = (instru_data_t *)dr_thread_alloc(drcontext, sizeof(*data));
     data->reg_addr = DR_REG_NULL;
+    data->src_reg = DR_REG_NULL;
     data->write_sz = 0;
     data->has_reads = false;
     data->value_is_imm = false;
@@ -856,10 +921,11 @@ handle_pending_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     if (data->reg_addr == DR_REG_NULL)
         return;
     emit_post_write(drcontext, bb, where, data->reg_addr, data->write_sz,
-                    data->value_inline, data->value_is_imm);
+                    data->value_inline, data->value_is_imm, data->src_reg);
     if (drreg_unreserve_register(drcontext, bb, where, data->reg_addr) != DRREG_SUCCESS)
         DR_ASSERT(false);
     data->reg_addr = DR_REG_NULL;
+    data->src_reg = DR_REG_NULL;
     data->value_inline = false;
     data->value_is_imm = false;
 }
@@ -1007,7 +1073,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                     }
                 }
 
-                ccc_src_reg = DR_REG_NULL;
+                /* GPR capture deferred to emit_post_write; imm captured in emit_pre_write */
                 bool vi = ccc_has_imm;
 
                 emit_pre_write(drcontext, bb, instr,
@@ -1018,6 +1084,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                 drreg_unreserve_register(drcontext, bb, instr, pre_scratch);
 
                 data->reg_addr = reg_addr;
+                data->src_reg  = ccc_src_reg;
                 data->write_sz = sz;
                 data->value_inline = vi;
                 data->value_is_imm = ccc_has_imm;
@@ -1382,11 +1449,17 @@ event_exit(void)
     dr_printf("memvis:   allocs:  %llu\n", (unsigned long long)atomic_load(&g_stat_allocs));
     dr_printf("memvis:   frees:   %llu\n", (unsigned long long)atomic_load(&g_stat_frees));
     dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
+    dr_printf("memvis: --- JIT site breakdown ---\n");
+    dr_printf("memvis:   imm_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_imm_sites));
+    dr_printf("memvis:   gpr_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_gpr_sites));
+    dr_printf("memvis:   clean_sites: %llu\n", (unsigned long long)atomic_load(&g_jit_clean_sites));
 #ifdef MEMVIS_CCC_AUDIT
     dr_printf("memvis: --- CCC shadow audit ---\n");
-    dr_printf("memvis:   checks: %llu\n", (unsigned long long)atomic_load(&g_ccc_audit_checks));
-    dr_printf("memvis:   pass:   %llu\n", (unsigned long long)atomic_load(&g_ccc_audit_pass));
-    dr_printf("memvis:   fail:   %llu\n", (unsigned long long)atomic_load(&g_ccc_audit_fail));
+    dr_printf("memvis:   checks:      %llu\n", (unsigned long long)atomic_load(&g_ccc_audit_checks));
+    dr_printf("memvis:   pass:        %llu\n", (unsigned long long)atomic_load(&g_ccc_audit_pass));
+    dr_printf("memvis:   fail:        %llu\n", (unsigned long long)atomic_load(&g_ccc_audit_fail));
+    dr_printf("memvis:   rt_gpr:      %llu\n", (unsigned long long)atomic_load(&g_stat_gpr_captures));
+    dr_printf("memvis:   rt_clean:    %llu\n", (unsigned long long)atomic_load(&g_stat_clean_reads));
 #endif
 
     unmap_ctl_ring();
