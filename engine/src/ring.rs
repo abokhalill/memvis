@@ -19,7 +19,7 @@ pub struct Event {
     pub addr: u64,
     pub size: u32,
     pub thread_id: u16,
-    pub seq: u16,       
+    pub seq: u16,
     pub value: u64,
     pub kind_flags: u32,
     pub rip_lo: u32,
@@ -248,16 +248,15 @@ impl ThreadRing {
                     );
                 }
             }
-            let ev: Event = unsafe {
-                ptr::read_volatile(data.add(((t + n as u64) & mask) as usize))
-            };
+            let ev: Event =
+                unsafe { ptr::read_volatile(data.add(((t + n as u64) & mask) as usize)) };
             if snap_tail == 0 && ev.kind() == EVENT_REG_SNAPSHOT {
                 if n + 7 > cap {
                     break;
                 }
                 snap_tail = 6;
             } else if snap_tail > 0 {
-                snap_tail -= 1;
+                snap_tail = snap_tail.saturating_sub(1);
             }
             out[n] = ev;
             n += 1;
@@ -306,8 +305,10 @@ impl RingOrchestrator {
             );
             return false;
         }
-        eprintln!("memvis: ctl attached (proto={}, build_hash=0x{:08x}, target_pid={})",
-                  hdr.proto_version, hdr.build_hash, hdr.target_pid);
+        eprintln!(
+            "memvis: ctl attached (proto={}, build_hash=0x{:08x}, target_pid={})",
+            hdr.proto_version, hdr.build_hash, hdr.target_pid
+        );
         self.ctl = Some(shm);
         true
     }
@@ -315,7 +316,11 @@ impl RingOrchestrator {
     pub fn target_pid(&self) -> Option<u32> {
         let shm = self.ctl.as_ref()?;
         let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
-        if hdr.target_pid == 0 { None } else { Some(hdr.target_pid) }
+        if hdr.target_pid == 0 {
+            None
+        } else {
+            Some(hdr.target_pid)
+        }
     }
 
     pub fn poll_new_rings(&mut self) {

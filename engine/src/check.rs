@@ -8,6 +8,7 @@ use std::fs;
 use std::io::{self, BufRead};
 use std::process;
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct AllocEvent {
     seq: u64,
@@ -16,6 +17,7 @@ struct AllocEvent {
     freed: bool,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct StampEvent {
     seq: u64,
@@ -26,6 +28,7 @@ struct StampEvent {
     fields: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct LinkEvent {
     seq: u64,
@@ -36,6 +39,7 @@ struct LinkEvent {
     edge: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct HazardEvent {
     seq: u64,
@@ -49,6 +53,7 @@ struct HazardEvent {
     field_name: String,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Default)]
 struct Summary {
     total_events: u64,
@@ -81,52 +86,62 @@ impl TopoGraph {
         for line in reader.lines() {
             let line = line?;
             let line = line.trim();
-            if line.is_empty() { continue; }
+            if line.is_empty() {
+                continue;
+            }
             // minimal json parsing without serde
-            let ty = json_str(&line, "type");
+            let ty = json_str(line, "type");
             match ty.as_str() {
                 "ALLOC" => {
                     g.allocs.push(AllocEvent {
-                        seq: json_u64(&line, "seq"),
-                        addr: json_hex(&line, "addr"),
-                        size: json_u64(&line, "size"),
+                        seq: json_u64(line, "seq"),
+                        addr: json_hex(line, "addr"),
+                        size: json_u64(line, "size"),
                         freed: false,
                     });
                 }
                 "FREE" => {
-                    let addr = json_hex(&line, "addr");
-                    if let Some(a) = g.allocs.iter_mut().rev().find(|a| a.addr == addr && !a.freed) {
+                    let addr = json_hex(line, "addr");
+                    if let Some(a) = g
+                        .allocs
+                        .iter_mut()
+                        .rev()
+                        .find(|a| a.addr == addr && !a.freed)
+                    {
                         a.freed = true;
                     }
                     g.addr_type.remove(&addr);
                 }
                 "STAMP" => {
-                    let addr = json_hex(&line, "addr");
-                    let type_name = json_str(&line, "type_name");
-                    let source = json_str(&line, "source");
+                    let addr = json_hex(line, "addr");
+                    let type_name = json_str(line, "type_name");
+                    let source = json_str(line, "source");
                     g.addr_type.insert(addr, type_name.clone());
-                    g.type_addrs.entry(type_name.clone()).or_default().insert(addr);
+                    g.type_addrs
+                        .entry(type_name.clone())
+                        .or_default()
+                        .insert(addr);
                     g.source_targets.insert(source.clone(), addr);
                     g.stamps.push(StampEvent {
-                        seq: json_u64(&line, "seq"),
+                        seq: json_u64(line, "seq"),
                         addr,
                         type_name,
-                        type_size: json_u64(&line, "type_size"),
+                        type_size: json_u64(line, "type_size"),
                         source,
-                        fields: json_u64(&line, "fields") as usize,
+                        fields: json_u64(line, "fields") as usize,
                     });
                 }
                 "LINK" => {
-                    let from_name = json_str(&line, "from");
-                    let from_addr = json_hex(&line, "from_addr");
-                    let to_addr = json_hex(&line, "to_addr");
-                    let edge = json_str(&line, "edge");
-                    let pointee_type = json_str(&line, "pointee_type");
+                    let from_name = json_str(line, "from");
+                    let from_addr = json_hex(line, "from_addr");
+                    let to_addr = json_hex(line, "to_addr");
+                    let edge = json_str(line, "edge");
+                    let pointee_type = json_str(line, "pointee_type");
                     // resolve field addr to object base for chain traversal
                     let base = g.resolve_base(from_addr).unwrap_or(from_addr);
                     g.edges.insert((base, edge.clone()), to_addr);
                     g.links.push(LinkEvent {
-                        seq: json_u64(&line, "seq"),
+                        seq: json_u64(line, "seq"),
                         from_name,
                         from_addr,
                         to_addr,
@@ -136,25 +151,25 @@ impl TopoGraph {
                 }
                 "HAZARD" => {
                     g.hazards.push(HazardEvent {
-                        seq: json_u64(&line, "seq"),
-                        kind: json_str(&line, "kind"),
-                        write_addr: json_hex(&line, "write_addr"),
-                        write_size: json_u64(&line, "write_size") as u32,
-                        alloc_base: json_hex(&line, "alloc_base"),
-                        alloc_size: json_u64(&line, "alloc_size"),
-                        overflow: json_u64(&line, "overflow"),
-                        type_name: json_str(&line, "type_name"),
-                        field_name: json_str(&line, "field_name"),
+                        seq: json_u64(line, "seq"),
+                        kind: json_str(line, "kind"),
+                        write_addr: json_hex(line, "write_addr"),
+                        write_size: json_u64(line, "write_size") as u32,
+                        alloc_base: json_hex(line, "alloc_base"),
+                        alloc_size: json_u64(line, "alloc_size"),
+                        overflow: json_u64(line, "overflow"),
+                        type_name: json_str(line, "type_name"),
+                        field_name: json_str(line, "field_name"),
                     });
                 }
                 "SUMMARY" => {
                     g.summary = Summary {
-                        total_events: json_u64(&line, "total_events"),
-                        nodes: json_u64(&line, "nodes") as usize,
-                        edges: json_u64(&line, "edges") as usize,
-                        stm_projections: json_u64(&line, "stm_projections") as usize,
-                        live_allocs: json_u64(&line, "live_allocs") as usize,
-                        hazards: json_u64(&line, "hazards") as usize,
+                        total_events: json_u64(line, "total_events"),
+                        nodes: json_u64(line, "nodes") as usize,
+                        edges: json_u64(line, "edges") as usize,
+                        stm_projections: json_u64(line, "stm_projections") as usize,
+                        live_allocs: json_u64(line, "live_allocs") as usize,
+                        hazards: json_u64(line, "hazards") as usize,
                     };
                 }
                 _ => {}
@@ -165,13 +180,17 @@ impl TopoGraph {
 
     fn resolve_base(&self, field_addr: u64) -> Option<u64> {
         // find the stamped object whose range covers field_addr
-        self.stamps.iter().rev()
+        self.stamps
+            .iter()
+            .rev()
             .find(|s| field_addr >= s.addr && field_addr < s.addr + s.type_size)
             .map(|s| s.addr)
     }
 
     fn chain_length(&self, start_type: &str, edge_field: &str) -> usize {
-        let addrs: Vec<u64> = self.type_addrs.get(start_type)
+        let addrs: Vec<u64> = self
+            .type_addrs
+            .get(start_type)
             .map(|s| s.iter().copied().collect())
             .unwrap_or_default();
         let mut max_len = 0usize;
@@ -180,7 +199,9 @@ impl TopoGraph {
             let mut cur = *start;
             let mut len = 0;
             loop {
-                if !visited.insert(cur) { break; } // cycle
+                if !visited.insert(cur) {
+                    break;
+                } // cycle
                 len += 1;
                 match self.edges.get(&(cur, edge_field.to_string())) {
                     Some(&next) if next != 0 => cur = next,
@@ -194,7 +215,8 @@ impl TopoGraph {
 
     fn type_stable(&self, source_name: &str, expected_type: &str) -> bool {
         // check that every STAMP from this source has the expected type
-        self.stamps.iter()
+        self.stamps
+            .iter()
             .filter(|s| s.source == source_name)
             .all(|s| s.type_name == expected_type)
     }
@@ -208,9 +230,19 @@ impl TopoGraph {
 enum Assertion {
     NoHazards,
     LiveAllocsLt(usize),
-    MaxChain { type_name: String, field: String, limit: usize },
-    TypeStable { source: String, expected_type: String },
-    NoFalseSharing { name_a: String, name_b: String },
+    MaxChain {
+        type_name: String,
+        field: String,
+        limit: usize,
+    },
+    TypeStable {
+        source: String,
+        expected_type: String,
+    },
+    NoFalseSharing {
+        name_a: String,
+        name_b: String,
+    },
     StmProjectionsGt(usize),
     AllocBeforeStamp,
     NoUseAfterFree,
@@ -223,12 +255,14 @@ fn parse_assertions(path: &str) -> io::Result<Vec<(usize, Assertion)>> {
     let mut out = Vec::new();
     for (lineno, line) in content.lines().enumerate() {
         let line = line.trim();
-        if line.is_empty() || line.starts_with('#') { continue; }
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
         if !line.starts_with("assert ") {
             eprintln!("  WARN line {}: unrecognized: {}", lineno + 1, line);
             continue;
         }
-        let body = &line[7..].trim();
+        let body = line[7..].trim();
         if let Some(a) = parse_one(body) {
             out.push((lineno + 1, a));
         } else {
@@ -257,15 +291,20 @@ fn parse_one(s: &str) -> Option<Assertion> {
         return Some(Assertion::StmProjectionsGt(n));
     }
     // max_chain(type("X"), "Y") < N
-    if s.starts_with("max_chain(") {
+    if let Some(after) = s.strip_prefix("max_chain(") {
         // find the closing paren that matches the opening one after max_chain
-        let after = &s["max_chain(".len()..];
         let mut depth = 1i32;
         let mut close_pos = None;
         for (i, c) in after.char_indices() {
             match c {
                 '(' => depth += 1,
-                ')' => { depth -= 1; if depth == 0 { close_pos = Some(i); break; } }
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        close_pos = Some(i);
+                        break;
+                    }
+                }
                 _ => {}
             }
         }
@@ -276,7 +315,11 @@ fn parse_one(s: &str) -> Option<Assertion> {
         let type_arg = extract_quoted_after(args_str, "type(")?;
         let comma_rest = args_str.split_once(',')?.1.trim();
         let field = extract_plain_quoted(comma_rest)?;
-        return Some(Assertion::MaxChain { type_name: type_arg, field, limit });
+        return Some(Assertion::MaxChain {
+            type_name: type_arg,
+            field,
+            limit,
+        });
     }
     // type_stable(global("X"), "Y")
     if s.starts_with("type_stable(") {
@@ -284,7 +327,10 @@ fn parse_one(s: &str) -> Option<Assertion> {
         let source = extract_quoted_after(inner, "global(")?;
         let rest = inner.split_once(',')?.1.trim();
         let expected = extract_plain_quoted(rest)?;
-        return Some(Assertion::TypeStable { source, expected_type: expected });
+        return Some(Assertion::TypeStable {
+            source,
+            expected_type: expected,
+        });
     }
     if s == "alloc_before_stamp" {
         return Some(Assertion::AllocBeforeStamp);
@@ -305,7 +351,10 @@ fn parse_one(s: &str) -> Option<Assertion> {
         if parts.len() == 2 {
             let a = extract_plain_quoted(parts[0].trim())?;
             let b = extract_plain_quoted(parts[1].trim())?;
-            return Some(Assertion::NoFalseSharing { name_a: a, name_b: b });
+            return Some(Assertion::NoFalseSharing {
+                name_a: a,
+                name_b: b,
+            });
         }
     }
     None
@@ -348,25 +397,52 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
         }
         Assertion::LiveAllocsLt(limit) => {
             let n = g.live_alloc_count();
-            (n < *limit, format!("live_allocs < {} (actual {})", limit, n))
+            (
+                n < *limit,
+                format!("live_allocs < {} (actual {})", limit, n),
+            )
         }
         Assertion::StmProjectionsGt(min) => {
             let n = g.summary.stm_projections;
-            (n > *min, format!("stm_projections > {} (actual {})", min, n))
+            (
+                n > *min,
+                format!("stm_projections > {} (actual {})", min, n),
+            )
         }
-        Assertion::MaxChain { type_name, field, limit } => {
+        Assertion::MaxChain {
+            type_name,
+            field,
+            limit,
+        } => {
             let len = g.chain_length(type_name, field);
-            (len < *limit, format!("max_chain(type(\"{}\"), \"{}\") < {} (actual {})", type_name, field, limit, len))
+            (
+                len < *limit,
+                format!(
+                    "max_chain(type(\"{}\"), \"{}\") < {} (actual {})",
+                    type_name, field, limit, len
+                ),
+            )
         }
-        Assertion::TypeStable { source, expected_type } => {
+        Assertion::TypeStable {
+            source,
+            expected_type,
+        } => {
             let ok = g.type_stable(source, expected_type);
-            let actual: Vec<String> = g.stamps.iter()
+            let actual: Vec<String> = g
+                .stamps
+                .iter()
                 .filter(|s| s.source == *source)
                 .map(|s| s.type_name.clone())
                 .collect::<HashSet<_>>()
                 .into_iter()
                 .collect();
-            (ok, format!("type_stable(global(\"{}\"), \"{}\") (seen: {:?})", source, expected_type, actual))
+            (
+                ok,
+                format!(
+                    "type_stable(global(\"{}\"), \"{}\") (seen: {:?})",
+                    source, expected_type, actual
+                ),
+            )
         }
         Assertion::AllocBeforeStamp => {
             let alloc_addrs: HashSet<u64> = g.allocs.iter().map(|a| a.addr).collect();
@@ -427,7 +503,10 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
                 "no_use_after_free (0 violations)".to_string()
             } else {
                 let (seq, kind, addr) = first_violation.unwrap();
-                format!("no_use_after_free ({} violations, first {} at seq={} addr=0x{:x})", violations, kind, seq, addr)
+                format!(
+                    "no_use_after_free ({} violations, first {} at seq={} addr=0x{:x})",
+                    violations, kind, seq, addr
+                )
             };
             (violations == 0, msg)
         }
@@ -468,7 +547,10 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
                 "monotonic_seq (all event streams ordered)".to_string()
             } else {
                 let (seq, prev, kind) = first_violation.unwrap();
-                format!("monotonic_seq ({} violations, first {} seq={} < prev={})", violations, kind, seq, prev)
+                format!(
+                    "monotonic_seq ({} violations, first {} seq={} < prev={})",
+                    violations, kind, seq, prev
+                )
             };
             (violations == 0, msg)
         }
@@ -480,7 +562,9 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
             let mut violations = 0usize;
             let mut first_violation: Option<(u64, u64)> = None;
             for l in &g.links {
-                if l.to_addr == 0 { continue; }
+                if l.to_addr == 0 {
+                    continue;
+                }
                 if let Some(&stamp_seq) = stamp_seqs.get(&l.to_addr) {
                     if l.seq < stamp_seq {
                         violations += 1;
@@ -494,25 +578,50 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
                 "stamp_before_link (all link targets stamped before use)".to_string()
             } else {
                 let (seq, addr) = first_violation.unwrap();
-                format!("stamp_before_link ({} violations, first at seq={} to_addr=0x{:x})", violations, seq, addr)
+                format!(
+                    "stamp_before_link ({} violations, first at seq={} to_addr=0x{:x})",
+                    violations, seq, addr
+                )
             };
             (violations == 0, msg)
         }
         Assertion::NoFalseSharing { name_a, name_b } => {
             let addr_a = g.source_targets.get(name_a.as_str()).or_else(|| {
-                g.stamps.iter().find(|s| s.source == *name_a || s.type_name == *name_a).map(|s| &s.addr)
+                g.stamps
+                    .iter()
+                    .find(|s| s.source == *name_a || s.type_name == *name_a)
+                    .map(|s| &s.addr)
             });
             let addr_b = g.source_targets.get(name_b.as_str()).or_else(|| {
-                g.stamps.iter().find(|s| s.source == *name_b || s.type_name == *name_b).map(|s| &s.addr)
+                g.stamps
+                    .iter()
+                    .find(|s| s.source == *name_b || s.type_name == *name_b)
+                    .map(|s| &s.addr)
             });
             match (addr_a, addr_b) {
                 (Some(&a), Some(&b)) => {
                     let cl_a = a >> 6;
                     let cl_b = b >> 6;
                     let ok = cl_a != cl_b;
-                    (ok, format!("no_false_sharing(\"{}\", \"{}\") cl_a=0x{:x} cl_b=0x{:x} {}", name_a, name_b, cl_a * 64, cl_b * 64, if ok { "distinct" } else { "SHARED" }))
+                    (
+                        ok,
+                        format!(
+                            "no_false_sharing(\"{}\", \"{}\") cl_a=0x{:x} cl_b=0x{:x} {}",
+                            name_a,
+                            name_b,
+                            cl_a * 64,
+                            cl_b * 64,
+                            if ok { "distinct" } else { "SHARED" }
+                        ),
+                    )
                 }
-                _ => (true, format!("no_false_sharing(\"{}\", \"{}\"): one or both not found (vacuously true)", name_a, name_b)),
+                _ => (
+                    true,
+                    format!(
+                        "no_false_sharing(\"{}\", \"{}\"): one or both not found (vacuously true)",
+                        name_a, name_b
+                    ),
+                ),
             }
         }
     }
@@ -578,7 +687,10 @@ fn main() {
     };
     eprintln!(
         "memvis-check: {} allocs, {} stamps, {} links, {} hazards",
-        graph.allocs.len(), graph.stamps.len(), graph.links.len(), graph.hazards.len()
+        graph.allocs.len(),
+        graph.stamps.len(),
+        graph.links.len(),
+        graph.hazards.len()
     );
 
     eprintln!("memvis-check: loading assertions from {}", assert_path);

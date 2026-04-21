@@ -9,8 +9,8 @@ use std::process;
 use memvis::dwarf::{self, DwarfInfo};
 use memvis::heap_graph::{HeapGraph, HeapOracle};
 use memvis::index::{AddressIndex, FrameId};
-use memvis::record::EventPlayer;
 use memvis::reconciler;
+use memvis::record::EventPlayer;
 use memvis::shadow_regs::ShadowRegisterFile;
 use memvis::world::{HazardKind, ShadowStack, WorldState};
 
@@ -33,11 +33,26 @@ fn parse_args() -> Args {
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
-            "--baseline" | "-a" => { i += 1; baseline = Some(args[i].clone()); }
-            "--subject" | "-b" => { i += 1; subject = Some(args[i].clone()); }
-            "--dwarf" | "-d" => { i += 1; dwarf_path = Some(args[i].clone()); }
-            "--interval" | "-n" => { i += 1; interval = args[i].parse().unwrap_or(100_000); }
-            "--output" | "-o" => { i += 1; output = Some(args[i].clone()); }
+            "--baseline" | "-a" => {
+                i += 1;
+                baseline = Some(args[i].clone());
+            }
+            "--subject" | "-b" => {
+                i += 1;
+                subject = Some(args[i].clone());
+            }
+            "--dwarf" | "-d" => {
+                i += 1;
+                dwarf_path = Some(args[i].clone());
+            }
+            "--interval" | "-n" => {
+                i += 1;
+                interval = args[i].parse().unwrap_or(100_000);
+            }
+            "--output" | "-o" => {
+                i += 1;
+                output = Some(args[i].clone());
+            }
             "--help" | "-h" => {
                 eprintln!("memvis-diff: compare two recorded traces");
                 eprintln!("  --baseline/-a <file>  baseline recording (.bin)");
@@ -56,9 +71,18 @@ fn parse_args() -> Args {
     }
 
     Args {
-        baseline: baseline.unwrap_or_else(|| { eprintln!("memvis-diff: --baseline required"); process::exit(1); }),
-        subject: subject.unwrap_or_else(|| { eprintln!("memvis-diff: --subject required"); process::exit(1); }),
-        dwarf_path: dwarf_path.unwrap_or_else(|| { eprintln!("memvis-diff: --dwarf required"); process::exit(1); }),
+        baseline: baseline.unwrap_or_else(|| {
+            eprintln!("memvis-diff: --baseline required");
+            process::exit(1);
+        }),
+        subject: subject.unwrap_or_else(|| {
+            eprintln!("memvis-diff: --subject required");
+            process::exit(1);
+        }),
+        dwarf_path: dwarf_path.unwrap_or_else(|| {
+            eprintln!("memvis-diff: --dwarf required");
+            process::exit(1);
+        }),
         interval,
         output,
     }
@@ -74,6 +98,7 @@ struct CanonicalStamp {
     field_count: usize,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 struct CanonicalAlloc {
     size: u64,
@@ -100,6 +125,7 @@ struct HazardRegContext {
     rsp: u64,
 }
 
+#[allow(dead_code)]
 #[derive(Debug, Clone)]
 struct TopologyCheckpoint {
     seq: u64,
@@ -143,7 +169,10 @@ fn take_checkpoint(seq: u64, world: &WorldState, heap_graph: &HeapGraph) -> Topo
     let mut hazard_regs = Vec::new();
     for h in &world.hazards {
         hazards.push(CanonicalHazard {
-            kind: match h.kind { HazardKind::OutOfBounds => "OOB".into(), HazardKind::HeapHole => "HOLE".into() },
+            kind: match h.kind {
+                HazardKind::OutOfBounds => "OOB".into(),
+                HazardKind::HeapHole => "HOLE".into(),
+            },
             write_size: h.write_size,
             type_name: h.type_name.clone(),
             field_name: h.field_name.clone(),
@@ -151,7 +180,11 @@ fn take_checkpoint(seq: u64, world: &WorldState, heap_graph: &HeapGraph) -> Topo
         });
         hazard_regs.push(h.reg_snapshot.map(|r| HazardRegContext {
             pc: h.pc,
-            rax: r[0], rdi: r[5], rsi: r[4], rdx: r[3], rsp: r[7],
+            rax: r[0],
+            rdi: r[5],
+            rsi: r[4],
+            rdx: r[3],
+            rsp: r[7],
         }));
     }
 
@@ -223,7 +256,9 @@ fn replay_to_checkpoints(
     loop {
         batch.clear();
         let got = player.read_batch(&mut batch, 4096)?;
-        if got == 0 { break; }
+        if got == 0 {
+            break;
+        }
 
         let mut i = 0;
         while i < batch.len() {
@@ -232,20 +267,28 @@ fn replay_to_checkpoints(
             let ev_kind = ev.kind();
 
             if ev_kind == reconciler::EVENT_REG_SNAPSHOT {
-                let consumed = reconciler::apply_reg_snapshot(
-                    &batch[i..], &mut world, &mut shadow_regs,
-                ).max(1);
+                let consumed =
+                    reconciler::apply_reg_snapshot(&batch[i..], &mut world, &mut shadow_regs)
+                        .max(1);
                 seq += consumed as u64 - 1; // outer seq+=1 already counted header
                 i += consumed;
                 continue;
             }
 
             reconciler::process_event(
-                ev, 0, &orch,
-                &mut world, &mut addr_index, dwarf_info,
-                &mut stacks, &mut next_frame_id,
-                &mut relocation_delta, &mut returned_frames,
-                &mut shadow_regs, &mut heap_graph, &mut heap_oracle,
+                ev,
+                0,
+                &orch,
+                &mut world,
+                &mut addr_index,
+                dwarf_info,
+                &mut stacks,
+                &mut next_frame_id,
+                &mut relocation_delta,
+                &mut returned_frames,
+                &mut shadow_regs,
+                &mut heap_graph,
+                &mut heap_oracle,
                 &mut topo,
             );
 
@@ -305,25 +348,31 @@ fn diff_checkpoints(
                 raw_only_b.difference(mask).cloned().collect(),
             )
         } else {
-            (raw_only_a.into_iter().collect(), raw_only_b.into_iter().collect())
+            (
+                raw_only_a.into_iter().collect(),
+                raw_only_b.into_iter().collect(),
+            )
         };
 
     let hazards_a: BTreeSet<&CanonicalHazard> = a.hazards.iter().collect();
     let hazards_b: BTreeSet<&CanonicalHazard> = b.hazards.iter().collect();
 
-    let hazards_only_a: Vec<(CanonicalHazard, Option<HazardRegContext>)> = hazards_a.difference(&hazards_b)
+    let hazards_only_a: Vec<(CanonicalHazard, Option<HazardRegContext>)> = hazards_a
+        .difference(&hazards_b)
         .map(|&h| {
             let idx = a.hazards.iter().position(|x| x == h);
             let ctx = idx.and_then(|i| a.hazard_regs.get(i).cloned().flatten());
             (h.clone(), ctx)
-        }).collect();
-    let hazards_only_b: Vec<(CanonicalHazard, Option<HazardRegContext>)> = hazards_b.difference(&hazards_a)
+        })
+        .collect();
+    let hazards_only_b: Vec<(CanonicalHazard, Option<HazardRegContext>)> = hazards_b
+        .difference(&hazards_a)
         .map(|&h| {
             let idx = b.hazards.iter().position(|x| x == h);
             let ctx = idx.and_then(|i| b.hazard_regs.get(i).cloned().flatten());
             (h.clone(), ctx)
-        }).collect();
-
+        })
+        .collect();
 
     let identical = stamps_only_a.is_empty()
         && stamps_only_b.is_empty()
@@ -347,40 +396,62 @@ fn diff_checkpoints(
 
 fn emit_diff_jsonl(out: &mut impl Write, diff: &CheckpointDiff) -> io::Result<()> {
     if diff.identical {
-        writeln!(out,
+        writeln!(
+            out,
             r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"identical","stamps_a":{},"stamps_b":{},"allocs_a":{},"allocs_b":{}}}"#,
-            diff.seq_a, diff.seq_b, diff.stamp_count_a, diff.stamp_count_b,
-            diff.alloc_count_a, diff.alloc_count_b)?;
+            diff.seq_a,
+            diff.seq_b,
+            diff.stamp_count_a,
+            diff.stamp_count_b,
+            diff.alloc_count_a,
+            diff.alloc_count_b
+        )?;
     } else {
         for s in &diff.stamps_only_a {
-            writeln!(out,
+            writeln!(
+                out,
                 r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"baseline_only","source":"{}","type":"{}","type_size":{},"fields":{}}}"#,
-                diff.seq_a, diff.seq_b, s.source, s.type_name, s.type_size, s.field_count)?;
+                diff.seq_a, diff.seq_b, s.source, s.type_name, s.type_size, s.field_count
+            )?;
         }
         for s in &diff.stamps_only_b {
-            writeln!(out,
+            writeln!(
+                out,
                 r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"subject_only","source":"{}","type":"{}","type_size":{},"fields":{}}}"#,
-                diff.seq_a, diff.seq_b, s.source, s.type_name, s.type_size, s.field_count)?;
+                diff.seq_a, diff.seq_b, s.source, s.type_name, s.type_size, s.field_count
+            )?;
         }
         for (h, ctx) in &diff.hazards_only_a {
             let reg_str = ctx.as_ref().map(|r| format!(
                 r#","pc":"0x{:x}","rax":"0x{:x}","rdi":"0x{:x}","rsi":"0x{:x}","rdx":"0x{:x}","rsp":"0x{:x}""#,
                 r.pc, r.rax, r.rdi, r.rsi, r.rdx, r.rsp)).unwrap_or_default();
-            writeln!(out,
+            writeln!(
+                out,
                 r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"baseline_only","hazard":"{}","write_size":{},"type":"{}","field":"{}"{}}}"#,
-                diff.seq_a, diff.seq_b, h.kind, h.write_size,
+                diff.seq_a,
+                diff.seq_b,
+                h.kind,
+                h.write_size,
                 h.type_name.as_deref().unwrap_or("?"),
-                h.field_name.as_deref().unwrap_or("?"), reg_str)?;
+                h.field_name.as_deref().unwrap_or("?"),
+                reg_str
+            )?;
         }
         for (h, ctx) in &diff.hazards_only_b {
             let reg_str = ctx.as_ref().map(|r| format!(
                 r#","pc":"0x{:x}","rax":"0x{:x}","rdi":"0x{:x}","rsi":"0x{:x}","rdx":"0x{:x}","rsp":"0x{:x}""#,
                 r.pc, r.rax, r.rdi, r.rsi, r.rdx, r.rsp)).unwrap_or_default();
-            writeln!(out,
+            writeln!(
+                out,
                 r#"{{"checkpoint_a":{},"checkpoint_b":{},"status":"diverged","side":"subject_only","hazard":"{}","write_size":{},"type":"{}","field":"{}"{}}}"#,
-                diff.seq_a, diff.seq_b, h.kind, h.write_size,
+                diff.seq_a,
+                diff.seq_b,
+                h.kind,
+                h.write_size,
                 h.type_name.as_deref().unwrap_or("?"),
-                h.field_name.as_deref().unwrap_or("?"), reg_str)?;
+                h.field_name.as_deref().unwrap_or("?"),
+                reg_str
+            )?;
         }
     }
     Ok(())
@@ -388,15 +459,29 @@ fn emit_diff_jsonl(out: &mut impl Write, diff: &CheckpointDiff) -> io::Result<()
 
 fn print_steady_state(a: &TopologyCheckpoint, b: &TopologyCheckpoint) {
     eprintln!("\n── Steady-State (final checkpoint) ──────────────");
-    eprintln!("  baseline: seq={} stamps={} allocs={} hazards={}",
-        a.seq, a.stamp_count, a.alloc_count, a.hazards.len());
-    eprintln!("  subject:  seq={} stamps={} allocs={} hazards={}",
-        b.seq, b.stamp_count, b.alloc_count, b.hazards.len());
+    eprintln!(
+        "  baseline: seq={} stamps={} allocs={} hazards={}",
+        a.seq,
+        a.stamp_count,
+        a.alloc_count,
+        a.hazards.len()
+    );
+    eprintln!(
+        "  subject:  seq={} stamps={} allocs={} hazards={}",
+        b.seq,
+        b.stamp_count,
+        b.alloc_count,
+        b.hazards.len()
+    );
 
-    eprintln!("  heap graph (baseline): {} objects, {} typed, {} rescores, {} contradictions",
-        a.heap_objects, a.heap_typed, a.heap_rescores, a.heap_contradictions);
-    eprintln!("  heap graph (subject):  {} objects, {} typed, {} rescores, {} contradictions",
-        b.heap_objects, b.heap_typed, b.heap_rescores, b.heap_contradictions);
+    eprintln!(
+        "  heap graph (baseline): {} objects, {} typed, {} rescores, {} contradictions",
+        a.heap_objects, a.heap_typed, a.heap_rescores, a.heap_contradictions
+    );
+    eprintln!(
+        "  heap graph (subject):  {} objects, {} typed, {} rescores, {} contradictions",
+        b.heap_objects, b.heap_typed, b.heap_rescores, b.heap_contradictions
+    );
 
     {
         let mut hd: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
@@ -409,7 +494,10 @@ fn print_steady_state(a: &TopologyCheckpoint, b: &TopologyCheckpoint) {
         let mut found = false;
         for (name, (ca, cb)) in &hd {
             if ca != cb {
-                if !found { eprintln!("  heap type histogram delta (A vs B):"); found = true; }
+                if !found {
+                    eprintln!("  heap type histogram delta (A vs B):");
+                    found = true;
+                }
                 eprintln!("    {:+6} {:+6}  {}", ca, cb, name);
             }
         }
@@ -449,19 +537,29 @@ fn print_steady_state(a: &TopologyCheckpoint, b: &TopologyCheckpoint) {
         for h in &only_a {
             let idx = a.hazards.iter().position(|x| x == **h);
             let ctx = idx.and_then(|i| a.hazard_regs.get(i).cloned().flatten());
-            eprint!("    - [baseline] {} type={} field={}",
-                h.kind, h.type_name.as_deref().unwrap_or("?"),
-                h.field_name.as_deref().unwrap_or("?"));
-            if let Some(r) = ctx { eprint!(" pc=0x{:x} rax=0x{:x}", r.pc, r.rax); }
+            eprint!(
+                "    - [baseline] {} type={} field={}",
+                h.kind,
+                h.type_name.as_deref().unwrap_or("?"),
+                h.field_name.as_deref().unwrap_or("?")
+            );
+            if let Some(r) = ctx {
+                eprint!(" pc=0x{:x} rax=0x{:x}", r.pc, r.rax);
+            }
             eprintln!();
         }
         for h in &only_b {
             let idx = b.hazards.iter().position(|x| x == **h);
             let ctx = idx.and_then(|i| b.hazard_regs.get(i).cloned().flatten());
-            eprint!("    + [subject]  {} type={} field={}",
-                h.kind, h.type_name.as_deref().unwrap_or("?"),
-                h.field_name.as_deref().unwrap_or("?"));
-            if let Some(r) = ctx { eprint!(" pc=0x{:x} rax=0x{:x}", r.pc, r.rax); }
+            eprint!(
+                "    + [subject]  {} type={} field={}",
+                h.kind,
+                h.type_name.as_deref().unwrap_or("?"),
+                h.field_name.as_deref().unwrap_or("?")
+            );
+            if let Some(r) = ctx {
+                eprint!(" pc=0x{:x} rax=0x{:x}", r.pc, r.rax);
+            }
             eprintln!();
         }
     }
@@ -483,26 +581,38 @@ fn print_summary(diffs: &[CheckpointDiff]) {
     }
 
     if let Some(first) = diffs.iter().find(|d| !d.identical) {
-        eprintln!("  first divergence at seq A={} / B={}", first.seq_a, first.seq_b);
+        eprintln!(
+            "  first divergence at seq A={} / B={}",
+            first.seq_a, first.seq_b
+        );
         if !first.stamps_only_a.is_empty() {
             eprintln!("    baseline-only stamps:");
             for s in first.stamps_only_a.iter().take(10) {
-                eprintln!("      {} → {} ({}B, {} fields)", s.source, s.type_name, s.type_size, s.field_count);
+                eprintln!(
+                    "      {} → {} ({}B, {} fields)",
+                    s.source, s.type_name, s.type_size, s.field_count
+                );
             }
         }
         if !first.stamps_only_b.is_empty() {
             eprintln!("    subject-only stamps:");
             for s in first.stamps_only_b.iter().take(10) {
-                eprintln!("      {} → {} ({}B, {} fields)", s.source, s.type_name, s.type_size, s.field_count);
+                eprintln!(
+                    "      {} → {} ({}B, {} fields)",
+                    s.source, s.type_name, s.type_size, s.field_count
+                );
             }
         }
         if !first.hazards_only_a.is_empty() {
             eprintln!("    baseline-only hazards:");
             for (h, ctx) in &first.hazards_only_a {
-                eprint!("      {} write_size={} type={} field={}",
-                    h.kind, h.write_size,
+                eprint!(
+                    "      {} write_size={} type={} field={}",
+                    h.kind,
+                    h.write_size,
                     h.type_name.as_deref().unwrap_or("?"),
-                    h.field_name.as_deref().unwrap_or("?"));
+                    h.field_name.as_deref().unwrap_or("?")
+                );
                 if let Some(r) = ctx {
                     eprint!(" pc=0x{:x} rax=0x{:x} rdi=0x{:x}", r.pc, r.rax, r.rdi);
                 }
@@ -512,10 +622,13 @@ fn print_summary(diffs: &[CheckpointDiff]) {
         if !first.hazards_only_b.is_empty() {
             eprintln!("    subject-only hazards:");
             for (h, ctx) in &first.hazards_only_b {
-                eprint!("      {} write_size={} type={} field={}",
-                    h.kind, h.write_size,
+                eprint!(
+                    "      {} write_size={} type={} field={}",
+                    h.kind,
+                    h.write_size,
                     h.type_name.as_deref().unwrap_or("?"),
-                    h.field_name.as_deref().unwrap_or("?"));
+                    h.field_name.as_deref().unwrap_or("?")
+                );
                 if let Some(r) = ctx {
                     eprint!(" pc=0x{:x} rax=0x{:x} rdi=0x{:x}", r.pc, r.rax, r.rdi);
                 }
@@ -527,8 +640,12 @@ fn print_summary(diffs: &[CheckpointDiff]) {
     let mut all_only_a: BTreeMap<String, usize> = BTreeMap::new();
     let mut all_only_b: BTreeMap<String, usize> = BTreeMap::new();
     for d in diffs.iter().filter(|d| !d.identical) {
-        for s in &d.stamps_only_a { *all_only_a.entry(s.type_name.clone()).or_insert(0) += 1; }
-        for s in &d.stamps_only_b { *all_only_b.entry(s.type_name.clone()).or_insert(0) += 1; }
+        for s in &d.stamps_only_a {
+            *all_only_a.entry(s.type_name.clone()).or_insert(0) += 1;
+        }
+        for s in &d.stamps_only_b {
+            *all_only_b.entry(s.type_name.clone()).or_insert(0) += 1;
+        }
     }
     if !all_only_a.is_empty() {
         eprintln!("  type distribution (baseline-only across all checkpoints):");
@@ -549,7 +666,10 @@ fn print_summary(diffs: &[CheckpointDiff]) {
 fn main() {
     let args = parse_args();
 
-    eprintln!("memvis-diff: baseline={} subject={}", args.baseline, args.subject);
+    eprintln!(
+        "memvis-diff: baseline={} subject={}",
+        args.baseline, args.subject
+    );
     eprintln!("  dwarf={} interval={}", args.dwarf_path, args.interval);
 
     let mut dwarf_info = match dwarf::parse_elf(&args.dwarf_path) {
@@ -561,7 +681,8 @@ fn main() {
     };
 
     eprintln!("\n── Baseline ────────────────────────────────────");
-    let checkpoints_a = match replay_to_checkpoints(&args.baseline, &mut dwarf_info, args.interval) {
+    let checkpoints_a = match replay_to_checkpoints(&args.baseline, &mut dwarf_info, args.interval)
+    {
         Ok(c) => c,
         Err(e) => {
             eprintln!("memvis-diff: failed to replay baseline: {}", e);
@@ -582,9 +703,15 @@ fn main() {
     let common_mask: Option<BTreeSet<CanonicalStamp>> =
         match (checkpoints_a.last(), checkpoints_b.last()) {
             (Some(fa), Some(fb)) => {
-                let mask: BTreeSet<CanonicalStamp> = fa.stamps.intersection(&fb.stamps).cloned().collect();
-                if mask.is_empty() { None } else {
-                    eprintln!("  common stamp mask: {} stamps filtered from intermediate diffs", mask.len());
+                let mask: BTreeSet<CanonicalStamp> =
+                    fa.stamps.intersection(&fb.stamps).cloned().collect();
+                if mask.is_empty() {
+                    None
+                } else {
+                    eprintln!(
+                        "  common stamp mask: {} stamps filtered from intermediate diffs",
+                        mask.len()
+                    );
                     Some(mask)
                 }
             }
@@ -600,10 +727,16 @@ fn main() {
     }
 
     if checkpoints_a.len() > pairs {
-        eprintln!("  note: baseline has {} extra checkpoints beyond subject", checkpoints_a.len() - pairs);
+        eprintln!(
+            "  note: baseline has {} extra checkpoints beyond subject",
+            checkpoints_a.len() - pairs
+        );
     }
     if checkpoints_b.len() > pairs {
-        eprintln!("  note: subject has {} extra checkpoints beyond baseline", checkpoints_b.len() - pairs);
+        eprintln!(
+            "  note: subject has {} extra checkpoints beyond baseline",
+            checkpoints_b.len() - pairs
+        );
     }
 
     if let Some(ref path) = args.output {

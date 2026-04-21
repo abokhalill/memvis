@@ -24,9 +24,19 @@ pub struct FieldHeatmap {
     pub contention_hits: u64,
 }
 
+impl Default for FieldHeatmap {
+    fn default() -> Self {
+        Self {
+            counts: HashMap::with_capacity(512),
+            read_counts: HashMap::with_capacity(256),
+            contention_hits: 0,
+        }
+    }
+}
+
 impl FieldHeatmap {
     pub fn new() -> Self {
-        Self { counts: HashMap::with_capacity(512), read_counts: HashMap::with_capacity(256), contention_hits: 0 }
+        Self::default()
     }
 
     #[inline]
@@ -41,7 +51,13 @@ impl FieldHeatmap {
     }
 
     #[inline]
-    pub fn record_read(&mut self, thread_id: u16, type_name: &str, field_name: &str, field_offset: u64) {
+    pub fn record_read(
+        &mut self,
+        thread_id: u16,
+        type_name: &str,
+        field_name: &str,
+        field_offset: u64,
+    ) {
         let key = FieldHeatKey {
             thread_id,
             type_name: type_name.to_string(),
@@ -51,9 +67,17 @@ impl FieldHeatmap {
         *self.read_counts.entry(key).or_insert(0) += 1;
     }
 
-    pub fn len(&self) -> usize { self.counts.len() }
+    pub fn len(&self) -> usize {
+        self.counts.len()
+    }
 
-    pub fn read_len(&self) -> usize { self.read_counts.len() }
+    pub fn is_empty(&self) -> bool {
+        self.counts.is_empty()
+    }
+
+    pub fn read_len(&self) -> usize {
+        self.read_counts.len()
+    }
 
     // TSV export for divergence analysis: type\tfield\toffset\tthread\twrites
     pub fn export_tsv(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -61,11 +85,18 @@ impl FieldHeatmap {
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         writeln!(f, "type\tfield\toffset\tthread\twrites")?;
         let mut entries: Vec<_> = self.counts.iter().collect();
-        entries.sort_by(|a, b| a.0.type_name.cmp(&b.0.type_name)
-            .then(a.0.field_offset.cmp(&b.0.field_offset))
-            .then(a.0.thread_id.cmp(&b.0.thread_id)));
+        entries.sort_by(|a, b| {
+            a.0.type_name
+                .cmp(&b.0.type_name)
+                .then(a.0.field_offset.cmp(&b.0.field_offset))
+                .then(a.0.thread_id.cmp(&b.0.thread_id))
+        });
         for (k, &c) in &entries {
-            writeln!(f, "{}\t{}\t{}\t{}\t{}", k.type_name, k.field_name, k.field_offset, k.thread_id, c)?;
+            writeln!(
+                f,
+                "{}\t{}\t{}\t{}\t{}",
+                k.type_name, k.field_name, k.field_offset, k.thread_id, c
+            )?;
         }
         f.flush()
     }
@@ -87,20 +118,24 @@ impl FieldHeatmap {
 
     /// For a given cacheline address, find all fields written by different threads.
     /// Returns groups: type_name.field_name -> set of (thread_id, write_count).
-    pub fn contention_report(
-        &self,
-        cl_tracker: &CacheLineTracker,
-    ) -> Vec<ContentionEntry> {
+    pub fn contention_report(&self, cl_tracker: &CacheLineTracker) -> Vec<ContentionEntry> {
         // group by (type_name, field_name, field_offset)
         let mut by_field: HashMap<(String, String, u64), Vec<(u16, u64)>> = HashMap::new();
         for (key, &count) in &self.counts {
-            by_field.entry((key.type_name.clone(), key.field_name.clone(), key.field_offset))
+            by_field
+                .entry((
+                    key.type_name.clone(),
+                    key.field_name.clone(),
+                    key.field_offset,
+                ))
                 .or_default()
                 .push((key.thread_id, count));
         }
         let mut result = Vec::new();
         for ((type_name, field_name, field_offset), threads) in &by_field {
-            if threads.len() < 2 { continue; }
+            if threads.len() < 2 {
+                continue;
+            }
             // check if any address at this offset has CL contention
             // (we can't recover exact addresses here, so just report multi-thread fields)
             let total: u64 = threads.iter().map(|(_, c)| c).sum();
@@ -178,11 +213,17 @@ pub struct CacheLineTracker {
     pub slots: Box<[ClSlot; CL_SLOTS]>,
 }
 
-impl CacheLineTracker {
-    pub fn new() -> Self {
+impl Default for CacheLineTracker {
+    fn default() -> Self {
         Self {
             slots: Box::new([ClSlot::default(); CL_SLOTS]),
         }
+    }
+}
+
+impl CacheLineTracker {
+    pub fn new() -> Self {
+        Self::default()
     }
 
     #[inline(always)]
@@ -191,7 +232,11 @@ impl CacheLineTracker {
         let idx = (cl as usize) & CL_MASK;
         let s = unsafe { self.slots.get_unchecked_mut(idx) };
         if s.cl_addr != cl {
-            *s = ClSlot { cl_addr: cl, write_count: 1, writers: 1u16 << (thread_id & 15) };
+            *s = ClSlot {
+                cl_addr: cl,
+                write_count: 1,
+                writers: 1u16 << (thread_id & 15),
+            };
             return s.writers;
         }
         s.write_count = s.write_count.saturating_add(1);
@@ -203,7 +248,11 @@ impl CacheLineTracker {
         let cl = addr >> CL_SHIFT;
         let idx = (cl as usize) & CL_MASK;
         let s = &self.slots[idx];
-        if s.cl_addr == cl { s.writers.count_ones() } else { 0 }
+        if s.cl_addr == cl {
+            s.writers.count_ones()
+        } else {
+            0
+        }
     }
 
     pub fn tick(&mut self) {
@@ -305,9 +354,17 @@ pub struct ShadowTypeMap {
     map: HashMap<u64, TypeProjection>,
 }
 
+impl Default for ShadowTypeMap {
+    fn default() -> Self {
+        Self {
+            map: HashMap::with_capacity(256),
+        }
+    }
+}
+
 impl ShadowTypeMap {
     pub fn new() -> Self {
-        Self { map: HashMap::with_capacity(256) }
+        Self::default()
     }
 
     pub fn stamp_type(
@@ -342,10 +399,11 @@ impl ShadowTypeMap {
         if write_size != 8 || write_value == 0 {
             return;
         }
-        let covering = self.map.iter()
+        let covering = self
+            .map
+            .iter()
             .find(|(_, p)| {
-                write_addr >= p.base_addr
-                    && write_addr < p.base_addr + p.type_info.byte_size
+                write_addr >= p.base_addr && write_addr < p.base_addr + p.type_info.byte_size
             })
             .map(|(_, p)| (p.base_addr, p.type_info.clone()));
 
@@ -355,7 +413,11 @@ impl ShadowTypeMap {
         };
 
         let offset = write_addr - base;
-        if let Some(field) = ti.fields.iter().find(|f| f.byte_offset == offset && f.name != "<pointee>") {
+        if let Some(field) = ti
+            .fields
+            .iter()
+            .find(|f| f.byte_offset == offset && f.name != "<pointee>")
+        {
             if field.type_info.is_pointer {
                 let pointee_name = field.type_info.name.strip_prefix('*').unwrap_or("");
                 if let Some(pointee_ti) = type_registry.get(pointee_name) {
@@ -370,13 +432,17 @@ impl ShadowTypeMap {
     }
 
     pub fn covering(&self, addr: u64) -> Option<&TypeProjection> {
-        self.map.values().find(|p| {
-            addr >= p.base_addr && addr < p.base_addr + p.type_info.byte_size
-        })
+        self.map
+            .values()
+            .find(|p| addr >= p.base_addr && addr < p.base_addr + p.type_info.byte_size)
     }
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.map.is_empty()
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&u64, &TypeProjection)> {
@@ -386,7 +452,8 @@ impl ShadowTypeMap {
     pub fn purge_range(&mut self, addr: u64, size: u64) -> usize {
         let hi = addr.saturating_add(size);
         let before = self.map.len();
-        self.map.retain(|_, p| p.base_addr < addr || p.base_addr >= hi);
+        self.map
+            .retain(|_, p| p.base_addr < addr || p.base_addr >= hi);
         before - self.map.len()
     }
 
@@ -406,7 +473,9 @@ impl ShadowTypeMap {
         let mut stamped = 0usize;
 
         while let Some(base) = queue.pop_front() {
-            if stamped >= FUEL { break; }
+            if stamped >= FUEL {
+                break;
+            }
 
             let proj = match self.map.get(&base) {
                 Some(p) => p.type_info.clone(),
@@ -477,6 +546,7 @@ pub struct HeapHazard {
     pub reg_snapshot: Option<[u64; REG_COUNT]>,
 }
 
+#[derive(Default)]
 pub struct HeapAllocTracker {
     allocs: BTreeMap<u64, u64>,
     pub total_allocs: u64,
@@ -495,13 +565,7 @@ pub struct SizeMismatch {
 
 impl HeapAllocTracker {
     pub fn new() -> Self {
-        Self {
-            allocs: BTreeMap::new(),
-            total_allocs: 0,
-            total_frees: 0,
-            orphan_frees: 0,
-            size_mismatches: Vec::new(),
-        }
+        Self::default()
     }
 
     /// returns Some(old_size) if the address was already tracked (allocator reuse)
@@ -514,7 +578,9 @@ impl HeapAllocTracker {
     pub fn on_free(&mut self, addr: u64) -> Option<u64> {
         self.total_frees += 1;
         let r = self.allocs.remove(&addr);
-        if r.is_none() { self.orphan_frees += 1; }
+        if r.is_none() {
+            self.orphan_frees += 1;
+        }
         r
     }
 
@@ -556,7 +622,10 @@ impl HeapAllocTracker {
                 let overflow = end - alloc_end;
                 let sym = stm.covering(addr).map(|p| {
                     let off = addr - p.base_addr;
-                    let field = p.type_info.fields.iter()
+                    let field = p
+                        .type_info
+                        .fields
+                        .iter()
                         .find(|f| f.byte_offset == off)
                         .map(|f| f.name.clone());
                     (p.type_info.name.clone(), field)
@@ -578,8 +647,12 @@ impl HeapAllocTracker {
         }
         // only flag heap-hole if addr falls within the span of known allocations
         let lo = self.allocs.keys().next().copied().unwrap_or(u64::MAX);
-        let hi = self.allocs.iter().next_back()
-            .map(|(&b, &s)| b + s).unwrap_or(0);
+        let hi = self
+            .allocs
+            .iter()
+            .next_back()
+            .map(|(&b, &s)| b + s)
+            .unwrap_or(0);
         if addr >= lo && addr < hi {
             return Some(HeapHazard {
                 kind: HazardKind::HeapHole,

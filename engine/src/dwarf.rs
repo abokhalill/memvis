@@ -419,6 +419,7 @@ pub struct FunctionMeta {
     pub locals: Vec<LocalVar>,
 }
 
+#[derive(Default)]
 pub struct CfiTable {
     entries: Vec<CfiEntry>,
 }
@@ -431,16 +432,23 @@ struct CfiEntry {
 
 impl CfiTable {
     pub fn new() -> Self {
-        Self { entries: Vec::new() }
+        Self::default()
     }
 
     pub fn saved_regs_at(&self, pc: u64) -> Option<&[usize]> {
-        self.entries.iter()
+        self.entries
+            .iter()
             .find(|e| pc >= e.start_pc && pc < e.end_pc)
             .map(|e| e.saved_regs.as_slice())
     }
 
-    pub fn len(&self) -> usize { self.entries.len() }
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
 }
 
 pub struct DwarfInfo {
@@ -531,7 +539,8 @@ impl DwarfInfo {
                     continue;
                 }
                 let mut visited = HashSet::new();
-                let fields = extract_struct_fields_deep(&dw, &unit, entry.offset(), 0, &mut visited);
+                let fields =
+                    extract_struct_fields_deep(&dw, &unit, entry.offset(), 0, &mut visited);
                 if fields.len() > existing.fields.len() {
                     let deep_ti = TypeInfo {
                         name: name.clone(),
@@ -543,7 +552,11 @@ impl DwarfInfo {
                         fields,
                     };
                     self.type_registry.insert(name.clone(), deep_ti);
-                    eprintln!("dwarf: deep-resolved {} ({} fields)", name, self.type_registry[&name].fields.len());
+                    eprintln!(
+                        "dwarf: deep-resolved {} ({} fields)",
+                        name,
+                        self.type_registry[&name].fields.len()
+                    );
                     return true;
                 }
             }
@@ -608,7 +621,9 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                     spec_globals
                         .entry(name)
                         .and_modify(|existing| {
-                            if ti.fields.len() > existing.fields.len() { *existing = ti.clone(); }
+                            if ti.fields.len() > existing.fields.len() {
+                                *existing = ti.clone();
+                            }
                         })
                         .or_insert(ti);
                 }
@@ -621,13 +636,22 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                     functions.insert(f.low_pc, f);
                 }
             } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
-                if let Some(ti) = resolve_type_at(&dw, &unit, entry.offset(), 0, &mut HashSet::new()) {
-                    if !ti.name.is_empty() && ti.name != "<anon>" && !ti.is_pointer && ti.byte_size > 0 && !ti.fields.is_empty() {
+                if let Some(ti) =
+                    resolve_type_at(&dw, &unit, entry.offset(), 0, &mut HashSet::new())
+                {
+                    if !ti.name.is_empty()
+                        && ti.name != "<anon>"
+                        && !ti.is_pointer
+                        && ti.byte_size > 0
+                        && !ti.fields.is_empty()
+                    {
                         let entry_fields = ti.fields.len();
                         type_registry
                             .entry(ti.name.clone())
                             .and_modify(|existing| {
-                                if entry_fields > existing.fields.len() { *existing = ti.clone(); }
+                                if entry_fields > existing.fields.len() {
+                                    *existing = ti.clone();
+                                }
                             })
                             .or_insert(ti);
                     }
@@ -648,14 +672,28 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                 Ok(n) => n,
                 Err(_) => continue,
             };
-            if !spec_globals.contains_key(name) { continue; }
-            if existing_names.contains(name) { continue; }
-            if sym.size() == 0 { continue; }
-            if !matches!(sym.kind(), SymbolKind::Data | SymbolKind::Unknown) { continue; }
+            if !spec_globals.contains_key(name) {
+                continue;
+            }
+            if existing_names.contains(name) {
+                continue;
+            }
+            if sym.size() == 0 {
+                continue;
+            }
+            if !matches!(sym.kind(), SymbolKind::Data | SymbolKind::Unknown) {
+                continue;
+            }
             let addr = sym.address();
-            if addr == 0 { continue; }
+            if addr == 0 {
+                continue;
+            }
             if let Some(ti) = spec_globals.remove(name) {
-                let size = if ti.byte_size > 0 { ti.byte_size } else { sym.size() };
+                let size = if ti.byte_size > 0 {
+                    ti.byte_size
+                } else {
+                    sym.size()
+                };
                 resolved_globals.push(GlobalVar {
                     name: name.to_string(),
                     addr,
@@ -664,7 +702,9 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
                     location: LocationTable::single(LocationPiece::Address(addr)),
                 });
             }
-            if spec_globals.is_empty() { break; }
+            if spec_globals.is_empty() {
+                break;
+            }
         }
         let resolved = resolved_globals.len();
         globals.extend(resolved_globals);
@@ -684,7 +724,9 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         if !ti.fields.is_empty() && ti.byte_size > 0 && !ti.name.is_empty() && !ti.is_pointer {
             reg.entry(ti.name.clone())
                 .and_modify(|existing| {
-                    if ti.fields.len() > existing.fields.len() { *existing = ti.clone(); }
+                    if ti.fields.len() > existing.fields.len() {
+                        *existing = ti.clone();
+                    }
                 })
                 .or_insert_with(|| ti.clone());
         }
@@ -702,7 +744,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
     }
 
     let cfi = parse_eh_frame(&obj);
-    if cfi.len() > 0 {
+    if !cfi.is_empty() {
         eprintln!("dwarf: {} CFI entries from .eh_frame", cfi.len());
     }
 
@@ -724,11 +766,15 @@ fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
         None => return CfiTable::new(),
     };
     let eh: gimli::EhFrame<R<'_>> = gimli::EhFrame::new(eh_data, LittleEndian);
-    let bases = gimli::BaseAddresses::default()
-        .set_eh_frame(obj.section_by_name(".eh_frame").map(|s| s.address()).unwrap_or(0));
+    let bases = gimli::BaseAddresses::default().set_eh_frame(
+        obj.section_by_name(".eh_frame")
+            .map(|s| s.address())
+            .unwrap_or(0),
+    );
 
     let mut result_entries = Vec::new();
-    let mut cies: HashMap<gimli::EhFrameOffset<usize>, gimli::CommonInformationEntry<R<'_>>> = HashMap::new();
+    let mut cies: HashMap<gimli::EhFrameOffset<usize>, gimli::CommonInformationEntry<R<'_>>> =
+        HashMap::new();
     let mut ctx = gimli::UnwindContext::new();
     let mut iter = eh.entries(&bases);
 
@@ -745,7 +791,8 @@ fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
             }
             gimli::CieOrFde::Fde(partial) => {
                 let fde = match partial.parse(|_section, _bases, offset| {
-                    cies.get(&offset).cloned()
+                    cies.get(&offset)
+                        .cloned()
                         .ok_or(gimli::Error::NoEntryAtGivenOffset)
                 }) {
                     Ok(f) => f,
@@ -761,19 +808,17 @@ fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
                     Err(_) => continue,
                 };
                 let mut last_row = None;
-                loop {
-                    match table.next_row() {
-                        Ok(Some(row)) => { last_row = Some(row.clone()); }
-                        _ => break,
-                    }
+                while let Ok(Some(row)) = table.next_row() {
+                    last_row = Some(row.clone());
                 }
                 if let Some(row) = last_row {
                     for dwarf_reg in 0u16..17 {
                         let reg = gimli::Register(dwarf_reg);
                         match row.register(reg) {
-                            gimli::RegisterRule::Offset(_) |
-                            gimli::RegisterRule::ValOffset(_) => {
-                                if let Some(idx) = DWARF_TO_REGFILE.get(dwarf_reg as usize).copied().flatten() {
+                            gimli::RegisterRule::Offset(_) | gimli::RegisterRule::ValOffset(_) => {
+                                if let Some(idx) =
+                                    DWARF_TO_REGFILE.get(dwarf_reg as usize).copied().flatten()
+                                {
                                     saved.push(idx);
                                 }
                             }
@@ -782,13 +827,19 @@ fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
                     }
                 }
                 if !saved.is_empty() {
-                    result_entries.push(CfiEntry { start_pc: start, end_pc: end, saved_regs: saved });
+                    result_entries.push(CfiEntry {
+                        start_pc: start,
+                        end_pc: end,
+                        saved_regs: saved,
+                    });
                 }
             }
         }
     }
 
-    CfiTable { entries: result_entries }
+    CfiTable {
+        entries: result_entries,
+    }
 }
 
 fn op_to_steps(op: &Operation<R<'_>>, steps: &mut Vec<ExprStep>) -> bool {
@@ -1053,10 +1104,19 @@ fn try_extract_spec_global<'a>(
     unit: &Unit<R<'a>>,
     entry: &DebuggingInformationEntry<R<'a>>,
 ) -> Option<(String, TypeInfo)> {
-    if entry.attr_value(gimli::DW_AT_location).ok().flatten().is_some() {
+    if entry
+        .attr_value(gimli::DW_AT_location)
+        .ok()
+        .flatten()
+        .is_some()
+    {
         return None;
     }
-    let spec_offset = match entry.attr_value(gimli::DW_AT_specification).ok().flatten()? {
+    let spec_offset = match entry
+        .attr_value(gimli::DW_AT_specification)
+        .ok()
+        .flatten()?
+    {
         AttributeValue::UnitRef(off) => off,
         _ => return None,
     };
@@ -1466,11 +1526,14 @@ fn resolve_type_at_deep<'a>(
             .ok()
             .flatten()
             .and_then(|v| match v {
-                AttributeValue::UnitRef(off) => resolve_type_at_deep(dwarf, unit, off, depth + 1, visited),
+                AttributeValue::UnitRef(off) => {
+                    resolve_type_at_deep(dwarf, unit, off, depth + 1, visited)
+                }
                 _ => None,
             });
 
-        let pointee_name = pointee.as_ref()
+        let pointee_name = pointee
+            .as_ref()
             .map(|t| format!("*{}", t.name))
             .unwrap_or_else(|| "*void".into());
 
@@ -1578,11 +1641,14 @@ fn resolve_type_at<'a>(
             .ok()
             .flatten()
             .and_then(|v| match v {
-                AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1, visited),
+                AttributeValue::UnitRef(off) => {
+                    resolve_type_at(dwarf, unit, off, depth + 1, visited)
+                }
                 _ => None,
             });
 
-        let pointee_name = pointee.as_ref()
+        let pointee_name = pointee
+            .as_ref()
             .map(|t| format!("*{}", t.name))
             .unwrap_or_else(|| "*void".into());
 
@@ -1644,7 +1710,9 @@ fn resolve_type_at<'a>(
             .ok()
             .flatten()
             .and_then(|v| match v {
-                AttributeValue::UnitRef(off) => resolve_type_at(dwarf, unit, off, depth + 1, visited),
+                AttributeValue::UnitRef(off) => {
+                    resolve_type_at(dwarf, unit, off, depth + 1, visited)
+                }
                 _ => None,
             });
         let elem_name = elem_type
@@ -1797,10 +1865,15 @@ mod tests {
 
         info.patch_shallow_fields(&mut parent);
 
-        assert!(!parent.fields[0].type_info.shallow,
-            "shallow field should be patched");
-        assert_eq!(parent.fields[0].type_info.fields.len(), 2,
-            "patched field should have 2 sub-fields");
+        assert!(
+            !parent.fields[0].type_info.shallow,
+            "shallow field should be patched"
+        );
+        assert_eq!(
+            parent.fields[0].type_info.fields.len(),
+            2,
+            "patched field should have 2 sub-fields"
+        );
         assert_eq!(parent.fields[0].type_info.fields[0].name, "x");
         assert_eq!(parent.fields[0].type_info.fields[1].name, "y");
 
@@ -1816,7 +1889,12 @@ mod tests {
         }
         let info = parse_elf(elf_path).expect("parse_elf");
         let root = info.type_registry.get("Root").expect("Root type");
-        eprintln!("Root: {}B, {} fields, shallow={}", root.byte_size, root.fields.len(), root.shallow);
+        eprintln!(
+            "Root: {}B, {} fields, shallow={}",
+            root.byte_size,
+            root.fields.len(),
+            root.shallow
+        );
 
         // walk the inner chain, counting depth before truncation
         let mut depth = 0;
@@ -1833,13 +1911,21 @@ mod tests {
                 }
                 Some(f) if !f.type_info.fields.is_empty() => {
                     depth += 1;
-                    eprintln!("  depth {}: {} ({} fields)", depth, f.type_info.name, f.type_info.fields.len());
+                    eprintln!(
+                        "  depth {}: {} ({} fields)",
+                        depth,
+                        f.type_info.name,
+                        f.type_info.fields.len()
+                    );
                     cur = &f.type_info;
                 }
                 _ => break,
             }
         }
-        eprintln!("traversable depth: {}, found_shallow: {}", depth, found_shallow);
+        eprintln!(
+            "traversable depth: {}, found_shallow: {}",
+            depth, found_shallow
+        );
         assert!(depth >= 5, "expected >=5 levels, got {}", depth);
 
         // patch and verify the shallow node gets upgraded
@@ -1860,7 +1946,12 @@ mod tests {
                 }
             }
             eprintln!("after patch: traversable depth {}", d2);
-            assert!(d2 > depth, "patched tree should be deeper ({} vs {})", d2, depth);
+            assert!(
+                d2 > depth,
+                "patched tree should be deeper ({} vs {})",
+                d2,
+                depth
+            );
         }
     }
 }

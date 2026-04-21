@@ -121,9 +121,18 @@ impl ScoreCache {
     fn empty() -> Self {
         Self {
             top: [
-                ScoreEntry { candidate_idx: 0, score: 0.0 },
-                ScoreEntry { candidate_idx: 0, score: 0.0 },
-                ScoreEntry { candidate_idx: 0, score: 0.0 },
+                ScoreEntry {
+                    candidate_idx: 0,
+                    score: 0.0,
+                },
+                ScoreEntry {
+                    candidate_idx: 0,
+                    score: 0.0,
+                },
+                ScoreEntry {
+                    candidate_idx: 0,
+                    score: 0.0,
+                },
             ],
             count: 0,
             last_rescore_seq: 0,
@@ -132,7 +141,11 @@ impl ScoreCache {
     }
 
     fn best(&self) -> Option<&ScoreEntry> {
-        if self.count > 0 { Some(&self.top[0]) } else { None }
+        if self.count > 0 {
+            Some(&self.top[0])
+        } else {
+            None
+        }
     }
 }
 
@@ -278,7 +291,16 @@ impl HeapGraph {
 
             // incremental confidence update against current best candidate
             if let Some(ref cands) = self.candidates {
-                Self::update_confidence(obj, cands, offset, size, is_ptr, seq, &mut self.rescores, &mut self.contradictions);
+                Self::update_confidence(
+                    obj,
+                    cands,
+                    offset,
+                    size,
+                    is_ptr,
+                    seq,
+                    &mut self.rescores,
+                    &mut self.contradictions,
+                );
             }
 
             if is_ptr && value != 0 {
@@ -377,7 +399,9 @@ impl HeapGraph {
     fn score_object(obj: &mut HeapObject, candidates: &[StructCandidate]) {
         let mut buf: Vec<(u16, f32)> = Vec::with_capacity(candidates.len().min(8));
         for (ci, c) in candidates.iter().enumerate() {
-            if c.fields.is_empty() { continue; }
+            if c.fields.is_empty() {
+                continue;
+            }
             let mut matches = 0u32;
             let total = c.fields.len() as u32;
             for &(c_off, c_size, c_is_ptr) in &c.fields {
@@ -388,7 +412,11 @@ impl HeapGraph {
                 }
             }
             let score = matches as f32 / total as f32;
-            let size_bonus = if obj.inferred_size == c.byte_size { 0.1 } else { 0.0 };
+            let size_bonus = if obj.inferred_size == c.byte_size {
+                0.1
+            } else {
+                0.0
+            };
             let final_score = (score + size_bonus).min(1.0);
             if final_score > 0.0 {
                 buf.push((ci as u16, final_score));
@@ -398,7 +426,10 @@ impl HeapGraph {
 
         let mut sc = ScoreCache::empty();
         for (i, &(idx, s)) in buf.iter().take(3).enumerate() {
-            sc.top[i] = ScoreEntry { candidate_idx: idx, score: s };
+            sc.top[i] = ScoreEntry {
+                candidate_idx: idx,
+                score: s,
+            };
             sc.count = (i + 1) as u8;
         }
         sc.events_since_rescore = 0;
@@ -414,6 +445,7 @@ impl HeapGraph {
 
     // O(1) hot-path: check if this write confirms or contradicts the best candidate.
     // if confidence drops below threshold and cooldown expired, trigger full re-score.
+    #[allow(clippy::too_many_arguments)]
     fn update_confidence(
         obj: &mut HeapObject,
         candidates: &[StructCandidate],
@@ -437,7 +469,9 @@ impl HeapGraph {
         }
 
         let best_idx = obj.score_cache.top[0].candidate_idx as usize;
-        if best_idx >= candidates.len() { return; }
+        if best_idx >= candidates.len() {
+            return;
+        }
         let cand = &candidates[best_idx];
 
         // O(1): does this write match the candidate's expected field?
@@ -468,7 +502,9 @@ impl HeapGraph {
 
         // propagate best type name
         if obj.type_confidence >= 0.5 {
-            if obj.inferred_type.is_none() || obj.score_cache.top[0].candidate_idx as usize != best_idx {
+            if obj.inferred_type.is_none()
+                || obj.score_cache.top[0].candidate_idx as usize != best_idx
+            {
                 let new_idx = obj.score_cache.top[0].candidate_idx as usize;
                 if new_idx < candidates.len() {
                     obj.inferred_type = Some(candidates[new_idx].name.clone());
@@ -496,7 +532,6 @@ impl HeapGraph {
         }
     }
 }
-
 
 struct StructCandidate {
     name: String,
@@ -651,17 +686,17 @@ mod tests {
                 name: "widget_t".into(),
                 byte_size: 24,
                 fields: vec![
-                    (0, 4, false),   // int at +0
-                    (8, 8, true),    // ptr at +8
-                    (16, 4, false),  // int at +16
+                    (0, 4, false),  // int at +0
+                    (8, 8, true),   // ptr at +8
+                    (16, 4, false), // int at +16
                 ],
             },
             StructCandidate {
                 name: "gadget_t".into(),
                 byte_size: 16,
                 fields: vec![
-                    (0, 8, true),    // ptr at +0
-                    (8, 8, false),   // u64 at +8
+                    (0, 8, true),  // ptr at +0
+                    (8, 8, false), // u64 at +8
                 ],
             },
         ]
@@ -684,9 +719,15 @@ mod tests {
         graph.process_write(base, 4, 43, 4, &oracle);
         let obj = graph.objects.values().next().unwrap();
 
-        assert!(obj.score_cache.count > 0, "must have scored at least one candidate");
+        assert!(
+            obj.score_cache.count > 0,
+            "must have scored at least one candidate"
+        );
         assert_eq!(obj.inferred_type.as_deref(), Some("widget_t"));
-        assert!(obj.type_confidence >= 0.5, "confidence must cross threshold");
+        assert!(
+            obj.type_confidence >= 0.5,
+            "confidence must cross threshold"
+        );
         assert_eq!(graph.rescores, 1);
     }
 
@@ -706,14 +747,23 @@ mod tests {
         graph.process_write(base, 4, 2, 4, &oracle);
 
         let c0 = graph.objects.values().next().unwrap().type_confidence;
-        assert!(c0 < 1.0, "initial score must be < 1.0 for partial match: {}", c0);
+        assert!(
+            c0 < 1.0,
+            "initial score must be < 1.0 for partial match: {}",
+            c0
+        );
 
         // confirming writes to known widget_t offsets should raise confidence
         for i in 5..25u64 {
             graph.process_write(base, 4, i, i, &oracle);
         }
         let c1 = graph.objects.values().next().unwrap().type_confidence;
-        assert!(c1 > c0, "confirming writes must increase confidence: {} > {}", c1, c0);
+        assert!(
+            c1 > c0,
+            "confirming writes must increase confidence: {} > {}",
+            c1,
+            c0
+        );
     }
 
     #[test]
@@ -733,7 +783,10 @@ mod tests {
         // write at offset 5 with size 3: matches no candidate field → contradiction
         graph.process_write(base + 5, 3, 0xFF, 5, &oracle);
         let obj = graph.objects.values().next().unwrap();
-        assert!(obj.type_confidence < c0, "contradiction must drop confidence");
+        assert!(
+            obj.type_confidence < c0,
+            "contradiction must drop confidence"
+        );
         assert!(graph.contradictions >= 1);
     }
 
@@ -764,8 +817,12 @@ mod tests {
         }
 
         // confidence should have collapsed, triggering a re-score
-        assert!(graph.rescores > pre_cooldown_rescores,
-            "re-score must fire after cooldown: {} > {}", graph.rescores, pre_cooldown_rescores);
+        assert!(
+            graph.rescores > pre_cooldown_rescores,
+            "re-score must fire after cooldown: {} > {}",
+            graph.rescores,
+            pre_cooldown_rescores
+        );
     }
 
     #[test]
@@ -780,7 +837,16 @@ mod tests {
         graph.process_write(base + 8, 8, 0x5555_0001_0000, 2, &oracle);
         graph.process_write(base + 16, 4, 3, 3, &oracle);
         graph.process_write(base, 4, 2, 4, &oracle);
-        assert_eq!(graph.objects.values().next().unwrap().inferred_type.as_deref(), Some("widget_t"));
+        assert_eq!(
+            graph
+                .objects
+                .values()
+                .next()
+                .unwrap()
+                .inferred_type
+                .as_deref(),
+            Some("widget_t")
+        );
 
         // now rewrite as gadget_t layout: ptr+0, u64+8
         // contradict enough times past cooldown to force re-score
@@ -797,8 +863,10 @@ mod tests {
             assert!(obj.inferred_type.is_some());
         } else {
             // confidence collapsed — type cleared, not silently wrong
-            assert!(obj.inferred_type.is_none(),
-                "low confidence must clear type, not leave stale name");
+            assert!(
+                obj.inferred_type.is_none(),
+                "low confidence must clear type, not leave stale name"
+            );
         }
     }
 }

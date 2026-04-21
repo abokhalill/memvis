@@ -15,7 +15,9 @@ use ratatui::widgets::*;
 use crate::heap_graph::HeapGraph;
 use crate::index::NodeId;
 use crate::shadow_regs::{Confidence, ShadowRegisterFile};
-use crate::world::{CacheLineTracker, ShadowTypeMap, ShadowStack, WorldInner, REG_COUNT, REG_NAMES};
+use crate::world::{
+    CacheLineTracker, ShadowStack, ShadowTypeMap, WorldInner, REG_COUNT, REG_NAMES,
+};
 
 #[derive(Clone)]
 pub struct JournalEntry {
@@ -304,15 +306,21 @@ struct MemLine {
     spans: Vec<Span<'static>>,
 }
 
-fn resolve_ptr_target<'a>(val: u64, addr_names: &'a HashMap<u64, (String, u64)>) -> Option<&'a str> {
-    if val == 0 { return None; }
+fn resolve_ptr_target(val: u64, addr_names: &HashMap<u64, (String, u64)>) -> Option<&str> {
+    if val == 0 {
+        return None;
+    }
     if let Some((name, _)) = addr_names.get(&val) {
         return Some(name.as_str());
     }
     None
 }
 
-fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker, stm: &ShadowTypeMap) -> Vec<MemLine> {
+fn build_mem_lines(
+    world: &WorldInner,
+    cl_tracker: &CacheLineTracker,
+    stm: &ShadowTypeMap,
+) -> Vec<MemLine> {
     let mut sorted: Vec<_> = world.nodes.iter().filter(|(_, n)| n.size > 0).collect();
     sorted.sort_by_key(|(_, n)| (n.addr, std::cmp::Reverse(n.last_write_insn)));
     sorted.dedup_by(|a, b| {
@@ -402,57 +410,59 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker, stm: &Shad
         lines.push(MemLine { spans });
 
         if let NodeId::Global(gi) = nid {
-            if node.type_info.is_pointer { }
-            else { for (fi, f) in node.type_info.fields.iter().enumerate() {
-                if f.byte_size == 0 || f.name == "<pointee>" {
-                    continue;
-                }
-                let fa = node.addr + f.byte_offset;
-                let fid = NodeId::Field(*gi, fi as u16);
-                let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
-                let fwrite = world
-                    .nodes
-                    .get(&fid)
-                    .map(|n| n.last_write_insn)
-                    .unwrap_or(0);
-                let fvc = recency_color(fwrite, insn);
-                lines.push(MemLine {
-                    spans: vec![
-                        Span::styled(
-                            format!("    {:>12x}", fa),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::raw(format!(" {:>3}B ", f.byte_size)),
-                        Span::styled(
-                            format!("{:<18}", f.name),
-                            Style::default().fg(Color::DarkGray),
-                        ),
-                        Span::styled(
-                            format!("{:<12}", f.type_info.name),
-                            Style::default().fg(type_color(&f.type_info.name)),
-                        ),
-                        Span::styled(format!(" 0x{:<16x}", fval), Style::default().fg(fvc)),
-                    ],
-                });
-                if f.type_info.is_pointer && fval != 0 {
-                    if let Some(tname) = resolve_ptr_target(fval, &addr_names) {
-                        let last = lines.last_mut().unwrap();
-                        last.spans.push(Span::styled(
-                            format!(" → {}", tname),
-                            Style::default().fg(Color::Magenta),
-                        ));
-                    } else {
-                        let last = lines.last_mut().unwrap();
-                        last.spans.push(Span::styled(
-                            format!(" → 0x{:x}", fval),
-                            Style::default().fg(Color::Magenta),
-                        ));
+            if node.type_info.is_pointer {
+            } else {
+                for (fi, f) in node.type_info.fields.iter().enumerate() {
+                    if f.byte_size == 0 || f.name == "<pointee>" {
+                        continue;
+                    }
+                    let fa = node.addr + f.byte_offset;
+                    let fid = NodeId::Field(*gi, fi as u16);
+                    let fval = world.nodes.get(&fid).map(|n| n.raw_value).unwrap_or(0);
+                    let fwrite = world
+                        .nodes
+                        .get(&fid)
+                        .map(|n| n.last_write_insn)
+                        .unwrap_or(0);
+                    let fvc = recency_color(fwrite, insn);
+                    lines.push(MemLine {
+                        spans: vec![
+                            Span::styled(
+                                format!("    {:>12x}", fa),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::raw(format!(" {:>3}B ", f.byte_size)),
+                            Span::styled(
+                                format!("{:<18}", f.name),
+                                Style::default().fg(Color::DarkGray),
+                            ),
+                            Span::styled(
+                                format!("{:<12}", f.type_info.name),
+                                Style::default().fg(type_color(&f.type_info.name)),
+                            ),
+                            Span::styled(format!(" 0x{:<16x}", fval), Style::default().fg(fvc)),
+                        ],
+                    });
+                    if f.type_info.is_pointer && fval != 0 {
+                        if let Some(tname) = resolve_ptr_target(fval, &addr_names) {
+                            let last = lines.last_mut().unwrap();
+                            last.spans.push(Span::styled(
+                                format!(" → {}", tname),
+                                Style::default().fg(Color::Magenta),
+                            ));
+                        } else {
+                            let last = lines.last_mut().unwrap();
+                            last.spans.push(Span::styled(
+                                format!(" → 0x{:x}", fval),
+                                Style::default().fg(Color::Magenta),
+                            ));
+                        }
                     }
                 }
             }
-        } }
+        }
     }
-    if stm.len() > 0 {
+    if !stm.is_empty() {
         lines.push(MemLine {
             spans: vec![Span::styled(
                 format!("  ── HEAP TYPES ({} projections) ──", stm.len()),
@@ -480,7 +490,9 @@ fn build_mem_lines(world: &WorldInner, cl_tracker: &CacheLineTracker, stm: &Shad
                 ],
             });
             for f in &proj.type_info.fields {
-                if f.byte_size == 0 || f.name == "<pointee>" { continue; }
+                if f.byte_size == 0 || f.name == "<pointee>" {
+                    continue;
+                }
                 let fa = base + f.byte_offset;
                 let mut fspans = vec![
                     Span::styled(
@@ -710,15 +722,21 @@ pub fn draw(
             .map(|(i, ml)| {
                 if Some(i) == current_match_line {
                     // current match: bright highlight
-                    let styled: Vec<Span> = ml.spans.iter().map(|s| {
-                        Span::styled(s.content.clone(), s.style.bg(Color::DarkGray))
-                    }).collect();
+                    let styled: Vec<Span> = ml
+                        .spans
+                        .iter()
+                        .map(|s| Span::styled(s.content.clone(), s.style.bg(Color::DarkGray)))
+                        .collect();
                     Line::from(styled)
                 } else if state.search_matches.contains(&i) {
                     // other matches: subtle highlight
-                    let styled: Vec<Span> = ml.spans.iter().map(|s| {
-                        Span::styled(s.content.clone(), s.style.bg(Color::Rgb(40, 40, 40)))
-                    }).collect();
+                    let styled: Vec<Span> = ml
+                        .spans
+                        .iter()
+                        .map(|s| {
+                            Span::styled(s.content.clone(), s.style.bg(Color::Rgb(40, 40, 40)))
+                        })
+                        .collect();
                     Line::from(styled)
                 } else {
                     Line::from(ml.spans.clone())
@@ -728,7 +746,11 @@ pub fn draw(
         let mem_title = if state.search_mode {
             format!(" Memory Map  /{}▏ ", state.search_query)
         } else if !state.search_matches.is_empty() {
-            format!(" Memory Map  [{}/{}] ", state.search_idx + 1, state.search_matches.len())
+            format!(
+                " Memory Map  [{}/{}] ",
+                state.search_idx + 1,
+                state.search_matches.len()
+            )
         } else {
             " Memory Map ".to_string()
         };
@@ -736,11 +758,15 @@ pub fn draw(
             .block(
                 Block::default()
                     .title(mem_title)
-                    .title_style(Style::default().fg(if state.search_mode || !state.search_matches.is_empty() {
-                        Color::Yellow
-                    } else {
-                        Color::White
-                    }).bold())
+                    .title_style(
+                        Style::default()
+                            .fg(if state.search_mode || !state.search_matches.is_empty() {
+                                Color::Yellow
+                            } else {
+                                Color::White
+                            })
+                            .bold(),
+                    )
                     .borders(Borders::ALL)
                     .border_style(mem_border_style),
             )

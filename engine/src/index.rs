@@ -40,8 +40,17 @@ const MRU_SLOTS: usize = 8;
 
 #[derive(Clone, Copy)]
 enum MruEntry {
-    Static { lo: u64, hi: u64, idx: usize },
-    Dynamic { lo: u64, hi: u64, frame_id: FrameId, local_idx: usize },
+    Static {
+        lo: u64,
+        hi: u64,
+        idx: usize,
+    },
+    Dynamic {
+        lo: u64,
+        hi: u64,
+        frame_id: FrameId,
+        local_idx: usize,
+    },
 }
 
 impl MruEntry {
@@ -53,7 +62,9 @@ impl MruEntry {
         addr >= lo && addr < hi
     }
     fn lo(&self) -> u64 {
-        match self { MruEntry::Static { lo, .. } | MruEntry::Dynamic { lo, .. } => *lo }
+        match self {
+            MruEntry::Static { lo, .. } | MruEntry::Dynamic { lo, .. } => *lo,
+        }
     }
 }
 
@@ -215,7 +226,12 @@ impl AddressIndex {
 
         let dyn_hit = self.lookup_dynamics(addr);
         if let Some((frame_id, local_idx, lo, hi)) = dyn_hit {
-            self.push_mru(MruEntry::Dynamic { lo, hi, frame_id, local_idx });
+            self.push_mru(MruEntry::Dynamic {
+                lo,
+                hi,
+                frame_id,
+                local_idx,
+            });
             let iv = &self.dynamics[&frame_id][local_idx];
             return Some(LookupResult {
                 name: &iv.meta.name,
@@ -251,7 +267,11 @@ impl AddressIndex {
                     offset_in_var: addr - lo,
                 })
             }
-            MruEntry::Dynamic { frame_id, local_idx, .. } => {
+            MruEntry::Dynamic {
+                frame_id,
+                local_idx,
+                ..
+            } => {
                 let frame = self.dynamics.get(frame_id)?;
                 let iv = frame.get(*local_idx)?;
                 Some(LookupResult {
@@ -273,8 +293,12 @@ impl AddressIndex {
 
     #[inline(always)]
     fn widen_universe(&mut self, lo: u64, hi: u64) {
-        if lo < self.universe_lo { self.universe_lo = lo; }
-        if hi > self.universe_hi { self.universe_hi = hi; }
+        if lo < self.universe_lo {
+            self.universe_lo = lo;
+        }
+        if hi > self.universe_hi {
+            self.universe_hi = hi;
+        }
     }
 
     fn lookup_dynamics(&self, addr: u64) -> Option<(FrameId, usize, u64, u64)> {
@@ -315,8 +339,7 @@ impl AddressIndex {
                     Some((_, prev)) => {
                         let iv_r = node_rank(&iv.meta.node_id);
                         let prev_r = node_rank(&prev.meta.node_id);
-                        iv_r > prev_r
-                            || (iv_r == prev_r && (iv.hi - iv.lo) < (prev.hi - prev.lo))
+                        iv_r > prev_r || (iv_r == prev_r && (iv.hi - iv.lo) < (prev.hi - prev.lo))
                     }
                 };
                 if dominated {

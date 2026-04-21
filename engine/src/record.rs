@@ -95,14 +95,20 @@ impl EventPlayer {
         if magic != RECORD_MAGIC {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("bad recording magic: expected 0x{:X}, got 0x{:X}", RECORD_MAGIC, magic),
+                format!(
+                    "bad recording magic: expected 0x{:X}, got 0x{:X}",
+                    RECORD_MAGIC, magic
+                ),
             ));
         }
         let proto = u32::from_le_bytes(hdr[8..12].try_into().unwrap());
         if proto != PROTO_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                format!("proto version mismatch: expected {}, got {}", PROTO_VERSION, proto),
+                format!(
+                    "proto version mismatch: expected {}, got {}",
+                    PROTO_VERSION, proto
+                ),
             ));
         }
         let count = u64::from_le_bytes(hdr[12..20].try_into().unwrap());

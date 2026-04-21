@@ -99,54 +99,123 @@ pub fn process_event(
                 }
             }
             if heap_oracle.is_heap(ev.addr) {
-                heap_graph.process_write(ev.addr, ev.size, ev.value, ev.seq32() as u64, heap_oracle);
+                heap_graph.process_write(
+                    ev.addr,
+                    ev.size,
+                    ev.value,
+                    ev.seq32() as u64,
+                    heap_oracle,
+                );
                 // field heatmap: attribute this write to a typed field if STM covers it
                 if let Some(covering) = world.stm.covering(ev.addr) {
                     let offset = ev.addr - covering.base_addr;
                     let tn = &covering.type_info.name;
-                    if let Some(field) = covering.type_info.fields.iter().find(|f| {
-                        offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
-                    }) {
-                        world.field_heatmap.record(ev.thread_id, tn, &field.name, field.byte_offset);
+                    if let Some(field) =
+                        covering.type_info.fields.iter().find(|f| {
+                            offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
+                        })
+                    {
+                        world.field_heatmap.record(
+                            ev.thread_id,
+                            tn,
+                            &field.name,
+                            field.byte_offset,
+                        );
                     } else {
-                        world.field_heatmap.record(ev.thread_id, tn, "<unresolved>", offset);
+                        world
+                            .field_heatmap
+                            .record(ev.thread_id, tn, "<unresolved>", offset);
                     }
                 }
                 if ev.size == 8 && ev.value != 0 {
                     if let Some(ref mut ts) = topo {
                         if let Some(covering) = world.stm.covering(ev.addr) {
                             let offset = ev.addr - covering.base_addr;
-                            if let Some(field) = covering.type_info.fields.iter().find(|f| f.byte_offset == offset && f.type_info.is_pointer) {
-                                let pointee = field.type_info.name.strip_prefix('*').unwrap_or(&field.type_info.name);
-                                ts.emit_link(ev.seq32() as u64, &covering.type_info.name, ev.addr, ev.value, pointee, &field.name);
+                            if let Some(field) = covering
+                                .type_info
+                                .fields
+                                .iter()
+                                .find(|f| f.byte_offset == offset && f.type_info.is_pointer)
+                            {
+                                let pointee = field
+                                    .type_info
+                                    .name
+                                    .strip_prefix('*')
+                                    .unwrap_or(&field.type_info.name);
+                                ts.emit_link(
+                                    ev.seq32() as u64,
+                                    &covering.type_info.name,
+                                    ev.addr,
+                                    ev.value,
+                                    pointee,
+                                    &field.name,
+                                );
                             }
                         }
                     }
                 }
                 if let Some(ref info) = dwarf_info {
                     let before = world.stm.len();
-                    world.stm.propagate_field_write(ev.addr, ev.value, ev.size, ev.seq32() as u64, &info.type_registry);
+                    world.stm.propagate_field_write(
+                        ev.addr,
+                        ev.value,
+                        ev.size,
+                        ev.seq32() as u64,
+                        &info.type_registry,
+                    );
                     let after = world.stm.len();
                     if after > before {
-                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq32() as u64);
+                        world.stm.retrospective_scan(
+                            ev.value,
+                            heap_graph,
+                            &world.heap_allocs,
+                            &info.type_registry,
+                            ev.seq32() as u64,
+                        );
                     }
                     if after > before {
                         if let Some(ref mut ts) = topo {
                             if let Some(proj) = world.stm.lookup(ev.value) {
-                                ts.emit_stamp(ev.seq32() as u64, ev.value, &proj.type_info.name, proj.type_info.byte_size, &proj.source_name, proj.type_info.fields.len());
+                                ts.emit_stamp(
+                                    ev.seq32() as u64,
+                                    ev.value,
+                                    &proj.type_info.name,
+                                    proj.type_info.byte_size,
+                                    &proj.source_name,
+                                    proj.type_info.fields.len(),
+                                );
                             }
                         }
                     }
                 }
                 if world.hazards.len() < 64 {
-                    if let Some(mut h) = world.heap_allocs.check_write_bounds(ev.addr, ev.size, &world.stm) {
-                        let dominated = world.hazards.iter().any(|prev| prev.write_addr == h.write_addr);
+                    if let Some(mut h) = world
+                        .heap_allocs
+                        .check_write_bounds(ev.addr, ev.size, &world.stm)
+                    {
+                        let dominated = world
+                            .hazards
+                            .iter()
+                            .any(|prev| prev.write_addr == h.write_addr);
                         if !dominated {
                             h.pc = ev.rip_lo as u64;
                             h.reg_snapshot = shadow_regs.get(&ev.thread_id).map(|srf| srf.values());
                             if let Some(ref mut ts) = topo {
-                                let kind_str = match h.kind { HazardKind::OutOfBounds => "OOB", HazardKind::HeapHole => "HOLE" };
-                                ts.emit_hazard(ev.seq32() as u64, kind_str, h.write_addr, h.write_size, h.alloc_base, h.alloc_size, h.overflow_bytes, h.type_name.as_deref(), h.field_name.as_deref());
+                                let kind_str = match h.kind {
+                                    HazardKind::OutOfBounds => "OOB",
+                                    HazardKind::HeapHole => "HOLE",
+                                };
+                                ts.emit_hazard(
+                                    ev.seq32() as u64,
+                                    kind_str,
+                                    h.write_addr,
+                                    h.write_size,
+                                    h.alloc_base,
+                                    h.alloc_size,
+                                    h.overflow_bytes,
+                                    h.type_name.as_deref(),
+                                    h.field_name.as_deref(),
+                                );
                             }
                             world.hazards.push(h);
                         }
@@ -171,27 +240,60 @@ pub fn process_event(
                         let is_heap = heap_oracle.is_heap(ev.value);
                         if is_heap {
                             if let Some(ref mut info) = dwarf_info {
-                                let pointee_name = h_type.name.strip_prefix('*').unwrap_or("").to_string();
-                                if info.type_registry.get(&pointee_name).map_or(false, |ti| ti.shallow) {
+                                let pointee_name =
+                                    h_type.name.strip_prefix('*').unwrap_or("").to_string();
+                                if info
+                                    .type_registry
+                                    .get(&pointee_name)
+                                    .is_some_and(|ti| ti.shallow)
+                                {
                                     info.resolve_deep(&pointee_name);
                                 }
-                                if let Some(pointee_ti) = info.type_registry.get(&pointee_name).cloned() {
+                                if let Some(pointee_ti) =
+                                    info.type_registry.get(&pointee_name).cloned()
+                                {
                                     let mut patched = pointee_ti;
                                     info.patch_shallow_fields(&mut patched);
                                     world.heap_allocs.check_size(ev.value, &patched);
-                                    if world.stm.stamp_type(ev.value, &patched, &h_name, ev.seq32() as u64) {
+                                    if world.stm.stamp_type(
+                                        ev.value,
+                                        &patched,
+                                        &h_name,
+                                        ev.seq32() as u64,
+                                    ) {
                                         orch.bloom_insert(ev.value);
-                                        world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq32() as u64);
+                                        world.stm.retrospective_scan(
+                                            ev.value,
+                                            heap_graph,
+                                            &world.heap_allocs,
+                                            &info.type_registry,
+                                            ev.seq32() as u64,
+                                        );
                                         if let Some(ref mut ts) = topo {
-                                            ts.emit_stamp(ev.seq32() as u64, ev.value, &patched.name, patched.byte_size, &h_name, patched.fields.len());
+                                            ts.emit_stamp(
+                                                ev.seq32() as u64,
+                                                ev.value,
+                                                &patched.name,
+                                                patched.byte_size,
+                                                &h_name,
+                                                patched.fields.len(),
+                                            );
                                         }
                                     }
                                 }
                             }
                         }
                         if let Some(ref mut ts) = topo {
-                            let pointee_name = h_type.name.strip_prefix('*').unwrap_or(&h_type.name);
-                            ts.emit_link(ev.seq32() as u64, &h_name, ev.addr, ev.value, pointee_name, &h_name);
+                            let pointee_name =
+                                h_type.name.strip_prefix('*').unwrap_or(&h_type.name);
+                            ts.emit_link(
+                                ev.seq32() as u64,
+                                &h_name,
+                                ev.addr,
+                                ev.value,
+                                pointee_name,
+                                &h_name,
+                            );
                         }
                     }
                 }
@@ -290,7 +392,14 @@ pub fn process_event(
         EVENT_RELOAD => {
             let reg_idx = ((ev.kind_flags >> 8) & 0xFF) as usize;
             let srf = shadow_regs.entry(ev.thread_id).or_default();
-            srf.on_reload(reg_idx, ev.value, ev.addr, ev.size, ev.seq32() as u64, ev.addr);
+            srf.on_reload(
+                reg_idx,
+                ev.value,
+                ev.addr,
+                ev.size,
+                ev.seq32() as u64,
+                ev.addr,
+            );
             true
         }
         EVENT_ALLOC => {
@@ -323,10 +432,17 @@ pub fn process_event(
                 if let Some(covering) = world.stm.covering(ev.addr) {
                     let offset = ev.addr - covering.base_addr;
                     let tn = &covering.type_info.name;
-                    if let Some(field) = covering.type_info.fields.iter().find(|f| {
-                        offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
-                    }) {
-                        world.field_heatmap.record_read(ev.thread_id, tn, &field.name, field.byte_offset);
+                    if let Some(field) =
+                        covering.type_info.fields.iter().find(|f| {
+                            offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
+                        })
+                    {
+                        world.field_heatmap.record_read(
+                            ev.thread_id,
+                            tn,
+                            &field.name,
+                            field.byte_offset,
+                        );
                     }
                 }
             }
@@ -387,6 +503,7 @@ pub fn populate_globals(
     addr_index.finalize();
 }
 
+#[allow(clippy::too_many_arguments)]
 fn register_fields_recursive(
     parent_name: &str,
     parent_base: u64,
@@ -397,14 +514,18 @@ fn register_fields_recursive(
     world: &mut WorldState,
     depth: u32,
 ) {
-    if depth > 6 { return; }
+    if depth > 6 {
+        return;
+    }
     for f in &parent_type.fields {
         if f.byte_size == 0 || f.name == "<pointee>" {
             continue;
         }
         let faddr = parent_base + f.byte_offset;
         let fi = *fi_counter;
-        if fi == u16::MAX { return; }
+        if fi == u16::MAX {
+            return;
+        }
         *fi_counter = fi + 1;
         let fid = NodeId::Field(gi, fi);
         let qualified = format!("{}.{}", parent_name, f.name);
@@ -448,6 +569,7 @@ pub struct WarmScanStats {
 }
 
 // BFS over /proc/<pid>/mem from global roots. stamps cold pointers missed by DBI.
+#[allow(clippy::too_many_arguments)]
 pub fn warm_scan(
     info: &DwarfInfo,
     pid: u32,
@@ -465,19 +587,36 @@ pub fn warm_scan(
     let mut queue: VecDeque<(u64, TypeInfo, String, u32)> = VecDeque::new();
 
     for g in &info.globals {
-        if stats.reads >= max_reads { break; }
+        if stats.reads >= max_reads {
+            break;
+        }
         let base = g.addr.wrapping_add(delta);
         stats.globals_scanned += 1;
         scan_ptr_fields(
-            &mem, base, &g.type_info, &g.name, 1,
-            &mut queue, &mut stats, heap_oracle, &info.type_registry, topo, max_reads,
+            &mem,
+            base,
+            &g.type_info,
+            &g.name,
+            1,
+            &mut queue,
+            &mut stats,
+            heap_oracle,
+            &info.type_registry,
+            topo,
+            max_reads,
         );
     }
 
     while let Some((target_addr, pointee_ti, source_name, depth)) = queue.pop_front() {
-        if stats.reads >= max_reads { break; }
-        if depth > max_depth { continue; }
-        if !visited.insert(target_addr) { continue; }
+        if stats.reads >= max_reads {
+            break;
+        }
+        if depth > max_depth {
+            continue;
+        }
+        if !visited.insert(target_addr) {
+            continue;
+        }
         stats.queue_visits += 1;
         stats.max_depth_reached = stats.max_depth_reached.max(depth);
 
@@ -487,24 +626,41 @@ pub fn warm_scan(
         } else {
             stats.not_heap += 1;
         }
-        if world.stm.stamp_type(target_addr, &pointee_ti, &source_name, 0) {
+        if world
+            .stm
+            .stamp_type(target_addr, &pointee_ti, &source_name, 0)
+        {
             stats.stamps_applied += 1;
             if let Some(ref mut ts) = topo {
                 ts.emit_cold_stamp(
-                    target_addr, &pointee_ti.name, pointee_ti.byte_size,
-                    &source_name, pointee_ti.fields.len(), depth,
+                    target_addr,
+                    &pointee_ti.name,
+                    pointee_ti.byte_size,
+                    &source_name,
+                    pointee_ti.fields.len(),
+                    depth,
                 );
             }
         }
         scan_ptr_fields(
-            &mem, target_addr, &pointee_ti, &source_name, depth + 1,
-            &mut queue, &mut stats, heap_oracle, &info.type_registry, topo, max_reads,
+            &mem,
+            target_addr,
+            &pointee_ti,
+            &source_name,
+            depth + 1,
+            &mut queue,
+            &mut stats,
+            heap_oracle,
+            &info.type_registry,
+            topo,
+            max_reads,
         );
     }
 
     Ok(stats)
 }
 
+#[allow(clippy::only_used_in_recursion, clippy::too_many_arguments)]
 fn scan_ptr_fields(
     mem: &File,
     base: u64,
@@ -519,8 +675,12 @@ fn scan_ptr_fields(
     max_reads: u64,
 ) {
     for f in &ti.fields {
-        if stats.reads >= max_reads { return; }
-        if f.name == "<pointee>" { continue; }
+        if stats.reads >= max_reads {
+            return;
+        }
+        if f.name == "<pointee>" {
+            continue;
+        }
         let faddr = base.wrapping_add(f.byte_offset);
         if f.type_info.is_pointer && f.byte_size == 8 {
             let mut buf = [0u8; 8];
@@ -528,14 +688,19 @@ fn scan_ptr_fields(
                 Ok(8) => {
                     stats.reads += 1;
                     let ptr = u64::from_le_bytes(buf);
-                    if ptr == 0 { stats.null_ptrs += 1; continue; }
+                    if ptr == 0 {
+                        stats.null_ptrs += 1;
+                        continue;
+                    }
                     let pointee_name = f.type_info.name.strip_prefix('*').unwrap_or("");
                     let qualified = format!("{}.{}", source, f.name);
-                    let pointee_ti_opt = type_registry.get(pointee_name)
-                        .cloned()
-                        .or_else(|| f.type_info.fields.iter()
+                    let pointee_ti_opt = type_registry.get(pointee_name).cloned().or_else(|| {
+                        f.type_info
+                            .fields
+                            .iter()
                             .find(|sf| sf.name == "<pointee>")
-                            .map(|sf| sf.type_info.clone()));
+                            .map(|sf| sf.type_info.clone())
+                    });
                     match pointee_ti_opt {
                         Some(pointee_ti) if pointee_ti.byte_size > 0 => {
                             if let Some(ref mut ts) = topo {
@@ -544,19 +709,27 @@ fn scan_ptr_fields(
                             queue.push_back((ptr, pointee_ti, qualified, depth));
                             stats.enqueued += 1;
                         }
-                        _ => { stats.missing_pointee_ti += 1; }
+                        _ => {
+                            stats.missing_pointee_ti += 1;
+                        }
                     }
                 }
                 Ok(_) | Err(_) => stats.read_errors += 1,
             }
-        } else if !f.type_info.is_pointer && !f.type_info.fields.is_empty() {
-            if depth <= 6 {
-                scan_ptr_fields(
-                    mem, faddr, &f.type_info,
-                    &format!("{}.{}", source, f.name),
-                    depth, queue, stats, heap_oracle, type_registry, topo, max_reads,
-                );
-            }
+        } else if !f.type_info.is_pointer && !f.type_info.fields.is_empty() && depth <= 6 {
+            scan_ptr_fields(
+                mem,
+                faddr,
+                &f.type_info,
+                &format!("{}.{}", source, f.name),
+                depth + 1,
+                queue,
+                stats,
+                heap_oracle,
+                type_registry,
+                topo,
+                max_reads,
+            );
         }
     }
 }
@@ -612,22 +785,45 @@ mod tests {
 
         let ev = make_bb_entry_event(0xABCD);
         let accepted = process_event(
-            &ev, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
-            &mut stacks, &mut next_frame_id, &mut relocation_delta,
-            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
-            &mut heap_oracle, &mut topo,
+            &ev,
+            0,
+            &orch,
+            &mut world,
+            &mut addr_index,
+            &mut dwarf_info,
+            &mut stacks,
+            &mut next_frame_id,
+            &mut relocation_delta,
+            &mut returned_frames,
+            &mut shadow_regs,
+            &mut heap_graph,
+            &mut heap_oracle,
+            &mut topo,
         );
-        assert!(accepted, "BB_ENTRY must return true, not fall through to _ => false");
+        assert!(
+            accepted,
+            "BB_ENTRY must return true, not fall through to _ => false"
+        );
         assert_eq!(world.insn_counter(), 1);
         assert_eq!(world.bb_hits[&0xABCD], 1);
 
         // second hit to same BB
         let ev2 = make_bb_entry_event(0xABCD);
         let accepted2 = process_event(
-            &ev2, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
-            &mut stacks, &mut next_frame_id, &mut relocation_delta,
-            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
-            &mut heap_oracle, &mut topo,
+            &ev2,
+            0,
+            &orch,
+            &mut world,
+            &mut addr_index,
+            &mut dwarf_info,
+            &mut stacks,
+            &mut next_frame_id,
+            &mut relocation_delta,
+            &mut returned_frames,
+            &mut shadow_regs,
+            &mut heap_graph,
+            &mut heap_oracle,
+            &mut topo,
         );
         assert!(accepted2);
         assert_eq!(world.insn_counter(), 2);
@@ -636,10 +832,20 @@ mod tests {
         // different BB
         let ev3 = make_bb_entry_event(0x1234);
         process_event(
-            &ev3, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
-            &mut stacks, &mut next_frame_id, &mut relocation_delta,
-            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
-            &mut heap_oracle, &mut topo,
+            &ev3,
+            0,
+            &orch,
+            &mut world,
+            &mut addr_index,
+            &mut dwarf_info,
+            &mut stacks,
+            &mut next_frame_id,
+            &mut relocation_delta,
+            &mut returned_frames,
+            &mut shadow_regs,
+            &mut heap_graph,
+            &mut heap_oracle,
+            &mut topo,
         );
         assert_eq!(world.bb_hits.len(), 2);
         assert_eq!(world.bb_hits[&0x1234], 1);
@@ -670,10 +876,20 @@ mod tests {
             rip_lo: 0,
         };
         let accepted = process_event(
-            &ev, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
-            &mut stacks, &mut next_frame_id, &mut relocation_delta,
-            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
-            &mut heap_oracle, &mut topo,
+            &ev,
+            0,
+            &orch,
+            &mut world,
+            &mut addr_index,
+            &mut dwarf_info,
+            &mut stacks,
+            &mut next_frame_id,
+            &mut relocation_delta,
+            &mut returned_frames,
+            &mut shadow_regs,
+            &mut heap_graph,
+            &mut heap_oracle,
+            &mut topo,
         );
         assert!(accepted, "EVENT_READ must be accepted");
         assert_eq!(world.insn_counter(), 1, "read must increment insn_counter");
@@ -696,10 +912,20 @@ mod tests {
 
         let ev = make_unknown_event();
         let accepted = process_event(
-            &ev, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
-            &mut stacks, &mut next_frame_id, &mut relocation_delta,
-            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
-            &mut heap_oracle, &mut topo,
+            &ev,
+            0,
+            &orch,
+            &mut world,
+            &mut addr_index,
+            &mut dwarf_info,
+            &mut stacks,
+            &mut next_frame_id,
+            &mut relocation_delta,
+            &mut returned_frames,
+            &mut shadow_regs,
+            &mut heap_graph,
+            &mut heap_oracle,
+            &mut topo,
         );
         assert!(!accepted, "unknown kind must return false");
         assert_eq!(world.insn_counter(), 0);

@@ -28,10 +28,16 @@ impl Annotations {
         let mut field_to_group = HashMap::new();
         for (i, line) in contents.lines().enumerate() {
             let line = line.trim();
-            if line.is_empty() || line.starts_with('#') { continue; }
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
             let parts: Vec<&str> = line.splitn(2, '=').collect();
             if parts.len() != 2 {
-                return Err(format!("line {}: expected 'field = group', got '{}'", i + 1, line));
+                return Err(format!(
+                    "line {}: expected 'field = group', got '{}'",
+                    i + 1,
+                    line
+                ));
             }
             field_to_group.insert(parts[0].trim().to_string(), parts[1].trim().to_string());
         }
@@ -41,7 +47,9 @@ impl Annotations {
     // lookup tries exact match, then tries the leaf name (last segment after '.')
     // so "bstate.timeout" matches annotation "timeout" if no dotted key exists.
     fn group_for(&self, field: &str) -> Option<&str> {
-        self.field_to_group.get(field).map(|s| s.as_str())
+        self.field_to_group
+            .get(field)
+            .map(|s| s.as_str())
             .or_else(|| {
                 let leaf = field.rsplit('.').next().unwrap_or(field);
                 self.field_to_group.get(leaf).map(|s| s.as_str())
@@ -55,16 +63,16 @@ impl Annotations {
 
 #[derive(Debug, Clone)]
 struct FieldLayout {
-    name: String,       // dotted path: "bstate.target"
-    offset: u64,        // absolute from struct base
+    name: String, // dotted path: "bstate.target"
+    offset: u64,  // absolute from struct base
     size: u64,
     type_name: String,
     cl_start: u64,
     cl_end: u64,
     // structural intent signals from DWARF
     is_pointer: bool,
-    is_volatile: bool,  // DW_TAG_volatile_type in type chain
-    is_atomic: bool,    // DW_TAG_atomic_type in type chain (C11 _Atomic)
+    is_volatile: bool,   // DW_TAG_volatile_type in type chain
+    is_atomic: bool,     // DW_TAG_atomic_type in type chain (C11 _Atomic)
     has_alignment: bool, // DW_AT_alignment on member — developer intended isolation
 }
 
@@ -90,7 +98,9 @@ fn flatten_fields(
     out: &mut Vec<FieldLayout>,
     depth: u32,
 ) {
-    if depth > 8 { return; }
+    if depth > 8 {
+        return;
+    }
     for f in fields {
         let abs_offset = base_offset + f.byte_offset;
         let path = if prefix.is_empty() {
@@ -115,13 +125,23 @@ fn flatten_fields(
                 has_alignment: f.alignment > 0 && f.alignment >= cl_size,
             });
         } else {
-            flatten_fields(&f.type_info.fields, abs_offset, &path, cl_size, out, depth + 1);
+            flatten_fields(
+                &f.type_info.fields,
+                abs_offset,
+                &path,
+                cl_size,
+                out,
+                depth + 1,
+            );
         }
     }
 }
 
 #[derive(Debug)]
-enum Severity { Warning, Info }
+enum Severity {
+    Warning,
+    Info,
+}
 
 #[derive(Debug)]
 struct Diagnostic {
@@ -150,7 +170,9 @@ fn analyze_struct(
     }
 
     for (&cl, fields) in &cl_fields {
-        if fields.len() < 2 { continue; }
+        if fields.len() < 2 {
+            continue;
+        }
 
         if annotations.has_annotations() {
             let mut groups_on_cl: HashMap<&str, Vec<&str>> = HashMap::new();
@@ -162,7 +184,10 @@ fn analyze_struct(
             if groups_on_cl.len() > 1 {
                 let mut msg = format!(
                     "cacheline {} (bytes {:#x}-{:#x}): {} writer groups collide",
-                    cl, cl * cl_size, (cl + 1) * cl_size - 1, groups_on_cl.len(),
+                    cl,
+                    cl * cl_size,
+                    (cl + 1) * cl_size - 1,
+                    groups_on_cl.len(),
                 );
                 for (group, gfields) in &groups_on_cl {
                     msg.push_str(&format!("\n    group '{}': {}", group, gfields.join(", ")));
@@ -178,20 +203,27 @@ fn analyze_struct(
             // structural intent analysis — three tiers, no keyword guessing.
             //
             // tier 1: volatile/atomic from DWARF qualifiers (ground truth)
-            let hot: Vec<&str> = fields.iter()
+            let hot: Vec<&str> = fields
+                .iter()
                 .filter(|f| f.is_write_hot())
-                .map(|f| f.name.as_str()).collect();
-            let cold: Vec<&str> = fields.iter()
+                .map(|f| f.name.as_str())
+                .collect();
+            let cold: Vec<&str> = fields
+                .iter()
                 .filter(|f| !f.is_write_hot())
-                .map(|f| f.name.as_str()).collect();
+                .map(|f| f.name.as_str())
+                .collect();
             if !hot.is_empty() && !cold.is_empty() {
                 diagnostics.push(Diagnostic {
                     severity: Severity::Warning,
                     cacheline: cl,
                     message: format!(
                         "CL{} ({:#x}-{:#x}): volatile/atomic [{}] shares line with [{}]",
-                        cl, cl * cl_size, (cl + 1) * cl_size - 1,
-                        hot.join(", "), cold.join(", "),
+                        cl,
+                        cl * cl_size,
+                        (cl + 1) * cl_size - 1,
+                        hot.join(", "),
+                        cold.join(", "),
                     ),
                     fields: fields.iter().map(|f| f.name.clone()).collect(),
                 });
@@ -201,12 +233,16 @@ fn analyze_struct(
             // tier 2: alignment-intent violation
             // if any field has cacheline-aligned DW_AT_alignment, everything
             // else on that line is a bug — the developer intended isolation.
-            let aligned: Vec<&str> = fields.iter()
+            let aligned: Vec<&str> = fields
+                .iter()
                 .filter(|f| f.has_alignment)
-                .map(|f| f.name.as_str()).collect();
-            let unaligned: Vec<&str> = fields.iter()
+                .map(|f| f.name.as_str())
+                .collect();
+            let unaligned: Vec<&str> = fields
+                .iter()
                 .filter(|f| !f.has_alignment)
-                .map(|f| f.name.as_str()).collect();
+                .map(|f| f.name.as_str())
+                .collect();
             if !aligned.is_empty() && !unaligned.is_empty() {
                 diagnostics.push(Diagnostic {
                     severity: Severity::Warning,
@@ -230,15 +266,21 @@ fn analyze_struct(
                 lock_kw.iter().any(|kw| lower.contains(kw))
             };
             let has_ptrs = fields.iter().any(|f| f.is_pointer);
-            let scalars: Vec<&str> = fields.iter()
+            let scalars: Vec<&str> = fields
+                .iter()
                 .filter(|f| !f.is_pointer && f.size <= 8)
-                .map(|f| f.name.as_str()).collect();
-            let lock_names: Vec<&str> = fields.iter()
+                .map(|f| f.name.as_str())
+                .collect();
+            let lock_names: Vec<&str> = fields
+                .iter()
                 .filter(|f| is_lock_name(&f.name))
-                .map(|f| f.name.as_str()).collect();
-            let non_lock: Vec<&str> = fields.iter()
+                .map(|f| f.name.as_str())
+                .collect();
+            let non_lock: Vec<&str> = fields
+                .iter()
                 .filter(|f| !is_lock_name(&f.name))
-                .map(|f| f.name.as_str()).collect();
+                .map(|f| f.name.as_str())
+                .collect();
 
             if !lock_names.is_empty() && !non_lock.is_empty() {
                 diagnostics.push(Diagnostic {
@@ -246,15 +288,20 @@ fn analyze_struct(
                     cacheline: cl,
                     message: format!(
                         "CL{} ({:#x}-{:#x}): lock/atomic [{}] shares line with [{}]",
-                        cl, cl * cl_size, (cl + 1) * cl_size - 1,
-                        lock_names.join(", "), non_lock.join(", "),
+                        cl,
+                        cl * cl_size,
+                        (cl + 1) * cl_size - 1,
+                        lock_names.join(", "),
+                        non_lock.join(", "),
                     ),
                     fields: fields.iter().map(|f| f.name.clone()).collect(),
                 });
             } else if has_ptrs && !scalars.is_empty() && scalars.len() < fields.len() {
-                let ptrs: Vec<&str> = fields.iter()
+                let ptrs: Vec<&str> = fields
+                    .iter()
                     .filter(|f| f.is_pointer)
-                    .map(|f| f.name.as_str()).collect();
+                    .map(|f| f.name.as_str())
+                    .collect();
                 diagnostics.push(Diagnostic {
                     severity: Severity::Info,
                     cacheline: cl,
@@ -289,22 +336,35 @@ fn format_layout(
 ) -> String {
     let mut out = format!(
         "struct {} ({} bytes, {} cachelines at {}B/line)\n",
-        type_info.name, type_info.byte_size,
-        (type_info.byte_size + cl_size - 1) / cl_size, cl_size,
+        type_info.name,
+        type_info.byte_size,
+        type_info.byte_size.div_ceil(cl_size),
+        cl_size,
     );
     let mut current_cl: Option<u64> = None;
     for f in layouts {
         let cl = f.offset / cl_size;
         if current_cl != Some(cl) {
-            out.push_str(&format!("  --- cacheline {} ({:#x}) ---\n", cl, cl * cl_size));
+            out.push_str(&format!(
+                "  --- cacheline {} ({:#x}) ---\n",
+                cl,
+                cl * cl_size
+            ));
             current_cl = Some(cl);
         }
-        let group = annotations.group_for(&f.name)
+        let group = annotations
+            .group_for(&f.name)
             .map(|g| format!("  [{}]", g))
             .unwrap_or_default();
         out.push_str(&format!(
             "    {:<40} {:#06x}  CL{}+{:<3}  {:>4}B  {}{}\n",
-            f.name, f.offset, cl, f.offset % cl_size, f.size, f.type_name, group,
+            f.name,
+            f.offset,
+            cl,
+            f.offset % cl_size,
+            f.size,
+            f.type_name,
+            group,
         ));
     }
     out
@@ -317,10 +377,16 @@ fn diff_structs(
     cl_size: u64,
 ) -> Vec<Diagnostic> {
     let mut diagnostics = Vec::new();
-    let old_fields: HashMap<&str, &FieldInfo> =
-        old_info.fields.iter().map(|f| (f.name.as_str(), f)).collect();
-    let new_fields: HashMap<&str, &FieldInfo> =
-        new_info.fields.iter().map(|f| (f.name.as_str(), f)).collect();
+    let old_fields: HashMap<&str, &FieldInfo> = old_info
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
+    let new_fields: HashMap<&str, &FieldInfo> = new_info
+        .fields
+        .iter()
+        .map(|f| (f.name.as_str(), f))
+        .collect();
 
     for (name, new_f) in &new_fields {
         if let Some(old_f) = old_fields.get(name) {
@@ -328,9 +394,12 @@ fn diff_structs(
             let new_cl = new_f.byte_offset / cl_size;
             if old_cl != new_cl {
                 diagnostics.push(Diagnostic {
-                    severity: Severity::Warning, cacheline: new_cl,
-                    message: format!("{}.{} moved CL{} ({:#x}) -> CL{} ({:#x})",
-                        struct_name, name, old_cl, old_f.byte_offset, new_cl, new_f.byte_offset),
+                    severity: Severity::Warning,
+                    cacheline: new_cl,
+                    message: format!(
+                        "{}.{} moved CL{} ({:#x}) -> CL{} ({:#x})",
+                        struct_name, name, old_cl, old_f.byte_offset, new_cl, new_f.byte_offset
+                    ),
                     fields: vec![name.to_string()],
                 });
             }
@@ -340,8 +409,15 @@ fn diff_structs(
         if !old_fields.contains_key(name) {
             let f = new_fields[name];
             diagnostics.push(Diagnostic {
-                severity: Severity::Info, cacheline: f.byte_offset / cl_size,
-                message: format!("{}.{} added at {:#x} (CL{})", struct_name, name, f.byte_offset, f.byte_offset / cl_size),
+                severity: Severity::Info,
+                cacheline: f.byte_offset / cl_size,
+                message: format!(
+                    "{}.{} added at {:#x} (CL{})",
+                    struct_name,
+                    name,
+                    f.byte_offset,
+                    f.byte_offset / cl_size
+                ),
                 fields: vec![name.to_string()],
             });
         }
@@ -349,20 +425,27 @@ fn diff_structs(
     for name in old_fields.keys() {
         if !new_fields.contains_key(name) {
             diagnostics.push(Diagnostic {
-                severity: Severity::Info, cacheline: 0,
+                severity: Severity::Info,
+                cacheline: 0,
                 message: format!("{}.{} removed", struct_name, name),
                 fields: vec![name.to_string()],
             });
         }
     }
     if old_info.byte_size != new_info.byte_size {
-        let old_cls = (old_info.byte_size + cl_size - 1) / cl_size;
-        let new_cls = (new_info.byte_size + cl_size - 1) / cl_size;
+        let old_cls = old_info.byte_size.div_ceil(cl_size);
+        let new_cls = new_info.byte_size.div_ceil(cl_size);
         diagnostics.push(Diagnostic {
-            severity: if new_cls > old_cls { Severity::Warning } else { Severity::Info },
+            severity: if new_cls > old_cls {
+                Severity::Warning
+            } else {
+                Severity::Info
+            },
             cacheline: 0,
-            message: format!("{} size: {} -> {} bytes ({} -> {} CLs)",
-                struct_name, old_info.byte_size, new_info.byte_size, old_cls, new_cls),
+            message: format!(
+                "{} size: {} -> {} bytes ({} -> {} CLs)",
+                struct_name, old_info.byte_size, new_info.byte_size, old_cls, new_cls
+            ),
             fields: Vec::new(),
         });
     }
@@ -383,9 +466,13 @@ fn parse_heatmap(path: &str) -> Result<Vec<HeatEntry>, String> {
     let contents = fs::read_to_string(path).map_err(|e| format!("{}: {}", path, e))?;
     let mut entries = Vec::new();
     for (i, line) in contents.lines().enumerate() {
-        if i == 0 && line.starts_with("type") { continue; } // header
+        if i == 0 && line.starts_with("type") {
+            continue;
+        } // header
         let cols: Vec<&str> = line.split('\t').collect();
-        if cols.len() < 5 { continue; }
+        if cols.len() < 5 {
+            continue;
+        }
         entries.push(HeatEntry {
             type_name: cols[0].to_string(),
             field_name: cols[1].to_string(),
@@ -404,24 +491,28 @@ struct ObservedField {
 }
 
 impl ObservedField {
-    fn is_multi_writer(&self) -> bool { self.threads.len() > 1 }
-    fn total_writes(&self) -> u64 { self.threads.values().sum() }
+    fn is_multi_writer(&self) -> bool {
+        self.threads.len() > 1
+    }
     fn thread_summary(&self) -> String {
         let mut pairs: Vec<_> = self.threads.iter().collect();
         pairs.sort_by(|a, b| b.1.cmp(a.1));
-        pairs.iter().map(|(t, w)| format!("T{}={}", t, w)).collect::<Vec<_>>().join(", ")
+        pairs
+            .iter()
+            .map(|(t, w)| format!("T{}={}", t, w))
+            .collect::<Vec<_>>()
+            .join(", ")
     }
 }
 
 #[derive(Debug)]
-enum DivergenceClass { Confirmed, SilentKiller, FalseAlarm }
+enum DivergenceClass {
+    Confirmed,
+    SilentKiller,
+    FalseAlarm,
+}
 
-fn divergence_report(
-    type_info: &TypeInfo,
-    struct_name: &str,
-    cl_size: u64,
-    heatmap: &[HeatEntry],
-) {
+fn divergence_report(type_info: &TypeInfo, struct_name: &str, cl_size: u64, heatmap: &[HeatEntry]) {
     let mut layouts = Vec::new();
     flatten_fields(&type_info.fields, 0, "", cl_size, &mut layouts, 0);
     layouts.sort_by_key(|f| f.offset);
@@ -429,8 +520,12 @@ fn divergence_report(
     // build observed field map from heatmap, keyed by (field_name, offset)
     let mut observed: HashMap<(String, u64), ObservedField> = HashMap::new();
     for e in heatmap {
-        if e.type_name != struct_name { continue; }
-        let of = observed.entry((e.field_name.clone(), e.field_offset)).or_default();
+        if e.type_name != struct_name {
+            continue;
+        }
+        let of = observed
+            .entry((e.field_name.clone(), e.field_offset))
+            .or_default();
         *of.threads.entry(e.thread_id).or_insert(0) += e.writes;
     }
 
@@ -447,18 +542,26 @@ fn divergence_report(
     let mut silent = 0u32;
     let mut false_alarm = 0u32;
 
-    println!("DIVERGENCE REPORT: {} ({} bytes, {} CLs at {}B)\n",
-        struct_name, type_info.byte_size,
-        (type_info.byte_size + cl_size - 1) / cl_size, cl_size);
+    println!(
+        "DIVERGENCE REPORT: {} ({} bytes, {} CLs at {}B)\n",
+        struct_name,
+        type_info.byte_size,
+        type_info.byte_size.div_ceil(cl_size),
+        cl_size
+    );
 
     for (&cl, fields) in &cl_fields {
-        if fields.len() < 2 { continue; }
+        if fields.len() < 2 {
+            continue;
+        }
 
         // lint prediction: any write-hot or lock-keyword field on this line?
         let lint_flagged = fields.iter().any(|f| {
             f.is_write_hot() || f.has_alignment || {
                 let lower = f.name.to_lowercase();
-                ["lock", "rwlock", "mutex", "atomic", "spinlock"].iter().any(|kw| lower.contains(kw))
+                ["lock", "rwlock", "mutex", "atomic", "spinlock"]
+                    .iter()
+                    .any(|kw| lower.contains(kw))
             }
         });
 
@@ -478,9 +581,18 @@ fn divergence_report(
         let observed_contention = cl_writers.len() > 1;
 
         let class = match (lint_flagged, observed_contention) {
-            (true, true) => { confirmed += 1; DivergenceClass::Confirmed }
-            (false, true) => { silent += 1; DivergenceClass::SilentKiller }
-            (true, false) => { false_alarm += 1; DivergenceClass::FalseAlarm }
+            (true, true) => {
+                confirmed += 1;
+                DivergenceClass::Confirmed
+            }
+            (false, true) => {
+                silent += 1;
+                DivergenceClass::SilentKiller
+            }
+            (true, false) => {
+                false_alarm += 1;
+                DivergenceClass::FalseAlarm
+            }
             (false, false) => continue,
         };
 
@@ -490,10 +602,22 @@ fn divergence_report(
             DivergenceClass::FalseAlarm => "FALSE ALARM",
         };
 
-        println!("  CL{} ({:#x}-{:#x}): {}", cl, cl * cl_size, (cl + 1) * cl_size - 1, icon);
-        println!("    lint:     {}", if lint_flagged { "flagged" } else { "clean" });
-        println!("    observed: {} writer thread(s), {} total writes",
-            cl_writers.len(), cl_writers.values().sum::<u64>());
+        println!(
+            "  CL{} ({:#x}-{:#x}): {}",
+            cl,
+            cl * cl_size,
+            (cl + 1) * cl_size - 1,
+            icon
+        );
+        println!(
+            "    lint:     {}",
+            if lint_flagged { "flagged" } else { "clean" }
+        );
+        println!(
+            "    observed: {} writer thread(s), {} total writes",
+            cl_writers.len(),
+            cl_writers.values().sum::<u64>()
+        );
         if !hot_fields.is_empty() {
             for (name, of) in &hot_fields {
                 println!("      {}: [{}]", name, of.thread_summary());
@@ -508,10 +632,12 @@ fn divergence_report(
     // (fields written by multiple threads but not on any lint-warning CL)
     let mut orphan_hot: Vec<(&str, u64, &ObservedField)> = Vec::new();
     for ((fname, foff), of) in &observed {
-        if !of.is_multi_writer() { continue; }
+        if !of.is_multi_writer() {
+            continue;
+        }
         let cl = foff / cl_size;
         // check if we already reported this CL
-        let already = cl_fields.get(&cl).map_or(false, |fs| fs.len() >= 2);
+        let already = cl_fields.get(&cl).is_some_and(|fs| fs.len() >= 2);
         if !already {
             orphan_hot.push((fname.as_str(), *foff, of));
         }
@@ -524,8 +650,10 @@ fn divergence_report(
         println!();
     }
 
-    println!("SUMMARY: {} confirmed, {} silent killers, {} false alarms",
-        confirmed, silent, false_alarm);
+    println!(
+        "SUMMARY: {} confirmed, {} silent killers, {} false alarms",
+        confirmed, silent, false_alarm
+    );
     if silent > 0 {
         println!("  silent killers need annotations or volatile/atomic qualifiers");
     }
@@ -539,12 +667,22 @@ fn check_union_overlaps(layouts: &[FieldLayout], cl_size: u64) -> Vec<Diagnostic
         by_offset.entry(f.offset).or_default().push(f);
     }
     for (&offset, fields) in &by_offset {
-        if fields.len() < 2 { continue; }
+        if fields.len() < 2 {
+            continue;
+        }
         let has_hot = fields.iter().any(|f| f.is_write_hot());
         let has_cold = fields.iter().any(|f| !f.is_write_hot());
         if has_hot && has_cold {
-            let hot: Vec<&str> = fields.iter().filter(|f| f.is_write_hot()).map(|f| f.name.as_str()).collect();
-            let cold: Vec<&str> = fields.iter().filter(|f| !f.is_write_hot()).map(|f| f.name.as_str()).collect();
+            let hot: Vec<&str> = fields
+                .iter()
+                .filter(|f| f.is_write_hot())
+                .map(|f| f.name.as_str())
+                .collect();
+            let cold: Vec<&str> = fields
+                .iter()
+                .filter(|f| !f.is_write_hot())
+                .map(|f| f.name.as_str())
+                .collect();
             diagnostics.push(Diagnostic {
                 severity: Severity::Warning,
                 cacheline: offset / cl_size,
@@ -594,13 +732,10 @@ fn main() {
             }
             "--cacheline" => {
                 i += 1;
-                cl_size = args
-                    .get(i)
-                    .and_then(|s| s.parse().ok())
-                    .unwrap_or_else(|| {
-                        eprintln!("--cacheline requires a numeric value");
-                        process::exit(1);
-                    });
+                cl_size = args.get(i).and_then(|s| s.parse().ok()).unwrap_or_else(|| {
+                    eprintln!("--cacheline requires a numeric value");
+                    process::exit(1);
+                });
             }
             "--annotations" => {
                 i += 1;
@@ -662,7 +797,7 @@ fn main() {
         println!("{} struct types found in {}:", types.len(), binary);
         println!();
         for (name, ti) in &types {
-            let n_cls = (ti.byte_size + cl_size - 1) / cl_size;
+            let n_cls = ti.byte_size.div_ceil(cl_size);
             println!(
                 "  {:<50} {:>6}B  {:>2} fields  {:>2} CLs",
                 name,
@@ -703,7 +838,10 @@ fn main() {
 
         let diags = diff_structs(old_type, new_type, &sname, cl_size);
         print_diagnostics(&diags, json_output);
-        let warnings = diags.iter().filter(|d| matches!(d.severity, Severity::Warning)).count();
+        let warnings = diags
+            .iter()
+            .filter(|d| matches!(d.severity, Severity::Warning))
+            .count();
         if warnings > 0 {
             process::exit(1);
         }
@@ -771,7 +909,10 @@ fn main() {
                     .filter(|k| k.to_lowercase().contains(&sname.to_lowercase()))
                     .collect();
                 if matches.is_empty() {
-                    eprintln!("struct '{}' not found. use --list to see available types.", sname);
+                    eprintln!(
+                        "struct '{}' not found. use --list to see available types.",
+                        sname
+                    );
                     process::exit(1);
                 } else {
                     eprintln!("struct '{}' not found. did you mean:", sname);
@@ -841,7 +982,11 @@ fn print_diagnostics_json(diags: &[Diagnostic]) {
             Severity::Info => "info",
         };
         let fields_json: Vec<String> = d.fields.iter().map(|f| format!("\"{}\"", f)).collect();
-        let msg_escaped = d.message.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n");
+        let msg_escaped = d
+            .message
+            .replace('\\', "\\\\")
+            .replace('"', "\\\"")
+            .replace('\n', "\\n");
         println!(
             "  {{\"severity\":\"{}\",\"cacheline\":{},\"message\":\"{}\",\"fields\":[{}]}}{}",
             severity,

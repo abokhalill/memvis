@@ -9,9 +9,9 @@ use memvis::dwarf::{self, DwarfInfo};
 use memvis::heap_graph::{HeapGraph, HeapOracle};
 use memvis::index::{AddressIndex, FrameId, NodeId};
 use memvis::reconciler::{self, EVENT_CALL, EVENT_REG_SNAPSHOT};
+use memvis::record::{EventPlayer, EventRecorder};
 use memvis::ring::{Event, RingOrchestrator};
 use memvis::shadow_regs::ShadowRegisterFile;
-use memvis::record::{EventPlayer, EventRecorder};
 use memvis::topology::TopologyStream;
 use memvis::tui::{self, AppState, JournalEntry};
 use memvis::world::{ShadowStack, SnapshotRing, WorldState};
@@ -19,7 +19,15 @@ use memvis::world::{ShadowStack, SnapshotRing, WorldState};
 // process_event and populate_globals are in memvis::reconciler (library crate).
 // this file is just a thin CLI shell over the library.
 
-fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
+fn run(
+    mut orch: RingOrchestrator,
+    mut dwarf_info: Option<DwarfInfo>,
+    once: bool,
+    min_events: u64,
+    record_path: Option<String>,
+    topo_path: Option<String>,
+    heatmap_path: Option<String>,
+) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
     let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
@@ -39,31 +47,33 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool
         heap_graph.init_candidates(info);
     }
 
-    let mut recorder: Option<EventRecorder> = record_path.as_ref().and_then(|p| {
-        match EventRecorder::create(std::path::Path::new(p)) {
-            Ok(r) => {
-                eprintln!("memvis: recording to {}", p);
-                Some(r)
-            }
-            Err(e) => {
-                eprintln!("memvis: failed to create recording: {}", e);
-                None
-            }
-        }
-    });
+    let mut recorder: Option<EventRecorder> =
+        record_path
+            .as_ref()
+            .and_then(|p| match EventRecorder::create(std::path::Path::new(p)) {
+                Ok(r) => {
+                    eprintln!("memvis: recording to {}", p);
+                    Some(r)
+                }
+                Err(e) => {
+                    eprintln!("memvis: failed to create recording: {}", e);
+                    None
+                }
+            });
 
-    let mut topo: Option<TopologyStream> = topo_path.as_ref().and_then(|p| {
-        match TopologyStream::create(std::path::Path::new(p)) {
-            Ok(t) => {
-                eprintln!("memvis: topology stream → {}", p);
-                Some(t)
-            }
-            Err(e) => {
-                eprintln!("memvis: failed to create topology stream: {}", e);
-                None
-            }
-        }
-    });
+    let mut topo: Option<TopologyStream> =
+        topo_path
+            .as_ref()
+            .and_then(|p| match TopologyStream::create(std::path::Path::new(p)) {
+                Ok(t) => {
+                    eprintln!("memvis: topology stream → {}", p);
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("memvis: failed to create topology stream: {}", e);
+                    None
+                }
+            });
 
     if once {
         run_headless(
@@ -85,7 +95,14 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool
             &mut topo,
         );
         if let Some(ref mut ts) = topo {
-            ts.emit_summary(total, world.node_count(), world.edge_count(), world.stm.len(), world.heap_allocs.live_count(), world.hazards.len());
+            ts.emit_summary(
+                total,
+                world.node_count(),
+                world.edge_count(),
+                world.stm.len(),
+                world.heap_allocs.live_count(),
+                world.hazards.len(),
+            );
         }
         if let Some(rec) = recorder {
             match rec.finish() {
@@ -144,7 +161,9 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool
             while tick_events < TICK_BUDGET {
                 batch_buf.clear();
                 let got = orch.batch_drain(4096, &mut batch_buf);
-                if got == 0 { break; }
+                if got == 0 {
+                    break;
+                }
                 tick_events += got;
 
                 let mut i = 0;
@@ -155,12 +174,18 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool
                     // snapshots live fully inside batch_buf; ring side pop_n raced.
                     if ev_kind == EVENT_REG_SNAPSHOT {
                         let slice_end = (i + 7).min(batch_buf.len());
-                        let mut events7: [memvis::ring::Event; 7] = [memvis::ring::Event::zero(); 7];
+                        let mut events7: [memvis::ring::Event; 7] =
+                            [memvis::ring::Event::zero(); 7];
                         let take = slice_end - i;
-                        for s in 0..take { events7[s] = batch_buf[i + s].1; }
+                        for s in 0..take {
+                            events7[s] = batch_buf[i + s].1;
+                        }
                         let consumed = reconciler::apply_reg_snapshot(
-                            &events7[..take], &mut world, &mut shadow_regs,
-                        ).max(1);
+                            &events7[..take],
+                            &mut world,
+                            &mut shadow_regs,
+                        )
+                        .max(1);
                         if let Some(ref mut rec) = recorder {
                             let _ = rec.record_reg_snapshot(&ev, &world.regs());
                         }
@@ -234,10 +259,19 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool
             }
             orch.update_backpressure();
 
-            if tick_events == 0 { warm_idle_rounds += 1; } else { warm_idle_rounds = 0; }
-            if !warm_scan_done && relocation_delta.is_some() && total > 2_000_000 && warm_idle_rounds >= 10 {
+            if tick_events == 0 {
+                warm_idle_rounds += 1;
+            } else {
+                warm_idle_rounds = 0;
+            }
+            if !warm_scan_done
+                && relocation_delta.is_some()
+                && total > 2_000_000
+                && warm_idle_rounds >= 10
+            {
                 if let (Some(ref info), Some(pid), Some(delta)) =
-                    (&dwarf_info, orch.target_pid(), relocation_delta) {
+                    (&dwarf_info, orch.target_pid(), relocation_delta)
+                {
                     match reconciler::warm_scan(info, pid, delta, &mut world, &heap_oracle, &mut topo, 10_000, 8) {
                         Ok(s) => eprintln!(
                             "memvis: warm-scan: globals={} reads={} null={} missing_ti={} enqueued={} stamps={} depth={} errors={} not_heap={}",
@@ -294,7 +328,14 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool
     }
 
     if let Some(ref mut ts) = topo {
-        ts.emit_summary(total, world.node_count(), world.edge_count(), world.stm.len(), world.heap_allocs.live_count(), world.hazards.len());
+        ts.emit_summary(
+            total,
+            world.node_count(),
+            world.edge_count(),
+            world.stm.len(),
+            world.heap_allocs.live_count(),
+            world.hazards.len(),
+        );
     }
     if let Some(rec) = recorder {
         match rec.finish() {
@@ -352,7 +393,9 @@ fn run_headless(
         while tick_events < HEADLESS_BUDGET {
             batch_buf.clear();
             let got = orch.batch_drain(4096, &mut batch_buf);
-            if got == 0 { break; }
+            if got == 0 {
+                break;
+            }
             tick_events += got;
             drained += got;
 
@@ -365,10 +408,11 @@ fn run_headless(
                     let slice_end = (i + 7).min(batch_buf.len());
                     let mut events7: [memvis::ring::Event; 7] = [memvis::ring::Event::zero(); 7];
                     let take = slice_end - i;
-                    for s in 0..take { events7[s] = batch_buf[i + s].1; }
-                    let consumed = reconciler::apply_reg_snapshot(
-                        &events7[..take], world, shadow_regs,
-                    ).max(1);
+                    for s in 0..take {
+                        events7[s] = batch_buf[i + s].1;
+                    }
+                    let consumed =
+                        reconciler::apply_reg_snapshot(&events7[..take], world, shadow_regs).max(1);
                     if let Some(ref mut rec) = recorder {
                         let _ = rec.record_reg_snapshot(&ev, &world.regs());
                     }
@@ -430,7 +474,19 @@ fn run_headless(
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && idle_rounds >= 50 {
                 let snap = world.snapshot();
-                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, journal, *total, orch, heap_graph);
+                headless_render(
+                    &mut out,
+                    &snap,
+                    &world.cl_tracker,
+                    &world.stm,
+                    &world.heap_allocs,
+                    &world.hazards,
+                    &world.field_heatmap,
+                    journal,
+                    *total,
+                    orch,
+                    heap_graph,
+                );
                 let _ = out.flush();
                 return;
             }
@@ -446,9 +502,15 @@ fn run_headless(
             world.cl_tracker_tick();
         }
 
-        if !warm_scan_done && relocation_delta.is_some() && *total > 2_000_000 && drained == 0 && idle_rounds >= 10 {
+        if !warm_scan_done
+            && relocation_delta.is_some()
+            && *total > 2_000_000
+            && drained == 0
+            && idle_rounds >= 10
+        {
             if let (Some(ref info), Some(pid), Some(delta)) =
-                (&*dwarf_info, orch.target_pid(), *relocation_delta) {
+                (&*dwarf_info, orch.target_pid(), *relocation_delta)
+            {
                 match reconciler::warm_scan(info, pid, delta, world, heap_oracle, recorder_topo, 10_000, 8) {
                     Ok(s) => eprintln!(
                         "memvis: warm-scan: globals={} reads={} null={} missing_ti={} enqueued={} stamps={} depth={} errors={} not_heap={}",
@@ -467,6 +529,7 @@ fn run_headless(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn headless_render(
     out: &mut impl std::io::Write,
     world: &memvis::world::WorldInner,
@@ -529,7 +592,9 @@ fn headless_render(
         addr_names.insert(n.addr, n.name.clone());
     }
     let resolve = |val: u64| -> String {
-        if val == 0 { return String::new(); }
+        if val == 0 {
+            return String::new();
+        }
         match addr_names.get(&val) {
             Some(name) => format!("  → {}", name),
             None => format!("  → 0x{:x}", val),
@@ -586,8 +651,12 @@ fn headless_render(
         }
     }
 
-    if stm.len() > 0 {
-        let _ = writeln!(out, "\nHEAP TYPES (Shadow Type Map: {} projections)", stm.len());
+    if !stm.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nHEAP TYPES (Shadow Type Map: {} projections)",
+            stm.len()
+        );
         let mut stm_sorted: Vec<_> = stm.iter().collect();
         stm_sorted.sort_by_key(|(addr, _)| *addr);
         for (&base, proj) in &stm_sorted {
@@ -597,7 +666,9 @@ fn headless_render(
                 base, proj.type_info.byte_size, proj.type_info.name, proj.source_name
             );
             for f in &proj.type_info.fields {
-                if f.byte_size == 0 { continue; }
+                if f.byte_size == 0 {
+                    continue;
+                }
                 let fa = base + f.byte_offset;
                 let ptr_tag = if f.type_info.is_pointer {
                     if let Some(tgt) = stm.lookup(fa) {
@@ -618,7 +689,11 @@ fn headless_render(
     }
 
     if !heap_allocs.size_mismatches.is_empty() {
-        let _ = writeln!(out, "\n⚠ HEAP SIZE MISMATCHES ({} detected)", heap_allocs.size_mismatches.len());
+        let _ = writeln!(
+            out,
+            "\n⚠ HEAP SIZE MISMATCHES ({} detected)",
+            heap_allocs.size_mismatches.len()
+        );
         for m in &heap_allocs.size_mismatches {
             let _ = writeln!(
                 out,
@@ -634,24 +709,34 @@ fn headless_render(
         let _ = writeln!(
             out,
             "\nHEAP GRAPH: {} objects, {} typed, {} rescores, {} contradictions",
-            objs.len(), typed, heap_graph.rescores, heap_graph.contradictions
+            objs.len(),
+            typed,
+            heap_graph.rescores,
+            heap_graph.contradictions
         );
         for obj in objs.values().filter(|o| o.inferred_type.is_some()) {
             let _ = writeln!(
                 out,
                 "  {:>12x}  {:>4}B  {:<30} conf={:.2}  fields={}  writes={}",
-                obj.base_addr, obj.inferred_size,
+                obj.base_addr,
+                obj.inferred_size,
                 obj.inferred_type.as_deref().unwrap_or("?"),
                 obj.type_confidence,
                 obj.fields.len(),
-                obj.fields.values().map(|f| f.write_count as u64).sum::<u64>(),
+                obj.fields
+                    .values()
+                    .map(|f| f.write_count as u64)
+                    .sum::<u64>(),
             );
         }
     }
 
     if !hazards.is_empty() {
         use memvis::world::HazardKind;
-        let oob = hazards.iter().filter(|h| matches!(h.kind, HazardKind::OutOfBounds)).count();
+        let oob = hazards
+            .iter()
+            .filter(|h| matches!(h.kind, HazardKind::OutOfBounds))
+            .count();
         let hole = hazards.len() - oob;
         let _ = writeln!(out, "\n🛑 HEAP HAZARDS ({} OOB, {} heap-hole)", oob, hole);
         for h in hazards {
@@ -665,11 +750,18 @@ fn headless_render(
                     let _ = writeln!(
                         out,
                         "  OOB  0x{:x} +{}B exceeds alloc [0x{:x}..+{}] by {}B{}",
-                        h.write_addr, h.write_size, h.alloc_base, h.alloc_size, h.overflow_bytes, sym
+                        h.write_addr,
+                        h.write_size,
+                        h.alloc_base,
+                        h.alloc_size,
+                        h.overflow_bytes,
+                        sym
                     );
                 }
                 HazardKind::HeapHole => {
-                    let sym = h.type_name.as_ref()
+                    let sym = h
+                        .type_name
+                        .as_ref()
                         .map(|t| format!(" (stale {} projection)", t))
                         .unwrap_or_default();
                     let _ = writeln!(
@@ -683,9 +775,16 @@ fn headless_render(
     }
 
     // field heatmap: top writes + contention report
-    if field_heatmap.len() > 0 {
-        let _ = writeln!(out, "\n FIELD WRITE HEATMAP ({} distinct entries)", field_heatmap.len());
-        let _ = writeln!(out, "  Top 20 hottest fields (thread, type.field, offset, writes):");
+    if !field_heatmap.is_empty() {
+        let _ = writeln!(
+            out,
+            "\n FIELD WRITE HEATMAP ({} distinct entries)",
+            field_heatmap.len()
+        );
+        let _ = writeln!(
+            out,
+            "  Top 20 hottest fields (thread, type.field, offset, writes):"
+        );
         for (key, count) in field_heatmap.top_entries(20) {
             let _ = writeln!(
                 out,
@@ -695,15 +794,24 @@ fn headless_render(
         }
         let contention = field_heatmap.contention_report(cl_tracker);
         if !contention.is_empty() {
-            let _ = writeln!(out, "\n CROSS-THREAD FIELD CONTENTION ({} fields written by multiple threads):", contention.len());
+            let _ = writeln!(
+                out,
+                "\n CROSS-THREAD FIELD CONTENTION ({} fields written by multiple threads):",
+                contention.len()
+            );
             for ce in contention.iter().take(20) {
-                let thread_detail: Vec<String> = ce.threads.iter()
+                let thread_detail: Vec<String> = ce
+                    .threads
+                    .iter()
                     .map(|(tid, cnt)| format!("T{}={}", tid, cnt))
                     .collect();
                 let _ = writeln!(
                     out,
                     "    {}.{:<24} +0x{:<4x} total={:<10} [{}]",
-                    ce.type_name, ce.field_name, ce.field_offset, ce.total_writes,
+                    ce.type_name,
+                    ce.field_name,
+                    ce.field_offset,
+                    ce.total_writes,
                     thread_detail.join(", ")
                 );
             }
@@ -711,8 +819,15 @@ fn headless_render(
     }
 
     if field_heatmap.read_len() > 0 {
-        let _ = writeln!(out, "\n FIELD READ HEATMAP ({} distinct entries)", field_heatmap.read_len());
-        let _ = writeln!(out, "  Top 20 hottest reads (thread, type.field, offset, reads):");
+        let _ = writeln!(
+            out,
+            "\n FIELD READ HEATMAP ({} distinct entries)",
+            field_heatmap.read_len()
+        );
+        let _ = writeln!(
+            out,
+            "  Top 20 hottest reads (thread, type.field, offset, reads):"
+        );
         for (key, count) in field_heatmap.top_read_entries(20) {
             let _ = writeln!(
                 out,
@@ -735,7 +850,8 @@ fn headless_render(
             if !seen.insert(key) {
                 continue;
             }
-            let tgt_name = addr_names.get(&edge.ptr_value)
+            let tgt_name = addr_names
+                .get(&edge.ptr_value)
                 .map(|s| s.as_str())
                 .unwrap_or("?");
             let _ = writeln!(
@@ -782,7 +898,11 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
         eprintln!("memvis: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
             Ok(info) => {
-                eprintln!("memvis: {} globals, {} functions", info.globals.len(), info.functions.len());
+                eprintln!(
+                    "memvis: {} globals, {} functions",
+                    info.globals.len(),
+                    info.functions.len()
+                );
                 Some(info)
             }
             Err(e) => {
@@ -799,7 +919,11 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
             return;
         }
     };
-    eprintln!("memvis: replaying {} events from {}", player.event_count(), replay_path);
+    eprintln!(
+        "memvis: replaying {} events from {}",
+        player.event_count(),
+        replay_path
+    );
 
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
@@ -818,18 +942,19 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
     // dummy orchestrator for headless_render (LAG will be 0)
     let orch = RingOrchestrator::new();
 
-    let mut topo: Option<TopologyStream> = topo_path.as_ref().and_then(|p| {
-        match TopologyStream::create(std::path::Path::new(p)) {
-            Ok(t) => {
-                eprintln!("memvis: topology stream → {}", p);
-                Some(t)
-            }
-            Err(e) => {
-                eprintln!("memvis: failed to create topology stream: {}", e);
-                None
-            }
-        }
-    });
+    let mut topo: Option<TopologyStream> =
+        topo_path
+            .as_ref()
+            .and_then(|p| match TopologyStream::create(std::path::Path::new(p)) {
+                Ok(t) => {
+                    eprintln!("memvis: topology stream → {}", p);
+                    Some(t)
+                }
+                Err(e) => {
+                    eprintln!("memvis: failed to create topology stream: {}", e);
+                    None
+                }
+            });
 
     if let Some(ref info) = dwarf_info {
         reconciler::populate_globals(info, 0, &mut addr_index, &mut world);
@@ -845,7 +970,9 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
                 break;
             }
         };
-        if got == 0 { break; }
+        if got == 0 {
+            break;
+        }
 
         let mut need_finalize = false;
         let mut i = 0;
@@ -854,9 +981,9 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
             let ev_kind = ev.kind();
 
             if ev_kind == EVENT_REG_SNAPSHOT {
-                let consumed = reconciler::apply_reg_snapshot(
-                    &event_buf[i..], &mut world, &mut shadow_regs,
-                ).max(1);
+                let consumed =
+                    reconciler::apply_reg_snapshot(&event_buf[i..], &mut world, &mut shadow_regs)
+                        .max(1);
                 total += consumed as u64;
                 world.inc_insn_counter();
                 i += consumed;
@@ -913,7 +1040,14 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
     }
 
     if let Some(ref mut ts) = topo {
-        ts.emit_summary(total, world.node_count(), world.edge_count(), world.stm.len(), world.heap_allocs.live_count(), world.hazards.len());
+        ts.emit_summary(
+            total,
+            world.node_count(),
+            world.edge_count(),
+            world.stm.len(),
+            world.heap_allocs.live_count(),
+            world.hazards.len(),
+        );
     }
     if let Some(ts) = topo {
         match ts.finish() {
@@ -926,7 +1060,19 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
     let snap = world.snapshot();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, &journal, total, &orch, &heap_graph);
+    headless_render(
+        &mut out,
+        &snap,
+        &world.cl_tracker,
+        &world.stm,
+        &world.heap_allocs,
+        &world.hazards,
+        &world.field_heatmap,
+        &journal,
+        total,
+        &orch,
+        &heap_graph,
+    );
     let _ = out.flush();
 }
 
@@ -1020,7 +1166,14 @@ fn install_signal_handlers() {
     }
 }
 
-fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
+fn run_consumer(
+    elf_path: Option<&str>,
+    once: bool,
+    min_events: u64,
+    record_path: Option<String>,
+    topo_path: Option<String>,
+    heatmap_path: Option<String>,
+) {
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
         eprintln!("memvis: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
@@ -1055,7 +1208,15 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
                 eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
-                run(orch, dwarf_info, once, min_events, record_path, topo_path, heatmap_path);
+                run(
+                    orch,
+                    dwarf_info,
+                    once,
+                    min_events,
+                    record_path,
+                    topo_path,
+                    heatmap_path,
+                );
                 return;
             }
         }
@@ -1063,7 +1224,15 @@ fn run_consumer(elf_path: Option<&str>, once: bool, min_events: u64, record_path
     }
 }
 
-fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
+fn launch(
+    target: &str,
+    target_args: &[String],
+    once: bool,
+    min_events: u64,
+    record_path: Option<String>,
+    topo_path: Option<String>,
+    heatmap_path: Option<String>,
+) {
     let drrun = match find_drrun() {
         Some(p) => p,
         None => {
@@ -1120,7 +1289,16 @@ fn launch(target: &str, target_args: &[String], once: bool, min_events: u64, rec
     let target_owned = target.to_string();
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_consumer(Some(&target_owned), once, min_events, record_path, topo_path, heatmap_path))
+        .spawn(move || {
+            run_consumer(
+                Some(&target_owned),
+                once,
+                min_events,
+                record_path,
+                topo_path,
+                heatmap_path,
+            )
+        })
         .expect("memvis: failed to spawn consumer thread");
     let _ = handle.join();
 
@@ -1209,7 +1387,16 @@ fn main() {
             .cloned();
         let handle = thread::Builder::new()
             .stack_size(64 * 1024 * 1024)
-            .spawn(move || run_consumer(elf_path.as_deref(), once, min_events, record_path, topo_path, heatmap_path))
+            .spawn(move || {
+                run_consumer(
+                    elf_path.as_deref(),
+                    once,
+                    min_events,
+                    record_path,
+                    topo_path,
+                    heatmap_path,
+                )
+            })
             .expect("memvis: failed to spawn consumer thread");
         let _ = handle.join();
         return;
@@ -1222,7 +1409,12 @@ fn main() {
             skip_next = false;
             continue;
         }
-        if a == "--min-events" || a == "--record" || a == "--replay" || a == "--export-topology" || a == "--export-heatmap" {
+        if a == "--min-events"
+            || a == "--record"
+            || a == "--replay"
+            || a == "--export-topology"
+            || a == "--export-heatmap"
+        {
             skip_next = true;
             continue;
         }
@@ -1245,5 +1437,13 @@ fn main() {
     let target = &args[target_idx];
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(target, &target_args, once, min_events, record_path, topo_path, heatmap_path);
+    launch(
+        target,
+        &target_args,
+        once,
+        min_events,
+        record_path,
+        topo_path,
+        heatmap_path,
+    );
 }

@@ -2,10 +2,10 @@
 pub mod dwarf;
 pub mod heap_graph;
 pub mod index;
-pub mod ring;
-pub mod shadow_regs;
-pub mod tui;
 pub mod reconciler;
 pub mod record;
+pub mod ring;
+pub mod shadow_regs;
 pub mod topology;
+pub mod tui;
 pub mod world;
