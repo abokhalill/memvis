@@ -111,9 +111,14 @@ struct TopologyCheckpoint {
     stamp_count: usize,
     alloc_count: usize,
     hazard_count: usize,
+    heap_objects: usize,
+    heap_typed: usize,
+    heap_rescores: u64,
+    heap_contradictions: u64,
+    heap_type_histogram: BTreeMap<String, u64>,
 }
 
-fn take_checkpoint(seq: u64, world: &WorldState) -> TopologyCheckpoint {
+fn take_checkpoint(seq: u64, world: &WorldState, heap_graph: &HeapGraph) -> TopologyCheckpoint {
     let mut stamps = BTreeSet::new();
     for (_, proj) in world.stm.iter() {
         stamps.insert(CanonicalStamp {
@@ -154,6 +159,16 @@ fn take_checkpoint(seq: u64, world: &WorldState) -> TopologyCheckpoint {
     let alloc_count = world.heap_allocs.live_count();
     let hazard_count = hazards.len();
 
+    let heap_objects = heap_graph.object_count();
+    let objs = heap_graph.objects();
+    let heap_typed = objs.values().filter(|o| o.inferred_type.is_some()).count();
+    let mut heap_type_histogram: BTreeMap<String, u64> = BTreeMap::new();
+    for obj in objs.values() {
+        if let Some(ref tn) = obj.inferred_type {
+            *heap_type_histogram.entry(tn.clone()).or_insert(0) += 1;
+        }
+    }
+
     TopologyCheckpoint {
         seq,
         stamps,
@@ -164,6 +179,11 @@ fn take_checkpoint(seq: u64, world: &WorldState) -> TopologyCheckpoint {
         stamp_count,
         alloc_count,
         hazard_count,
+        heap_objects,
+        heap_typed,
+        heap_rescores: heap_graph.rescores,
+        heap_contradictions: heap_graph.contradictions,
+        heap_type_histogram,
     }
 }
 
@@ -189,6 +209,7 @@ fn replay_to_checkpoints(
 
     if let Some(ref info) = dwarf_info {
         reconciler::populate_globals(info, 0, &mut addr_index, &mut world);
+        heap_graph.init_candidates(info);
     }
 
     let mut checkpoints = Vec::new();
@@ -237,7 +258,7 @@ fn replay_to_checkpoints(
                     addr_index.finalize();
                     need_finalize = false;
                 }
-                checkpoints.push(take_checkpoint(seq, &world));
+                checkpoints.push(take_checkpoint(seq, &world, &heap_graph));
                 next_checkpoint += interval;
             }
             i += 1;
@@ -247,7 +268,7 @@ fn replay_to_checkpoints(
     if need_finalize {
         addr_index.finalize();
     }
-    checkpoints.push(take_checkpoint(seq, &world));
+    checkpoints.push(take_checkpoint(seq, &world, &heap_graph));
     eprintln!("  {} checkpoints, final seq={}", checkpoints.len(), seq);
 
     Ok(checkpoints)
@@ -372,7 +393,32 @@ fn print_steady_state(a: &TopologyCheckpoint, b: &TopologyCheckpoint) {
     eprintln!("  subject:  seq={} stamps={} allocs={} hazards={}",
         b.seq, b.stamp_count, b.alloc_count, b.hazards.len());
 
-    // type histogram delta: immune to discovery order and ASLR
+    eprintln!("  heap graph (baseline): {} objects, {} typed, {} rescores, {} contradictions",
+        a.heap_objects, a.heap_typed, a.heap_rescores, a.heap_contradictions);
+    eprintln!("  heap graph (subject):  {} objects, {} typed, {} rescores, {} contradictions",
+        b.heap_objects, b.heap_typed, b.heap_rescores, b.heap_contradictions);
+
+    {
+        let mut hd: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
+        for (name, &count) in &a.heap_type_histogram {
+            hd.entry(name).or_insert((0, 0)).0 = count as i64;
+        }
+        for (name, &count) in &b.heap_type_histogram {
+            hd.entry(name).or_insert((0, 0)).1 = count as i64;
+        }
+        let mut found = false;
+        for (name, (ca, cb)) in &hd {
+            if ca != cb {
+                if !found { eprintln!("  heap type histogram delta (A vs B):"); found = true; }
+                eprintln!("    {:+6} {:+6}  {}", ca, cb, name);
+            }
+        }
+        if !found && !hd.is_empty() {
+            eprintln!("  heap type histograms identical ({} types)", hd.len());
+        }
+    }
+
+    // STM type histogram delta: immune to discovery order and ASLR
     let mut delta: BTreeMap<&str, (i64, i64)> = BTreeMap::new();
     for (name, &count) in &a.type_histogram {
         delta.entry(name).or_insert((0, 0)).0 = count as i64;
