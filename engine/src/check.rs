@@ -212,6 +212,10 @@ enum Assertion {
     TypeStable { source: String, expected_type: String },
     NoFalseSharing { name_a: String, name_b: String },
     StmProjectionsGt(usize),
+    AllocBeforeStamp,
+    NoUseAfterFree,
+    MonotonicSeq,
+    StampBeforeLink,
 }
 
 fn parse_assertions(path: &str) -> io::Result<Vec<(usize, Assertion)>> {
@@ -281,6 +285,18 @@ fn parse_one(s: &str) -> Option<Assertion> {
         let rest = inner.split_once(',')?.1.trim();
         let expected = extract_plain_quoted(rest)?;
         return Some(Assertion::TypeStable { source, expected_type: expected });
+    }
+    if s == "alloc_before_stamp" {
+        return Some(Assertion::AllocBeforeStamp);
+    }
+    if s == "no_use_after_free" {
+        return Some(Assertion::NoUseAfterFree);
+    }
+    if s == "monotonic_seq" {
+        return Some(Assertion::MonotonicSeq);
+    }
+    if s == "stamp_before_link" {
+        return Some(Assertion::StampBeforeLink);
     }
     // no_false_sharing("X", "Y") - currently checks cacheline distance via stamps
     if s.starts_with("no_false_sharing(") {
@@ -352,6 +368,136 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
                 .collect();
             (ok, format!("type_stable(global(\"{}\"), \"{}\") (seen: {:?})", source, expected_type, actual))
         }
+        Assertion::AllocBeforeStamp => {
+            let alloc_addrs: HashSet<u64> = g.allocs.iter().map(|a| a.addr).collect();
+            let mut violations = 0usize;
+            let mut skipped_non_heap = 0usize;
+            let mut first_violation: Option<(u64, u64)> = None;
+            for s in &g.stamps {
+                if !alloc_addrs.contains(&s.addr) {
+                    skipped_non_heap += 1;
+                    continue;
+                }
+                let has_prior = g.allocs.iter().any(|a| a.addr == s.addr && a.seq <= s.seq);
+                if !has_prior {
+                    violations += 1;
+                    if first_violation.is_none() {
+                        first_violation = Some((s.seq, s.addr));
+                    }
+                }
+            }
+            let msg = if violations == 0 {
+                format!("alloc_before_stamp (all heap stamps have preceding alloc, {} non-heap skipped)", skipped_non_heap)
+            } else {
+                let (seq, addr) = first_violation.unwrap();
+                format!("alloc_before_stamp ({} violations, first at seq={} addr=0x{:x}, {} non-heap skipped)", violations, seq, addr, skipped_non_heap)
+            };
+            (violations == 0, msg)
+        }
+        Assertion::NoUseAfterFree => {
+            let mut freed: HashMap<u64, u64> = HashMap::new();
+            for a in &g.allocs {
+                if a.freed {
+                    freed.insert(a.addr, a.seq);
+                }
+            }
+            let mut violations = 0usize;
+            let mut first_violation: Option<(u64, &str, u64)> = None;
+            for s in &g.stamps {
+                if let Some(&free_seq) = freed.get(&s.addr) {
+                    if s.seq > free_seq {
+                        violations += 1;
+                        if first_violation.is_none() {
+                            first_violation = Some((s.seq, "STAMP", s.addr));
+                        }
+                    }
+                }
+            }
+            for l in &g.links {
+                if let Some(&free_seq) = freed.get(&l.to_addr) {
+                    if l.seq > free_seq {
+                        violations += 1;
+                        if first_violation.is_none() {
+                            first_violation = Some((l.seq, "LINK", l.to_addr));
+                        }
+                    }
+                }
+            }
+            let msg = if violations == 0 {
+                "no_use_after_free (0 violations)".to_string()
+            } else {
+                let (seq, kind, addr) = first_violation.unwrap();
+                format!("no_use_after_free ({} violations, first {} at seq={} addr=0x{:x})", violations, kind, seq, addr)
+            };
+            (violations == 0, msg)
+        }
+        Assertion::MonotonicSeq => {
+            let mut violations = 0usize;
+            let mut last_alloc_seq = 0u64;
+            let mut last_stamp_seq = 0u64;
+            let mut last_link_seq = 0u64;
+            let mut first_violation: Option<(u64, u64, &str)> = None;
+            for a in &g.allocs {
+                if a.seq < last_alloc_seq {
+                    violations += 1;
+                    if first_violation.is_none() {
+                        first_violation = Some((a.seq, last_alloc_seq, "ALLOC"));
+                    }
+                }
+                last_alloc_seq = a.seq;
+            }
+            for s in &g.stamps {
+                if s.seq < last_stamp_seq {
+                    violations += 1;
+                    if first_violation.is_none() {
+                        first_violation = Some((s.seq, last_stamp_seq, "STAMP"));
+                    }
+                }
+                last_stamp_seq = s.seq;
+            }
+            for l in &g.links {
+                if l.seq < last_link_seq {
+                    violations += 1;
+                    if first_violation.is_none() {
+                        first_violation = Some((l.seq, last_link_seq, "LINK"));
+                    }
+                }
+                last_link_seq = l.seq;
+            }
+            let msg = if violations == 0 {
+                "monotonic_seq (all event streams ordered)".to_string()
+            } else {
+                let (seq, prev, kind) = first_violation.unwrap();
+                format!("monotonic_seq ({} violations, first {} seq={} < prev={})", violations, kind, seq, prev)
+            };
+            (violations == 0, msg)
+        }
+        Assertion::StampBeforeLink => {
+            let mut stamp_seqs: HashMap<u64, u64> = HashMap::new();
+            for s in &g.stamps {
+                stamp_seqs.entry(s.addr).or_insert(s.seq);
+            }
+            let mut violations = 0usize;
+            let mut first_violation: Option<(u64, u64)> = None;
+            for l in &g.links {
+                if l.to_addr == 0 { continue; }
+                if let Some(&stamp_seq) = stamp_seqs.get(&l.to_addr) {
+                    if l.seq < stamp_seq {
+                        violations += 1;
+                        if first_violation.is_none() {
+                            first_violation = Some((l.seq, l.to_addr));
+                        }
+                    }
+                }
+            }
+            let msg = if violations == 0 {
+                "stamp_before_link (all link targets stamped before use)".to_string()
+            } else {
+                let (seq, addr) = first_violation.unwrap();
+                format!("stamp_before_link ({} violations, first at seq={} to_addr=0x{:x})", violations, seq, addr)
+            };
+            (violations == 0, msg)
+        }
         Assertion::NoFalseSharing { name_a, name_b } => {
             let addr_a = g.source_targets.get(name_a.as_str()).or_else(|| {
                 g.stamps.iter().find(|s| s.source == *name_a || s.type_name == *name_a).map(|s| &s.addr)
@@ -411,6 +557,11 @@ fn main() {
         eprintln!("  assert max_chain(type(\"node_t\"), \"next\") < 1000");
         eprintln!("  assert type_stable(global(\"g_head\"), \"node\")");
         eprintln!("  assert no_false_sharing(\"counter\", \"lock\")");
+        eprintln!("  # temporal (lifecycle ordering)");
+        eprintln!("  assert alloc_before_stamp");
+        eprintln!("  assert no_use_after_free");
+        eprintln!("  assert monotonic_seq");
+        eprintln!("  assert stamp_before_link");
         process::exit(1);
     }
 
