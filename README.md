@@ -33,16 +33,69 @@ Headless output on a linked-list program after partial free. The freed nodes
 are absent. The surviving 4-node chain was discovered entirely by retrospective
 type reconciliation — no writes occurred after `g_head` was re-pointed.
 
-## Quick start
+## Quick start (native)
+
+Prerequisites: Linux x86-64, Rust 1.74+, CMake 3.7+, a C compiler.
 
 ```sh
-# interactive TUI
-DYNAMORIO_HOME=/path/to/DynamoRIO memvis ./my_program
+# 1. Install DynamoRIO (one-time, ~30s)
+curl -fSL https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-11.91.20552/DynamoRIO-Linux-11.91.20552.tar.gz \
+  | tar -xzC /opt
+export DYNAMORIO_HOME=/opt/DynamoRIO-Linux-11.91.20552
 
-# Docker (no local install)
-docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
-    -v /path/to/my_program:/app/my_program memvis /app/my_program
+# 2. Build memvis (~60s first time)
+cmake -B build -DDynamoRIO_DIR=$DYNAMORIO_HOME/cmake
+cmake --build build -j$(nproc)
+cargo build --release --manifest-path engine/Cargo.toml
+
+# 3. Compile a test target with debug info
+gcc -g examples/heap_chain.c -o heap_chain
+
+# 4. Run it
+./engine/target/release/memvis --once ./heap_chain
 ```
+
+You should see a named memory map with `g_head`, `g_tail`, heap type
+projections, and a 4-node linked list discovered via retrospective type
+reconciliation.
+
+For the interactive TUI (live, 20 Hz refresh), drop `--once`:
+
+```sh
+./engine/target/release/memvis ./heap_chain
+```
+
+## Quick start (Docker)
+
+No local Rust or DynamoRIO install required. You must build the image first
+(there is no published image yet).
+
+```sh
+# 1. Build the image (~3 min first time, cached after)
+DOCKER_BUILDKIT=1 docker build -t memvis .
+
+# 2. Compile a test target on the host (must be x86-64 Linux, -g)
+gcc -g examples/heap_chain.c -o heap_chain
+
+# 3. Run it
+docker run --rm \
+    --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
+    -v $(pwd)/heap_chain:/app/heap_chain \
+    memvis --once /app/heap_chain
+```
+
+`--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required
+for DynamoRIO's process injection. If you see a permission error, these flags
+are missing.
+
+## Troubleshooting
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| `cannot find drrun` | DynamoRIO not installed or `DYNAMORIO_HOME` not set | `export DYNAMORIO_HOME=/path/to/DynamoRIO-Linux-*` |
+| `cannot find libmemvis_tracer.so` | Tracer not built, or running from wrong directory | Build with `cmake --build build` and run from the repo root, or set `MEMVIS_TRACER=/path/to/libmemvis_tracer.so` |
+| Empty output / no events | Target not compiled with `-g` | Recompile with `gcc -g` |
+| Docker permission denied | Missing ptrace capability | Add `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` |
 
 ## Binaries
 
@@ -92,14 +145,16 @@ subsystem.
 
 ```sh
 # tracer (DynamoRIO client)
-cmake -B build -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake
+cmake -B build -DDynamoRIO_DIR=$DYNAMORIO_HOME/cmake
 cmake --build build -j$(nproc)
 
-# engine
+# engine (produces 4 binaries)
 cargo build --release --manifest-path engine/Cargo.toml
 ```
 
-This produces `engine/target/release/{memvis,memvis-lint,memvis-diff,memvis-check}`.
+This produces `engine/target/release/{memvis,memvis-lint,memvis-diff,memvis-check}`
+and `build/libmemvis_tracer.so`. The engine auto-discovers the tracer when run
+from the repo root; override with `MEMVIS_TRACER` if running from elsewhere.
 
 See [USAGE.md](docs/USAGE.md) for the full flag reference, all binary invocations,
 environment variables, and TUI keybindings.

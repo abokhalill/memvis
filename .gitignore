@@ -9,7 +9,7 @@ Makefile
 *.so
 *.dylib
 dynamorio-sdk/
-tests/
+examples/heap_chain
 .vscode/
 .idea/
 *.swp
