@@ -178,7 +178,7 @@ static inline memvis_event_v3_t *memvis_ring_data_v3(memvis_ring_header_t *hdr) 
 }
 
 static inline size_t memvis_shm_size(uint32_t capacity) {
-    return sizeof(memvis_ring_header_t) + (size_t)capacity * sizeof(memvis_event_t);
+    return sizeof(memvis_ring_header_t) + (size_t)capacity * sizeof(memvis_event_v3_t);
 }
 
 static inline int memvis_push_ex_flags(memvis_ring_header_t *ring,
@@ -292,7 +292,7 @@ static inline void memvis_ring_init(memvis_ring_header_t *ring,
     memset(ring, 0, sizeof(memvis_ring_header_t));
     ring->magic         = MEMVIS_MAGIC;
     ring->capacity      = capacity;
-    ring->entry_size    = sizeof(memvis_event_t);
+    ring->entry_size    = sizeof(memvis_event_v3_t);
     ring->flags         = flags;
     ring->proto_version = MEMVIS_PROTO_VERSION;
     atomic_store_explicit(&ring->head, 0, memory_order_relaxed);
