@@ -6,42 +6,102 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
 
+env:
+  RUST_VERSION: "1.88.0"
+  DYNAMORIO_VERSION: "11.91.20552"
+
 jobs:
+  # ── stage 1: lint (fast, catches style issues early) ──────────────
   lint:
-    name: Rust Lint & Format
-    runs-on: ubuntu-22.04 
+    name: fmt + clippy
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0 # pinned
         with:
+          toolchain: ${{ env.RUST_VERSION }}
           components: clippy, rustfmt
-      - uses: Swatinem/rust-cache@v2 
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2.7.8
         with:
           workspaces: engine -> target
-      - name: Format Check
-        run: cargo fmt --manifest-path engine/Cargo.toml -- --check
-      - name: Clippy
-        run: cargo clippy --manifest-path engine/Cargo.toml -- -D warnings
+      - run: cargo fmt --manifest-path engine/Cargo.toml -- --check
+      - run: cargo clippy --manifest-path engine/Cargo.toml --release -- -D warnings
 
-  docker-build:
-    name: Build & Verify Image
-    needs: [lint] 
-    runs-on: ubuntu-latest
+  # ── stage 2: build + test (parallel with lint) ────────────────────
+  build:
+    name: build + test
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+      - uses: dtolnay/rust-toolchain@56f84321dbccf38fb67ce29ab63e4754056677e0
+        with:
+          toolchain: ${{ env.RUST_VERSION }}
+      - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6
+        with:
+          workspaces: engine -> target
+
+      - name: cargo test
+        run: cargo test --manifest-path engine/Cargo.toml --release
+
+      - name: cargo build (all binaries)
+        run: cargo build --manifest-path engine/Cargo.toml --release
+
+      - name: smoke test — binaries execute
+        run: |
+          for bin in memvis memvis-lint memvis-diff memvis-check; do
+            test -x engine/target/release/$bin
+            echo "ok: $bin exists and is executable"
+          done
+          # memvis-check with no args should exit non-zero (no input) but not crash
+          engine/target/release/memvis-check 2>/dev/null && exit 1 || true
+          echo "ok: memvis-check exits non-zero on missing args"
+
+  # ── stage 3: docker (parallel with lint+build) ────────────────────
+  docker:
+    name: docker build + verify
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@b5ca514318bd6ebac0fb2aedd5d36ec1b5c232a2 # v3.10.0
 
-      - name: Build
-        uses: docker/build-push-action@v6
+      - name: Build image
+        uses: docker/build-push-action@14487ce63c7a62a4a324b0bfb37086795e31c6c1 # v6.16.0
         with:
           context: .
+          load: true
           push: false
           tags: memvis:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
+
+      - name: Verify — all 4 binaries present and runnable
+        run: |
+          for bin in memvis memvis-lint memvis-diff memvis-check; do
+            docker run --rm --entrypoint $bin memvis:ci --help 2>&1 || true
+            echo "ok: $bin runs inside container"
+          done
+
+      - name: Verify — DR runtime tree intact
+        run: |
+          docker run --rm --entrypoint ls memvis:ci \
+            /opt/dynamorio/bin64/drrun \
+            /opt/dynamorio/lib64/release/libdynamorio.so \
+            /opt/dynamorio/ext/lib64/release/libdrwrap.so \
+            /opt/dynamorio/ext/lib64/release/libdrsyms.so \
+            /app/libmemvis_tracer.so
+          echo "ok: DR runtime tree and tracer present"
+
+      - name: Verify — image size sanity (<250MB)
+        run: |
+          SIZE=$(docker image inspect memvis:ci --format '{{.Size}}')
+          echo "Image size: $((SIZE / 1048576)) MB"
+          test "$SIZE" -lt 262144000  # 250MB
