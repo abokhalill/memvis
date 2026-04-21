@@ -3,4 +3,9 @@ build/
 dynamorio-sdk/
 tests/
 .git/
+.github/
 docs/
+analysis/
+gimli-api/
+*.md
+LICENSE
