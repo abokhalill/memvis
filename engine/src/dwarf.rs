@@ -404,11 +404,36 @@ pub struct FunctionMeta {
     pub locals: Vec<LocalVar>,
 }
 
+pub struct CfiTable {
+    entries: Vec<CfiEntry>,
+}
+
+struct CfiEntry {
+    start_pc: u64,
+    end_pc: u64,
+    saved_regs: Vec<usize>,
+}
+
+impl CfiTable {
+    pub fn new() -> Self {
+        Self { entries: Vec::new() }
+    }
+
+    pub fn saved_regs_at(&self, pc: u64) -> Option<&[usize]> {
+        self.entries.iter()
+            .find(|e| pc >= e.start_pc && pc < e.end_pc)
+            .map(|e| e.saved_regs.as_slice())
+    }
+
+    pub fn len(&self) -> usize { self.entries.len() }
+}
+
 pub struct DwarfInfo {
     pub globals: Vec<GlobalVar>,
     pub functions: BTreeMap<u64, FunctionMeta>,
-    pub elf_base_vaddr: u64, // lowest PT_LOAD vaddr (0 for PIE)
+    pub elf_base_vaddr: u64,
     pub type_registry: HashMap<String, TypeInfo>,
+    pub cfi: CfiTable,
 }
 
 impl DwarfInfo {
@@ -571,12 +596,93 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         }
     }
 
+    let cfi = parse_eh_frame(&obj);
+    if cfi.len() > 0 {
+        eprintln!("dwarf: {} CFI entries from .eh_frame", cfi.len());
+    }
+
     Ok(DwarfInfo {
         globals,
         functions,
         elf_base_vaddr,
         type_registry,
+        cfi,
     })
+}
+
+fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
+    use gimli::UnwindSection;
+
+    let eh_data = match obj.section_by_name(".eh_frame").and_then(|s| s.data().ok()) {
+        Some(d) => d,
+        None => return CfiTable::new(),
+    };
+    let eh: gimli::EhFrame<R<'_>> = gimli::EhFrame::new(eh_data, LittleEndian);
+    let bases = gimli::BaseAddresses::default()
+        .set_eh_frame(obj.section_by_name(".eh_frame").map(|s| s.address()).unwrap_or(0));
+
+    let mut result_entries = Vec::new();
+    let mut cies: HashMap<gimli::EhFrameOffset<usize>, gimli::CommonInformationEntry<R<'_>>> = HashMap::new();
+    let mut ctx = gimli::UnwindContext::new();
+    let mut iter = eh.entries(&bases);
+
+    loop {
+        let entry = match iter.next() {
+            Ok(Some(e)) => e,
+            Ok(None) => break,
+            Err(_) => break,
+        };
+        match entry {
+            gimli::CieOrFde::Cie(cie) => {
+                let off = cie.offset();
+                cies.insert(gimli::EhFrameOffset(off), cie);
+            }
+            gimli::CieOrFde::Fde(partial) => {
+                let fde = match partial.parse(|_section, _bases, offset| {
+                    cies.get(&offset).cloned()
+                        .ok_or(gimli::Error::NoEntryAtGivenOffset)
+                }) {
+                    Ok(f) => f,
+                    Err(_) => continue,
+                };
+
+                let start = fde.initial_address();
+                let end = start + fde.len();
+                let mut saved = Vec::new();
+
+                let mut table = match fde.rows(&eh, &bases, &mut ctx) {
+                    Ok(t) => t,
+                    Err(_) => continue,
+                };
+                let mut last_row = None;
+                loop {
+                    match table.next_row() {
+                        Ok(Some(row)) => { last_row = Some(row.clone()); }
+                        _ => break,
+                    }
+                }
+                if let Some(row) = last_row {
+                    for dwarf_reg in 0u16..17 {
+                        let reg = gimli::Register(dwarf_reg);
+                        match row.register(reg) {
+                            gimli::RegisterRule::Offset(_) |
+                            gimli::RegisterRule::ValOffset(_) => {
+                                if let Some(idx) = DWARF_TO_REGFILE.get(dwarf_reg as usize).copied().flatten() {
+                                    saved.push(idx);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                if !saved.is_empty() {
+                    result_entries.push(CfiEntry { start_pc: start, end_pc: end, saved_regs: saved });
+                }
+            }
+        }
+    }
+
+    CfiTable { entries: result_entries }
 }
 
 fn op_to_steps(op: &Operation<R<'_>>, steps: &mut Vec<ExprStep>) -> bool {

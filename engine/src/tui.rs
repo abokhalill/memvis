@@ -823,6 +823,7 @@ pub fn draw(
             let bar_str: String = "\u{2588}".repeat(bar_filled) + &"\u{2591}".repeat(bar_empty);
             let conf_color = match conf {
                 Confidence::Observed => Color::Green,
+                Confidence::CfiVerified => Color::LightGreen,
                 Confidence::AbiInferred => Color::Cyan,
                 Confidence::WriteBack => Color::Yellow,
                 Confidence::Speculative => Color::Magenta,

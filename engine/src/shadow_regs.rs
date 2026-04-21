@@ -41,7 +41,8 @@ pub enum Confidence {
     Speculative = 2,
     WriteBack = 3,
     AbiInferred = 4,
-    Observed = 5,
+    CfiVerified = 5,
+    Observed = 6,
 }
 
 impl Confidence {
@@ -52,6 +53,7 @@ impl Confidence {
             Confidence::Speculative => "spec",
             Confidence::WriteBack => "wb",
             Confidence::AbiInferred => "abi",
+            Confidence::CfiVerified => "cfi",
             Confidence::Observed => "obs",
         }
     }
@@ -62,7 +64,8 @@ impl Confidence {
             Confidence::Stale => 2,
             Confidence::Speculative => 5,
             Confidence::WriteBack => 7,
-            Confidence::AbiInferred => 9,
+            Confidence::AbiInferred => 8,
+            Confidence::CfiVerified => 9,
             Confidence::Observed => 10,
         }
     }
@@ -195,6 +198,10 @@ impl ShadowRegisterFile {
         }
     }
 
+    pub fn callee_pc(&self) -> Option<u64> {
+        self.call_stack.last().map(|f| f.callee_pc)
+    }
+
     pub fn on_call(&mut self, callee_pc: u64, rsp: u64, seq: u64) {
         self.call_stack.push(ShadowFrame {
             callee_pc,
@@ -263,6 +270,19 @@ impl ShadowRegisterFile {
                 continue;
             }
             self.regs[idx] = frame.saved_regs[idx].clone();
+        }
+    }
+
+    pub fn on_return_cfi(&mut self, seq: u64, pc: u64, cfi_saved: &[usize]) {
+        self.on_return(seq, pc);
+        for &idx in cfi_saved {
+            if idx < REG_COUNT
+                && CALLEE_SAVED.contains(&idx)
+                && self.regs[idx].confidence >= Confidence::Speculative
+                && self.regs[idx].confidence < Confidence::Observed
+            {
+                self.regs[idx].confidence = Confidence::CfiVerified;
+            }
         }
     }
 
@@ -885,6 +905,34 @@ mod tests {
             Confidence::Stale,
             "4B write to upper half of 8B source must still invalidate"
         );
+    }
+
+    #[test]
+    fn test_cfi_verified_return_promotion() {
+        let mut srf = ShadowRegisterFile::new();
+        // set rbx(1), r12(12), r13(13) to Speculative (simulating partial knowledge)
+        srf.regs[1].set(0xAAAA, Provenance::CalleeSaved { since_seq: 1 }, Confidence::Speculative, 1, 0x1000);
+        srf.regs[12].set(0xBBBB, Provenance::CalleeSaved { since_seq: 1 }, Confidence::Speculative, 1, 0x1000);
+        srf.regs[13].set(0xCCCC, Provenance::CalleeSaved { since_seq: 1 }, Confidence::Speculative, 1, 0x1000);
+
+        // simulate CALL — callee-saved regs promoted to AbiInferred
+        srf.on_call(0x2000, 0x7FFF_0000, 2);
+        assert_eq!(srf.regs[1].confidence, Confidence::AbiInferred);
+        assert_eq!(srf.regs[12].confidence, Confidence::AbiInferred);
+        assert_eq!(srf.regs[13].confidence, Confidence::AbiInferred);
+
+        // return with CFI verifying rbx(1) and r12(12) but NOT r13(13)
+        // on_return restores from saved frame (Speculative), then CFI promotes
+        // But wait: on_return restores callee-saved from frame.saved_regs
+        // which had Speculative. Then on_return_cfi sees Speculative < Observed
+        // and promotes the CFI-verified ones.
+        srf.on_return_cfi(3, 0x1000, &[1, 12]);
+        assert_eq!(srf.regs[1].confidence, Confidence::CfiVerified,
+            "rbx should be CfiVerified");
+        assert_eq!(srf.regs[12].confidence, Confidence::CfiVerified,
+            "r12 should be CfiVerified");
+        assert_eq!(srf.regs[13].confidence, Confidence::Speculative,
+            "r13 not in CFI list, should stay Speculative from frame restore");
     }
 
     #[test]

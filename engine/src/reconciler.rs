@@ -246,7 +246,16 @@ pub fn process_event(
         EVENT_RETURN => {
             {
                 let srf = shadow_regs.entry(ev.thread_id).or_default();
-                srf.on_return(ev.seq32() as u64, ev.addr);
+                if let Some(ref info) = dwarf_info {
+                    let callee_pc = srf.callee_pc();
+                    if let Some(saved) = callee_pc.and_then(|pc| info.cfi.saved_regs_at(pc)) {
+                        srf.on_return_cfi(ev.seq32() as u64, ev.addr, saved);
+                    } else {
+                        srf.on_return(ev.seq32() as u64, ev.addr);
+                    }
+                } else {
+                    srf.on_return(ev.seq32() as u64, ev.addr);
+                }
             }
             let tid = ev.thread_id;
             if let Some(stack) = stacks.get_mut(&tid) {
