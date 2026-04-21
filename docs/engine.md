@@ -74,8 +74,10 @@ tables.
 ### Type resolution
 
 `resolve_type_at` follows `DW_AT_type` through typedefs, const/volatile/atomic
-qualifiers, pointers, structs, unions, and arrays. Peels up to 8 levels of
-indirection. Caps struct field extraction at depth 2.
+qualifiers, pointers, structs, unions, and arrays. Peels up to 16 levels of
+type indirection. Struct field extraction (`extract_struct_fields`) is
+depth-capped at 8 levels. Types whose fields were truncated by the depth cap
+are marked `shallow: true`.
 
 Qualifier tracking: `DW_TAG_volatile_type` and `DW_TAG_atomic_type` set
 `is_volatile` / `is_atomic` on the resolved `TypeInfo` instead of discarding
@@ -89,6 +91,7 @@ pub struct TypeInfo {
     pub is_pointer: bool,
     pub is_volatile: bool,  // DW_TAG_volatile_type in type chain
     pub is_atomic: bool,    // DW_TAG_atomic_type (C11 _Atomic)
+    pub shallow: bool,      // true if fields truncated by depth cap
     pub fields: Vec<FieldInfo>,
 }
 
@@ -107,6 +110,36 @@ After parsing, `register_recursive` builds a `HashMap<String, TypeInfo>`
 mapping struct/union names to their full `TypeInfo`. Only non-empty,
 non-pointer types with `byte_size > 0` are registered. This registry is
 used by the Shadow Type Map and RTR to resolve pointee types at runtime.
+
+Top-level registry entries are resolved at depth 0 and have full field
+trees. The `shallow` flag only appears on field-embedded `TypeInfo` that
+was resolved recursively from a parent struct and hit the depth-8 cap.
+
+### CFI table
+
+`parse_eh_frame` reads the `.eh_frame` section via gimli and builds a
+`CfiTable` — a vector of `CfiEntry` structs, each mapping a PC range
+(`start_pc..end_pc`) to the set of callee-saved register indices preserved
+in that frame. `saved_regs_at(pc)` finds the entry covering a given PC.
+The table is populated during `parse_elf` and stored as `DwarfInfo.cfi`.
+
+### JIT DWARF resolution
+
+On-demand deep type resolution for types marked `shallow: true`. Two
+strategies, applied in order by the reconciler's STM stamp path:
+
+1. **`patch_shallow_fields(ti)`**: walks a `TypeInfo`'s field tree and
+   replaces field-embedded shallow types with their full version from
+   `type_registry`. O(1) per field. Handles the common case where each
+   struct has a top-level DWARF DIE resolved at depth 0 in the registry.
+
+2. **`resolve_deep(type_name)`**: re-reads the ELF from `elf_path` and
+   re-parses the named type with raised depth caps (struct fields: 32,
+   type resolution: 64 via `extract_struct_fields_deep` and
+   `resolve_type_at_deep`). Updates `type_registry` in place. Fallback
+   for types that only exist as nested fields with no standalone DIE.
+
+`DwarfInfo` stores `elf_path: String` to enable on-demand re-parsing.
 
 ### Location tables
 
@@ -223,18 +256,21 @@ Per-thread register tracking with provenance and coherence.
 
 ### Confidence tiers
 
-Each of the 18 tracked registers carries a `Confidence` level:
+Each of the 18 tracked registers carries a `Confidence` level (ordered
+low to high):
 
-| Tier | Label | Source |
-|---|---|---|
-| `Observed` | `OBS` | Direct `REG_SNAPSHOT` from tracer |
-| `AbiInferred` | `ABI` | ABI convention (e.g., return value in RAX) |
-| `WriteBack` | `WB` | Value written back to known memory source |
-| `Speculative` | `SPEC` | Heuristic inference |
-| `Stale` | `STALE` | Invalidated by a memory write to the source |
-| `Unknown` | `???` | No information |
+| Tier | Label | Bar | Source |
+|---|---|---|---|
+| `Unknown` | `???` | 0/10 | No information |
+| `Stale` | `STALE` | 2/10 | Invalidated by a memory write to the source |
+| `Speculative` | `spec` | 5/10 | Heuristic inference |
+| `WriteBack` | `wb` | 7/10 | Value written back to known memory source |
+| `AbiInferred` | `abi` | 8/10 | ABI convention (callee-saved on CALL) |
+| `CfiVerified` | `cfi` | 9/10 | CFI `.eh_frame` confirms register preservation |
+| `Observed` | `obs` | 10/10 | Direct `REG_SNAPSHOT` from tracer |
 
 The TUI renders a 10-segment confidence bar per register with color coding.
+`CfiVerified` is rendered as `LightGreen`.
 
 ### Coherence checking
 
@@ -253,10 +289,19 @@ and same-thread overwrites of spilled register values.
 ### Event handlers
 
 - **`on_snapshot(regs)`**: Sets all 18 registers to `Observed` confidence.
-- **`on_call()`**: Marks caller-saved registers (RAX, RCX, RDX, RSI, RDI,
-  R8-R11) as `Unknown`. Callee-saved registers retain their confidence.
-- **`on_return()`**: Marks RAX as `AbiInferred` (return value). Callee-saved
-  registers retain confidence. Others become `Unknown`.
+- **`on_call(callee_pc, rsp, seq)`**: Pushes a `ShadowFrame` saving all
+  register states. Sets RSP to `Observed`. Promotes callee-saved registers
+  (RBX, RBP, R12-R15) to `AbiInferred`. Marks caller-saved registers
+  (RAX, RCX, RDX, RSI, RDI, R8-R11) as `Speculative`.
+- **`on_return(seq, pc)`**: Pops the `ShadowFrame` and restores callee-saved
+  registers to their pre-call state. Sets RAX to `Speculative` (return
+  value). Restores other caller-saved registers from the saved frame.
+- **`on_return_cfi(seq, pc, cfi_saved)`**: Calls `on_return`, then promotes
+  callee-saved registers that appear in the CFI saved set and have
+  confidence between `Speculative` and `Observed` (exclusive) to
+  `CfiVerified`. This is the CFI-hardened return path.
+- **`callee_pc()`**: Returns the PC of the current top-of-stack callee,
+  used by the reconciler to query `CfiTable.saved_regs_at(pc)`.
 - **`on_reload(reg, value, src_addr, src_size, seq, rip)`**: Sets register
   to `Observed` with known memory source for future coherence checking.
 
@@ -577,10 +622,10 @@ live engine and `memvis-diff`. Contains three public functions:
 
 | Event | Action |
 |---|---|
-| `WRITE` (0) | `cl_tracker.record_write`. `shadow_regs.check_coherence`. If heap: `heap_graph.process_write`, `stm.propagate_field_write` (+ RTR on new stamp), `heap_allocs.check_write_bounds` (Visual ASan, populates `pc` + `reg_snapshot` on hazard). `addr_index.lookup` → `world.update_value` + `world.update_edge`. If pointer to heap: `stm.stamp_type` + RTR scan. |
+| `WRITE` (0) | `cl_tracker.record_write`. `shadow_regs.check_coherence`. If heap: `heap_graph.process_write`, `stm.propagate_field_write` (+ RTR on new stamp), `heap_allocs.check_write_bounds` (Visual ASan, populates `pc` + `reg_snapshot` on hazard). `addr_index.lookup` → `world.update_value` + `world.update_edge`. If pointer to heap: clone type from registry, `patch_shallow_fields`, `stm.stamp_type` + RTR scan. |
 | `READ` (1) | Journal only (no state mutation). |
 | `CALL` (2) | DWARF function lookup (relocated PC). Push shadow frame. Insert locals into index. |
-| `RETURN` (3) | Pop shadow frame. Remove locals. Queue deferred node removal. |
+| `RETURN` (3) | Look up callee PC via `srf.callee_pc()`. If CFI data exists in `DwarfInfo.cfi` for that PC: `srf.on_return_cfi(saved)` (promotes callee-saved to `CfiVerified`). Otherwise: `srf.on_return()`. Pop shadow frame. Remove locals. Queue deferred node removal. |
 | `REG_SNAPSHOT` (5) | Handled by caller via `reconciler::apply_reg_snapshot` over the drained 7-slot run. `process_event`'s arm is a no-op. `ring::consume_batch` enforces snapshot atomicity so the run never straddles a batch. |
 | `CACHE_MISS` (6) | `addr_index.lookup`. Record miss in `cache_heat`. |
 | `MODULE_LOAD` (7) | Compute relocation delta. Re-populate globals with relocated addresses. Register heap oracle module range. |
@@ -832,7 +877,8 @@ likely to cause false-sharing.
 
 Nested structs and unions are recursively expanded into leaf fields with
 dotted paths (e.g., `bstate.timeout`, `pending_cmds.head`). Union variants
-are emitted at the same offset. Depth-capped at 8 to match the DWARF parser.
+are emitted at the same offset. Depth-capped at 8 to match the DWARF
+parser's `extract_struct_fields` cap.
 
 ### Three-tier structural intent analysis
 

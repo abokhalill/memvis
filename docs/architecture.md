@@ -22,7 +22,7 @@ memory, plus offline analysis tools that operate on recorded traces:
  │  per-thread raw TLS       │                │  reconciler.rs  (event dispatch)  │
  │  adaptive backpressure    │                │  record.rs      (recording I/O)   │
  │  tail-call detection      │                │  topology.rs    (JSONL streaming) │
- │  selective reload detect  │                │  dwarf.rs       (DWARF + ELF)     │
+ │  selective reload detect  │                │  dwarf.rs       (DWARF + ELF+CFI) │
  │  allocator hooks (drwrap) │                │  world.rs       (STM, RTR, ASan)  │
  │                           │                │  ring.rs        (SHM consumer)    │
  └───────────────────────────┘                └───────────────────────────────────┘
@@ -72,11 +72,11 @@ modules re-exported from `lib.rs`, with four binary entry points.
 | File | Module | Role |
 |---|---|---|
 | `reconciler.rs` | `reconciler` | Extracted event dispatch: `process_event`, `populate_globals`, `warm_scan` |
-| `dwarf.rs` | `dwarf` | DWARF parser + ELF symtab fallback: globals, functions, locals, types, type_registry |
+| `dwarf.rs` | `dwarf` | DWARF parser + ELF symtab fallback + CFI table + JIT deep resolution: globals, functions, locals, types, type_registry, `.eh_frame` |
 | `ring.rs` | `ring` | SHM mapping, ring consumer, orchestrator, `new_offline()` for replay |
 | `index.rs` | `index` | Two-tier interval map. O(log N) address-to-variable lookup |
 | `world.rs` | `world` | WorldState, STM, RTR, HeapAllocTracker, Visual ASan, CoW snapshots |
-| `shadow_regs.rs` | `shadow_regs` | Shadow Register File, confidence tiers, piece assembler |
+| `shadow_regs.rs` | `shadow_regs` | Shadow Register File, 7 confidence tiers (incl. `CfiVerified`), piece assembler |
 | `heap_graph.rs` | `heap_graph` | Heap object discovery, field value storage, pointer edges, type inference |
 | `record.rs` | `record` | EventRecorder (write), EventPlayer (read), compound REG_SNAPSHOT I/O |
 | `topology.rs` | `topology` | JSONL topology streamer: STAMP, LINK, HAZARD, COLD_*, SUMMARY |
@@ -95,7 +95,10 @@ modules re-exported from `lib.rs`, with four binary entry points.
 #### Engine subsystem summary
 
 1. **DWARF parsing** (`dwarf.rs`). Parses `.debug_info` via `gimli`. Extracts
-   globals, functions, locals, type information (depth-limited to 2 levels).
+   globals, functions, locals, type information. Struct field extraction is
+   depth-capped at 8 levels via `extract_struct_fields`; type resolution
+   (`resolve_type_at`) is depth-capped at 16 levels. Types truncated by the
+   depth cap are marked `shallow: true` on `TypeInfo`.
    Builds `type_registry` mapping struct names to `TypeInfo`. Supports
    location tables, `DW_OP_piece` fragments, and a stack-machine evaluator.
    Tracks `DW_TAG_volatile_type` and `DW_TAG_atomic_type` qualifiers
@@ -104,42 +107,84 @@ modules re-exported from `lib.rs`, with four binary entry points.
    **ELF symtab fallback**: globals with `DW_AT_specification` but no
    `DW_AT_location` have addresses resolved from the ELF symbol table.
 
-2. **Event reconciler** (`reconciler.rs`). Extracted from `main.rs` for
+2. **CFI table** (`dwarf.rs`). `parse_eh_frame` reads the `.eh_frame` section
+   via gimli and builds a `CfiTable` — a list of `CfiEntry` structs, each
+   mapping a PC range (`start_pc..end_pc`) to the set of callee-saved register
+   indices preserved in that frame. `saved_regs_at(pc)` performs a linear
+   scan to find the entry covering a given PC. The table is populated during
+   `parse_elf` and stored as `DwarfInfo.cfi`.
+
+3. **JIT DWARF resolution** (`dwarf.rs`). On-demand deep type resolution for
+   types marked `shallow: true` by the initial parse. Two strategies:
+   - `patch_shallow_fields(ti)`: walks a `TypeInfo`'s field tree and replaces
+     any field-embedded shallow types with their full version from
+     `type_registry`. This handles the common case where each struct has a
+     top-level DWARF DIE and was resolved at depth 0 in the registry.
+   - `resolve_deep(type_name)`: re-reads the ELF binary from `elf_path` and
+     re-parses the named type with raised depth caps (struct fields: 32,
+     type resolution: 64). Updates `type_registry` in place. Fallback for
+     types that only exist as nested fields with no standalone DIE.
+   The reconciler's STM stamp path clones the registry type, calls
+   `patch_shallow_fields`, then stamps with the patched version.
+
+4. **Event reconciler** (`reconciler.rs`). Extracted from `main.rs` for
    library consumption by `memvis-diff`. Contains `process_event` (central
    dispatch for all 12 event types), `populate_globals`, and `warm_scan`.
+   `process_event` takes `dwarf_info: &mut Option<DwarfInfo>` to allow
+   mutable access for `resolve_deep` and `patch_shallow_fields`.
 
-3. **Warm-scan** (`reconciler.rs`). Engine-side BFS over `/proc/<pid>/mem`.
+5. **Warm-scan** (`reconciler.rs`). Engine-side BFS over `/proc/<pid>/mem`.
    Reads global pointer fields from the target's memory after quiescence
    (2M events + 10 idle rounds). Discovers typed structures built before
    tracing. Emits COLD_STAMP and COLD_LINK events to the topology stream.
 
-4. **Ring orchestration** (`ring.rs`). Attaches to control ring with protocol
+6. **Ring orchestration** (`ring.rs`). Attaches to control ring with protocol
    handshake. Discovers per-thread data rings. Batch pops up to 20,000
    events per ring per cycle (2 atomics per ring per batch).
    `new_offline()` creates a dummy orchestrator for replay without SHM.
 
-5. **Shadow Type Map** (`world.rs`). Maps heap addresses to DWARF type
+7. **Shadow Type Map** (`world.rs`). Maps heap addresses to DWARF type
    projections. Three stamp paths: direct stamp, field propagation,
    retrospective scan. `purge_range` on FREE.
 
-6. **Retrospective Type Reconciliation** (`world.rs`). Bounded BFS (fuel=64)
+8. **Retrospective Type Reconciliation** (`world.rs`). Bounded BFS (fuel=64)
    from freshly-stamped addresses through HeapGraph pointer fields. Candidates
    sorted by field name for deterministic discovery order across runs.
 
-7. **Visual ASan** (`world.rs`). OutOfBounds and HeapHole detection with
+9. **Visual ASan** (`world.rs`). OutOfBounds and HeapHole detection with
    symbolic intent. Each `HeapHazard` carries `pc` and `reg_snapshot`
    (18 registers from `ShadowRegisterFile::values()`).
 
-8. **Event recording** (`record.rs`). `EventRecorder::record()` writes 32-byte
-   events. `record_reg_snapshot()` writes header + 6 continuation events
-   carrying 18 register values. `EventPlayer` reads them back. File format:
-   24-byte header (magic + proto + count) followed by packed 32-byte events.
+10. **Shadow Register File** (`shadow_regs.rs`). Per-thread tracking of 18
+    x86-64 registers with provenance, confidence, and memory-source coherence.
+    Seven confidence tiers (ordered low to high):
 
-9. **Topology streaming** (`topology.rs`). JSONL emitter for structural graph
-   deltas: ALLOC, FREE, STAMP, LINK, COLD_STAMP, COLD_LINK, HAZARD,
-   FALSE_SHARE, SUMMARY. Consumed by `memvis-check`.
+    | Tier | Label | Source |
+    |---|---|---|
+    | `Unknown` | `???` | No information |
+    | `Stale` | `STALE` | Invalidated by memory write to source |
+    | `Speculative` | `spec` | Heuristic inference |
+    | `WriteBack` | `wb` | Value written back to known memory source |
+    | `AbiInferred` | `abi` | ABI convention (callee-saved on CALL) |
+    | `CfiVerified` | `cfi` | CFI `.eh_frame` confirms preservation |
+    | `Observed` | `obs` | Direct `REG_SNAPSHOT` from tracer |
 
-10. **Differential topology** (`diff.rs`). Replays two `.bin` recordings
+    Key methods: `on_call`, `on_return`, `on_return_cfi` (D7: promotes
+    callee-saved registers to `CfiVerified` when CFI data is available),
+    `on_reload`, `on_snapshot`, `check_coherence`. `callee_pc()` returns
+    the current top-of-stack callee PC for CFI lookup.
+
+11. **Event recording** (`record.rs`). `EventRecorder::record()` writes
+    32-byte events. `record_reg_snapshot()` writes header + 6 continuation
+    events carrying 18 register values. `EventPlayer` reads them back. File
+    format: 24-byte header (magic + proto + count) followed by packed 32-byte
+    events.
+
+12. **Topology streaming** (`topology.rs`). JSONL emitter for structural graph
+    deltas: ALLOC, FREE, STAMP, LINK, COLD_STAMP, COLD_LINK, HAZARD,
+    FALSE_SHARE, SUMMARY. Consumed by `memvis-check`.
+
+13. **Differential topology** (`diff.rs`). Replays two `.bin` recordings
     through `reconciler::process_event` with `RingOrchestrator::new_offline()`.
     Checkpoints at configurable intervals. Comparison features:
     - Canonical stamps: `(source, type_name, type_size, field_count)`.
@@ -147,11 +192,11 @@ modules re-exported from `lib.rs`, with four binary entry points.
     - Steady-state type histogram: order-invariant final-checkpoint comparison.
     - Hazard register context: PC + RAX/RDI/RSI/RDX/RSP per hazard.
 
-11. **World state** (`world.rs`). CoW snapshots via `Arc<WorldInner>`.
+14. **World state** (`world.rs`). CoW snapshots via `Arc<WorldInner>`.
     Circular snapshot ring (512 entries) for time-travel. Cache-line
     contention tracker. Live register file.
 
-12. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz
+15. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz
     with six panels. Headless mode exits on 500ms idle timeout.
 
 ### Shared memory protocol (`memvis_bridge.h`)
@@ -200,7 +245,8 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
      b. shadow_regs.check_coherence(addr, value, size, seq)
      c. if heap: heap_graph → stm.propagate → RTR → check_write_bounds
      d. addr_index.lookup → world.update_value + update_edge
-     e. if pointer to heap: stm.stamp_type + retrospective_scan
+     e. if pointer to heap: clone type from registry,
+        patch_shallow_fields, stm.stamp_type + retrospective_scan
          │
          ▼
  [8] recorder.record(ev) or recorder.record_reg_snapshot(ev, regs)
@@ -209,6 +255,22 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
          ▼
  [9] world.snapshot() → Arc<WorldInner> (ref-count bump)
      TUI renders at 20 Hz
+```
+
+### RETURN path (CFI-hardened)
+
+```
+ [1] reconciler::process_event (EVENT_RETURN):
+         │
+         ▼
+ [2] srf.callee_pc() → look up CfiTable
+         │
+     ┌───┴───────────────────────────┐
+     │ CFI data available            │ No CFI data
+     ▼                               ▼
+ [3a] srf.on_return_cfi(saved)   [3b] srf.on_return()
+      restores callee-saved,          restores callee-saved,
+      promotes to CfiVerified         retains prior confidence
 ```
 
 ### Recording path (live → `.bin` → replay)
@@ -313,7 +375,7 @@ Cached in raw TLS (`MEMVIS_RAW_SLOT_HEAD`). Flushed to ring header:
 | Tracer | drreg | (bundled) | Register reservation |
 | Tracer | drwrap | (bundled) | Function wrapping (allocator hooks) |
 | Tracer | drsyms | (bundled) | Symbol lookup (allocator resolution) |
-| Engine | gimli | 0.31 | DWARF parsing |
+| Engine | gimli | 0.31 | DWARF parsing + `.eh_frame` CFI |
 | Engine | object | 0.36 | ELF parsing (including symtab fallback) |
 | Engine | ratatui | 0.29 | Terminal UI |
 | Engine | crossterm | 0.28 | Terminal I/O |
@@ -348,6 +410,9 @@ cd engine && cargo build --release
 ```sh
 # launch mode: tracer + engine together (interactive TUI)
 memvis <target> [args...]
+
+# explicit DWARF source (separate ELF)
+memvis --dwarf <elf> <target> [args...]
 
 # headless: print final snapshot, exit on 500ms idle
 memvis --once <target>
