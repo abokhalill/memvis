@@ -18,7 +18,6 @@ env:
   DYNAMORIO_VERSION: "11.91.20552"
 
 jobs:
-  # ── stage 1: lint (fast, catches style issues early) ──────────────
   lint:
     name: fmt + clippy
     runs-on: ubuntu-24.04
@@ -34,7 +33,6 @@ jobs:
       - run: cargo fmt --manifest-path engine/Cargo.toml -- --check
       - run: cargo clippy --manifest-path engine/Cargo.toml --release -- -D warnings
 
-  # ── stage 2: build + test (parallel with lint) ────────────────────
   build:
     name: build + test
     runs-on: ubuntu-24.04
@@ -63,7 +61,6 @@ jobs:
           engine/target/release/memvis-check 2>/dev/null && exit 1 || true
           echo "ok: memvis-check exits non-zero on missing args"
 
-  # ── stage 3: docker (parallel with lint+build) ────────────────────
   docker:
     name: docker build + verify
     runs-on: ubuntu-24.04
