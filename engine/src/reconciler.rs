@@ -66,7 +66,7 @@ pub fn process_event(
     orch: &RingOrchestrator,
     world: &mut WorldState,
     addr_index: &mut AddressIndex,
-    dwarf_info: &Option<DwarfInfo>,
+    dwarf_info: &mut Option<DwarfInfo>,
     stacks: &mut HashMap<u16, ShadowStack>,
     next_frame_id: &mut FrameId,
     relocation_delta: &mut Option<u64>,
@@ -170,15 +170,20 @@ pub fn process_event(
                     if ev.value != 0 {
                         let is_heap = heap_oracle.is_heap(ev.value);
                         if is_heap {
-                            if let Some(ref info) = dwarf_info {
-                                let pointee_name = h_type.name.strip_prefix('*').unwrap_or("");
-                                if let Some(pointee_ti) = info.type_registry.get(pointee_name) {
-                                    world.heap_allocs.check_size(ev.value, pointee_ti);
-                                    if world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq32() as u64) {
+                            if let Some(ref mut info) = dwarf_info {
+                                let pointee_name = h_type.name.strip_prefix('*').unwrap_or("").to_string();
+                                if info.type_registry.get(&pointee_name).map_or(false, |ti| ti.shallow) {
+                                    info.resolve_deep(&pointee_name);
+                                }
+                                if let Some(pointee_ti) = info.type_registry.get(&pointee_name).cloned() {
+                                    let mut patched = pointee_ti;
+                                    info.patch_shallow_fields(&mut patched);
+                                    world.heap_allocs.check_size(ev.value, &patched);
+                                    if world.stm.stamp_type(ev.value, &patched, &h_name, ev.seq32() as u64) {
                                         orch.bloom_insert(ev.value);
                                         world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq32() as u64);
                                         if let Some(ref mut ts) = topo {
-                                            ts.emit_stamp(ev.seq32() as u64, ev.value, &pointee_ti.name, pointee_ti.byte_size, &h_name, pointee_ti.fields.len());
+                                            ts.emit_stamp(ev.seq32() as u64, ev.value, &patched.name, patched.byte_size, &h_name, patched.fields.len());
                                         }
                                     }
                                 }
@@ -595,7 +600,7 @@ mod tests {
         let orch = RingOrchestrator::new();
         let mut world = WorldState::new();
         let mut addr_index = AddressIndex::new();
-        let dwarf_info: Option<DwarfInfo> = None;
+        let mut dwarf_info: Option<DwarfInfo> = None;
         let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
         let mut next_frame_id: u64 = 0;
         let mut relocation_delta: Option<u64> = None;
@@ -607,7 +612,7 @@ mod tests {
 
         let ev = make_bb_entry_event(0xABCD);
         let accepted = process_event(
-            &ev, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &ev, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
             &mut stacks, &mut next_frame_id, &mut relocation_delta,
             &mut returned_frames, &mut shadow_regs, &mut heap_graph,
             &mut heap_oracle, &mut topo,
@@ -619,7 +624,7 @@ mod tests {
         // second hit to same BB
         let ev2 = make_bb_entry_event(0xABCD);
         let accepted2 = process_event(
-            &ev2, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &ev2, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
             &mut stacks, &mut next_frame_id, &mut relocation_delta,
             &mut returned_frames, &mut shadow_regs, &mut heap_graph,
             &mut heap_oracle, &mut topo,
@@ -631,7 +636,7 @@ mod tests {
         // different BB
         let ev3 = make_bb_entry_event(0x1234);
         process_event(
-            &ev3, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &ev3, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
             &mut stacks, &mut next_frame_id, &mut relocation_delta,
             &mut returned_frames, &mut shadow_regs, &mut heap_graph,
             &mut heap_oracle, &mut topo,
@@ -645,7 +650,7 @@ mod tests {
         let orch = RingOrchestrator::new();
         let mut world = WorldState::new();
         let mut addr_index = AddressIndex::new();
-        let dwarf_info: Option<DwarfInfo> = None;
+        let mut dwarf_info: Option<DwarfInfo> = None;
         let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
         let mut next_frame_id: u64 = 0;
         let mut relocation_delta: Option<u64> = None;
@@ -665,7 +670,7 @@ mod tests {
             rip_lo: 0,
         };
         let accepted = process_event(
-            &ev, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &ev, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
             &mut stacks, &mut next_frame_id, &mut relocation_delta,
             &mut returned_frames, &mut shadow_regs, &mut heap_graph,
             &mut heap_oracle, &mut topo,
@@ -679,7 +684,7 @@ mod tests {
         let orch = RingOrchestrator::new();
         let mut world = WorldState::new();
         let mut addr_index = AddressIndex::new();
-        let dwarf_info: Option<DwarfInfo> = None;
+        let mut dwarf_info: Option<DwarfInfo> = None;
         let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
         let mut next_frame_id: u64 = 0;
         let mut relocation_delta: Option<u64> = None;
@@ -691,7 +696,7 @@ mod tests {
 
         let ev = make_unknown_event();
         let accepted = process_event(
-            &ev, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &ev, 0, &orch, &mut world, &mut addr_index, &mut dwarf_info,
             &mut stacks, &mut next_frame_id, &mut relocation_delta,
             &mut returned_frames, &mut shadow_regs, &mut heap_graph,
             &mut heap_oracle, &mut topo,

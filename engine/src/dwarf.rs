@@ -374,7 +374,22 @@ pub struct TypeInfo {
     pub is_pointer: bool,
     pub is_volatile: bool,
     pub is_atomic: bool,
+    pub shallow: bool,
     pub fields: Vec<FieldInfo>,
+}
+
+impl TypeInfo {
+    pub fn unknown() -> Self {
+        Self {
+            name: "<unknown>".into(),
+            byte_size: 0,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: Vec::new(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -434,6 +449,7 @@ pub struct DwarfInfo {
     pub elf_base_vaddr: u64,
     pub type_registry: HashMap<String, TypeInfo>,
     pub cfi: CfiTable,
+    pub elf_path: String,
 }
 
 impl DwarfInfo {
@@ -444,6 +460,95 @@ impl DwarfInfo {
             .next_back()
             .map(|(_, f)| f)
             .filter(|f| pc < f.high_pc)
+    }
+
+    pub fn patch_shallow_fields(&self, ti: &mut TypeInfo) {
+        for field in &mut ti.fields {
+            if field.type_info.shallow {
+                if let Some(full) = self.type_registry.get(&field.type_info.name) {
+                    if !full.shallow && full.fields.len() > field.type_info.fields.len() {
+                        field.type_info = full.clone();
+                    }
+                }
+            }
+            if !field.type_info.fields.is_empty() {
+                self.patch_shallow_fields(&mut field.type_info);
+            }
+        }
+    }
+
+    pub fn resolve_deep(&mut self, type_name: &str) -> bool {
+        let existing = match self.type_registry.get(type_name) {
+            Some(ti) if ti.shallow => ti.clone(),
+            _ => return false,
+        };
+        let file_data = match fs::read(&self.elf_path) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+        let obj = match object::File::parse(&*file_data) {
+            Ok(o) => o,
+            Err(_) => return false,
+        };
+        let load_section = |id: gimli::SectionId| -> Result<R<'_>, gimli::Error> {
+            let data = obj
+                .section_by_name(id.name())
+                .and_then(|s| s.data().ok())
+                .unwrap_or(&[]);
+            Ok(EndianSlice::new(data, LittleEndian))
+        };
+        let dw = match Dwarf::load(&load_section) {
+            Ok(d) => d,
+            Err(_) => return false,
+        };
+
+        let mut iter = dw.units();
+        while let Ok(Some(header)) = iter.next() {
+            let unit = match dw.unit(header) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let mut entries = unit.entries();
+            while let Ok(Some((_, entry))) = entries.next_dfs() {
+                let tag = entry.tag();
+                if tag != gimli::DW_TAG_structure_type && tag != gimli::DW_TAG_union_type {
+                    continue;
+                }
+                let name = match attr_name(&dw, &unit, entry) {
+                    Some(n) => n,
+                    None => continue,
+                };
+                if name != type_name {
+                    continue;
+                }
+                let bs = entry
+                    .attr_value(gimli::DW_AT_byte_size)
+                    .ok()
+                    .flatten()
+                    .and_then(|v| v.udata_value())
+                    .unwrap_or(0);
+                if bs != existing.byte_size {
+                    continue;
+                }
+                let mut visited = HashSet::new();
+                let fields = extract_struct_fields_deep(&dw, &unit, entry.offset(), 0, &mut visited);
+                if fields.len() > existing.fields.len() {
+                    let deep_ti = TypeInfo {
+                        name: name.clone(),
+                        byte_size: bs,
+                        is_pointer: false,
+                        is_volatile: existing.is_volatile,
+                        is_atomic: existing.is_atomic,
+                        shallow: false,
+                        fields,
+                    };
+                    self.type_registry.insert(name.clone(), deep_ti);
+                    eprintln!("dwarf: deep-resolved {} ({} fields)", name, self.type_registry[&name].fields.len());
+                    return true;
+                }
+            }
+        }
+        false
     }
 }
 
@@ -607,6 +712,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         elf_base_vaddr,
         type_registry,
         cfi,
+        elf_path: path.to_string(),
     })
 }
 
@@ -925,14 +1031,7 @@ fn try_extract_global<'a>(
         _ => return None,
     };
 
-    let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo {
-        name: "<unknown>".into(),
-        byte_size: 0,
-        is_pointer: false,
-        is_volatile: false,
-        is_atomic: false,
-        fields: Vec::new(),
-    });
+    let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo::unknown());
 
     let size = type_info.byte_size;
     if size == 0 {
@@ -1149,14 +1248,7 @@ fn try_extract_local<'a>(
         _ => 0,
     };
 
-    let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo {
-        name: "<unknown>".into(),
-        byte_size: 0,
-        is_pointer: false,
-        is_volatile: false,
-        is_atomic: false,
-        fields: Vec::new(),
-    });
+    let type_info = resolve_type(dwarf, unit, entry).unwrap_or(TypeInfo::unknown());
 
     Some(LocalVar {
         frame_offset,
@@ -1215,14 +1307,7 @@ fn extract_struct_fields<'a>(
             });
         let type_info = type_ref
             .and_then(|off| resolve_type_at(dwarf, unit, off, parent_depth + 1, visited))
-            .unwrap_or(TypeInfo {
-                name: "<unknown>".into(),
-                byte_size: 0,
-                is_pointer: false,
-                is_volatile: false,
-                is_atomic: false,
-                fields: Vec::new(),
-            });
+            .unwrap_or(TypeInfo::unknown());
 
         let byte_size = type_info.byte_size;
 
@@ -1243,6 +1328,175 @@ fn extract_struct_fields<'a>(
     }
 
     fields
+}
+
+fn extract_struct_fields_deep<'a>(
+    dwarf: &Dwarf<R<'a>>,
+    unit: &Unit<R<'a>>,
+    struct_offset: UnitOffset,
+    parent_depth: u32,
+    visited: &mut HashSet<UnitOffset>,
+) -> Vec<FieldInfo> {
+    if parent_depth >= 32 {
+        return Vec::new();
+    }
+
+    let mut fields = Vec::new();
+
+    let mut tree = match unit.entries_tree(Some(struct_offset)) {
+        Ok(t) => t,
+        Err(_) => return fields,
+    };
+    let root = match tree.root() {
+        Ok(r) => r,
+        Err(_) => return fields,
+    };
+    let mut children = root.children();
+
+    while let Ok(Some(child)) = children.next() {
+        let entry = child.entry();
+        if entry.tag() != gimli::DW_TAG_member {
+            continue;
+        }
+
+        let name = attr_name(dwarf, unit, entry).unwrap_or_else(|| "<anon>".into());
+
+        let byte_offset = entry
+            .attr_value(gimli::DW_AT_data_member_location)
+            .ok()
+            .flatten()
+            .and_then(|v| v.udata_value())
+            .unwrap_or(0);
+
+        let type_ref = entry
+            .attr_value(gimli::DW_AT_type)
+            .ok()
+            .flatten()
+            .and_then(|v| match v {
+                AttributeValue::UnitRef(off) => Some(off),
+                _ => None,
+            });
+        let type_info = type_ref
+            .and_then(|off| resolve_type_at_deep(dwarf, unit, off, parent_depth + 1, visited))
+            .unwrap_or(TypeInfo::unknown());
+
+        let byte_size = type_info.byte_size;
+
+        let alignment = entry
+            .attr_value(gimli::DW_AT_alignment)
+            .ok()
+            .flatten()
+            .and_then(|v| v.udata_value())
+            .unwrap_or(0);
+
+        fields.push(FieldInfo {
+            name,
+            byte_offset,
+            byte_size,
+            type_info,
+            alignment,
+        });
+    }
+
+    fields
+}
+
+fn resolve_type_at_deep<'a>(
+    dwarf: &Dwarf<R<'a>>,
+    unit: &Unit<R<'a>>,
+    offset: UnitOffset,
+    depth: u32,
+    visited: &mut HashSet<UnitOffset>,
+) -> Option<TypeInfo> {
+    if depth > 64 || !visited.insert(offset) {
+        return None;
+    }
+
+    let entry = unit.entry(offset).ok()?;
+    let tag = entry.tag();
+
+    if tag == gimli::DW_TAG_base_type || tag == gimli::DW_TAG_enumeration_type {
+        let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<prim>".into());
+        let byte_size = entry
+            .attr_value(gimli::DW_AT_byte_size)
+            .ok()
+            .flatten()
+            .and_then(|v| v.udata_value())
+            .unwrap_or(0);
+
+        Some(TypeInfo {
+            name,
+            byte_size,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: Vec::new(),
+        })
+    } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
+        let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<anon>".into());
+        let byte_size = entry
+            .attr_value(gimli::DW_AT_byte_size)
+            .ok()
+            .flatten()
+            .and_then(|v| v.udata_value())
+            .unwrap_or(0);
+
+        let fields = extract_struct_fields_deep(dwarf, unit, offset, depth, visited);
+
+        Some(TypeInfo {
+            name,
+            byte_size,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields,
+        })
+    } else if tag == gimli::DW_TAG_pointer_type {
+        let byte_size = entry
+            .attr_value(gimli::DW_AT_byte_size)
+            .ok()
+            .flatten()
+            .and_then(|v| v.udata_value())
+            .unwrap_or(8);
+
+        let pointee = entry
+            .attr_value(gimli::DW_AT_type)
+            .ok()
+            .flatten()
+            .and_then(|v| match v {
+                AttributeValue::UnitRef(off) => resolve_type_at_deep(dwarf, unit, off, depth + 1, visited),
+                _ => None,
+            });
+
+        let pointee_name = pointee.as_ref()
+            .map(|t| format!("*{}", t.name))
+            .unwrap_or_else(|| "*void".into());
+
+        Some(TypeInfo {
+            name: pointee_name,
+            byte_size,
+            is_pointer: true,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: Vec::new(),
+        })
+    } else if tag == gimli::DW_TAG_typedef
+        || tag == gimli::DW_TAG_const_type
+        || tag == gimli::DW_TAG_volatile_type
+        || tag == gimli::DW_TAG_atomic_type
+        || tag == gimli::DW_TAG_restrict_type
+    {
+        let inner_ref = match entry.attr_value(gimli::DW_AT_type).ok().flatten()? {
+            AttributeValue::UnitRef(off) => off,
+            _ => return None,
+        };
+        resolve_type_at_deep(dwarf, unit, inner_ref, depth + 1, visited)
+    } else {
+        None
+    }
 }
 
 fn resolve_type<'a>(
@@ -1287,6 +1541,7 @@ fn resolve_type_at<'a>(
             is_pointer: false,
             is_volatile: false,
             is_atomic: false,
+            shallow: false,
             fields: Vec::new(),
         })
     } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
@@ -1299,6 +1554,7 @@ fn resolve_type_at<'a>(
             .unwrap_or(0);
 
         let fields = extract_struct_fields(dwarf, unit, offset, depth, visited);
+        let shallow = fields.is_empty() && byte_size > 0 && depth >= 8;
 
         Some(TypeInfo {
             name,
@@ -1306,6 +1562,7 @@ fn resolve_type_at<'a>(
             is_pointer: false,
             is_volatile: false,
             is_atomic: false,
+            shallow,
             fields,
         })
     } else if tag == gimli::DW_TAG_pointer_type {
@@ -1345,6 +1602,7 @@ fn resolve_type_at<'a>(
             name: pointee_name,
             byte_size,
             is_pointer: true,
+            shallow: false,
             is_volatile: false,
             is_atomic: false,
             fields,
@@ -1455,11 +1713,154 @@ fn resolve_type_at<'a>(
             name: arr_name,
             byte_size,
             is_pointer: false,
+            shallow: false,
             is_volatile: false,
             is_atomic: false,
             fields,
         })
     } else {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_patch_shallow_fields() {
+        let full_inner = TypeInfo {
+            name: "InnerStruct".into(),
+            byte_size: 16,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: vec![
+                FieldInfo {
+                    name: "x".into(),
+                    byte_offset: 0,
+                    byte_size: 8,
+                    type_info: TypeInfo::unknown(),
+                    alignment: 0,
+                },
+                FieldInfo {
+                    name: "y".into(),
+                    byte_offset: 8,
+                    byte_size: 8,
+                    type_info: TypeInfo::unknown(),
+                    alignment: 0,
+                },
+            ],
+        };
+
+        let shallow_inner = TypeInfo {
+            name: "InnerStruct".into(),
+            byte_size: 16,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: true,
+            fields: Vec::new(),
+        };
+
+        let mut parent = TypeInfo {
+            name: "Parent".into(),
+            byte_size: 24,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: vec![FieldInfo {
+                name: "inner".into(),
+                byte_offset: 0,
+                byte_size: 16,
+                type_info: shallow_inner,
+                alignment: 0,
+            }],
+        };
+
+        assert!(parent.fields[0].type_info.shallow);
+        assert_eq!(parent.fields[0].type_info.fields.len(), 0);
+
+        let mut registry = HashMap::new();
+        registry.insert("InnerStruct".into(), full_inner);
+
+        let info = DwarfInfo {
+            globals: Vec::new(),
+            functions: BTreeMap::new(),
+            elf_base_vaddr: 0,
+            type_registry: registry,
+            cfi: CfiTable::new(),
+            elf_path: String::new(),
+        };
+
+        info.patch_shallow_fields(&mut parent);
+
+        assert!(!parent.fields[0].type_info.shallow,
+            "shallow field should be patched");
+        assert_eq!(parent.fields[0].type_info.fields.len(), 2,
+            "patched field should have 2 sub-fields");
+        assert_eq!(parent.fields[0].type_info.fields[0].name, "x");
+        assert_eq!(parent.fields[0].type_info.fields[1].name, "y");
+
+        eprintln!("patch_shallow_fields: PASS (0 fields -> 2 fields)");
+    }
+
+    #[test]
+    fn test_patch_shallow_deep_nest_elf() {
+        let elf_path = concat!(env!("CARGO_MANIFEST_DIR"), "/../tests/deep_nest");
+        if !std::path::Path::new(elf_path).exists() {
+            eprintln!("skipping: deep_nest not compiled");
+            return;
+        }
+        let info = parse_elf(elf_path).expect("parse_elf");
+        let root = info.type_registry.get("Root").expect("Root type");
+        eprintln!("Root: {}B, {} fields, shallow={}", root.byte_size, root.fields.len(), root.shallow);
+
+        // walk the inner chain, counting depth before truncation
+        let mut depth = 0;
+        let mut cur = root;
+        let mut found_shallow = false;
+        loop {
+            let inner = cur.fields.iter().find(|f| f.name == "inner");
+            match inner {
+                Some(f) if f.type_info.shallow => {
+                    found_shallow = true;
+                    depth += 1;
+                    eprintln!("  depth {}: {} (SHALLOW)", depth, f.type_info.name);
+                    break;
+                }
+                Some(f) if !f.type_info.fields.is_empty() => {
+                    depth += 1;
+                    eprintln!("  depth {}: {} ({} fields)", depth, f.type_info.name, f.type_info.fields.len());
+                    cur = &f.type_info;
+                }
+                _ => break,
+            }
+        }
+        eprintln!("traversable depth: {}, found_shallow: {}", depth, found_shallow);
+        assert!(depth >= 5, "expected >=5 levels, got {}", depth);
+
+        // patch and verify the shallow node gets upgraded
+        if found_shallow {
+            let mut patched_root = root.clone();
+            info.patch_shallow_fields(&mut patched_root);
+
+            let mut d2 = 0;
+            let mut cur2 = &patched_root;
+            loop {
+                let inner = cur2.fields.iter().find(|f| f.name == "inner");
+                match inner {
+                    Some(f) if !f.type_info.fields.is_empty() => {
+                        d2 += 1;
+                        cur2 = &f.type_info;
+                    }
+                    _ => break,
+                }
+            }
+            eprintln!("after patch: traversable depth {}", d2);
+            assert!(d2 > depth, "patched tree should be deeper ({} vs {})", d2, depth);
+        }
     }
 }

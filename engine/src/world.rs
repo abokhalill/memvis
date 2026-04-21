@@ -993,6 +993,7 @@ mod tests {
             is_pointer: ptr,
             is_volatile: false,
             is_atomic: false,
+            shallow: false,
             fields: Vec::new(),
         }
     }

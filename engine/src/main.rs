@@ -19,7 +19,7 @@ use memvis::world::{ShadowStack, SnapshotRing, WorldState};
 // process_event and populate_globals are in memvis::reconciler (library crate).
 // this file is just a thin CLI shell over the library.
 
-fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
+fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, once: bool, min_events: u64, record_path: Option<String>, topo_path: Option<String>, heatmap_path: Option<String>) {
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
     let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
@@ -68,7 +68,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
     if once {
         run_headless(
             &mut orch,
-            &dwarf_info,
+            &mut dwarf_info,
             min_events,
             &mut addr_index,
             &mut world,
@@ -189,7 +189,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
                         &orch,
                         &mut world,
                         &mut addr_index,
-                        &dwarf_info,
+                        &mut dwarf_info,
                         &mut stacks,
                         &mut next_frame_id,
                         &mut relocation_delta,
@@ -314,7 +314,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
 #[allow(clippy::too_many_arguments)]
 fn run_headless(
     orch: &mut RingOrchestrator,
-    dwarf_info: &Option<DwarfInfo>,
+    dwarf_info: &mut Option<DwarfInfo>,
     _min_events: u64,
     addr_index: &mut AddressIndex,
     world: &mut WorldState,
@@ -387,7 +387,7 @@ fn run_headless(
                     orch,
                     world,
                     addr_index,
-                    dwarf_info,
+                    &mut *dwarf_info,
                     stacks,
                     next_frame_id,
                     relocation_delta,
@@ -448,7 +448,7 @@ fn run_headless(
 
         if !warm_scan_done && relocation_delta.is_some() && *total > 2_000_000 && drained == 0 && idle_rounds >= 10 {
             if let (Some(ref info), Some(pid), Some(delta)) =
-                (dwarf_info, orch.target_pid(), *relocation_delta) {
+                (&*dwarf_info, orch.target_pid(), *relocation_delta) {
                 match reconciler::warm_scan(info, pid, delta, world, heap_oracle, recorder_topo, 10_000, 8) {
                     Ok(s) => eprintln!(
                         "memvis: warm-scan: globals={} reads={} null={} missing_ti={} enqueued={} stamps={} depth={} errors={} not_heap={}",
@@ -778,7 +778,7 @@ fn headless_render(
 fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path: Option<String>) {
     use std::io::Write;
 
-    let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
+    let mut dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
         eprintln!("memvis: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
             Ok(info) => {
@@ -872,7 +872,7 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
                 &orch,
                 &mut world,
                 &mut addr_index,
-                &dwarf_info,
+                &mut dwarf_info,
                 &mut stacks,
                 &mut next_frame_id,
                 &mut relocation_delta,

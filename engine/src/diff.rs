@@ -189,7 +189,7 @@ fn take_checkpoint(seq: u64, world: &WorldState, heap_graph: &HeapGraph) -> Topo
 
 fn replay_to_checkpoints(
     recording_path: &str,
-    dwarf_info: &Option<DwarfInfo>,
+    dwarf_info: &mut Option<DwarfInfo>,
     interval: u64,
 ) -> io::Result<Vec<TopologyCheckpoint>> {
     let mut player = EventPlayer::open(Path::new(recording_path))?;
@@ -552,7 +552,7 @@ fn main() {
     eprintln!("memvis-diff: baseline={} subject={}", args.baseline, args.subject);
     eprintln!("  dwarf={} interval={}", args.dwarf_path, args.interval);
 
-    let dwarf_info = match dwarf::parse_elf(&args.dwarf_path) {
+    let mut dwarf_info = match dwarf::parse_elf(&args.dwarf_path) {
         Ok(info) => Some(info),
         Err(e) => {
             eprintln!("memvis-diff: DWARF parse failed: {}", e);
@@ -561,7 +561,7 @@ fn main() {
     };
 
     eprintln!("\n── Baseline ────────────────────────────────────");
-    let checkpoints_a = match replay_to_checkpoints(&args.baseline, &dwarf_info, args.interval) {
+    let checkpoints_a = match replay_to_checkpoints(&args.baseline, &mut dwarf_info, args.interval) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("memvis-diff: failed to replay baseline: {}", e);
@@ -570,7 +570,7 @@ fn main() {
     };
 
     eprintln!("\n── Subject ─────────────────────────────────────");
-    let checkpoints_b = match replay_to_checkpoints(&args.subject, &dwarf_info, args.interval) {
+    let checkpoints_b = match replay_to_checkpoints(&args.subject, &mut dwarf_info, args.interval) {
         Ok(c) => c,
         Err(e) => {
             eprintln!("memvis-diff: failed to replay subject: {}", e);

@@ -344,6 +344,7 @@ mod tests {
             is_pointer: false,
             is_volatile: false,
             is_atomic: false,
+            shallow: false,
             fields: Vec::new(),
         }
     }
