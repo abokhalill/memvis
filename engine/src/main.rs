@@ -710,6 +710,18 @@ fn headless_render(
         }
     }
 
+    if field_heatmap.read_len() > 0 {
+        let _ = writeln!(out, "\n FIELD READ HEATMAP ({} distinct entries)", field_heatmap.read_len());
+        let _ = writeln!(out, "  Top 20 hottest reads (thread, type.field, offset, reads):");
+        for (key, count) in field_heatmap.top_read_entries(20) {
+            let _ = writeln!(
+                out,
+                "    T{:<3} {}.{:<24} +0x{:<4x} {:>10} reads",
+                key.thread_id, key.type_name, key.field_name, key.field_offset, count
+            );
+        }
+    }
+
     if !world.edges.is_empty() {
         let _ = writeln!(out, "\nPOINTER EDGES");
         let mut seen: std::collections::HashSet<(String, u64)> = std::collections::HashSet::new();

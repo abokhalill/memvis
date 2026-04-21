@@ -16,6 +16,7 @@ use crate::topology::TopologyStream;
 use crate::world::{HazardKind, ShadowStack, WorldState, REG_COUNT};
 
 pub const EVENT_WRITE: u8 = 0;
+pub const EVENT_READ: u8 = 1;
 pub const EVENT_CALL: u8 = 2;
 pub const EVENT_RETURN: u8 = 3;
 pub const EVENT_REG_SNAPSHOT: u8 = 5;
@@ -297,6 +298,21 @@ pub fn process_event(
                 heap_graph.on_free(ptr, old_size);
                 if let Some(ref mut ts) = topo {
                     ts.emit_free(ev.seq32() as u64, ev.thread_id, ptr, old_size);
+                }
+            }
+            true
+        }
+        EVENT_READ => {
+            world.inc_insn_counter();
+            if heap_oracle.is_heap(ev.addr) && ev.value != 0 {
+                if let Some(covering) = world.stm.covering(ev.addr) {
+                    let offset = ev.addr - covering.base_addr;
+                    let tn = &covering.type_info.name;
+                    if let Some(field) = covering.type_info.fields.iter().find(|f| {
+                        offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
+                    }) {
+                        world.field_heatmap.record_read(ev.thread_id, tn, &field.name, field.byte_offset);
+                    }
                 }
             }
             true
@@ -612,6 +628,40 @@ mod tests {
         );
         assert_eq!(world.bb_hits.len(), 2);
         assert_eq!(world.bb_hits[&0x1234], 1);
+    }
+
+    #[test]
+    fn test_process_event_read() {
+        let orch = RingOrchestrator::new();
+        let mut world = WorldState::new();
+        let mut addr_index = AddressIndex::new();
+        let dwarf_info: Option<DwarfInfo> = None;
+        let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
+        let mut next_frame_id: u64 = 0;
+        let mut relocation_delta: Option<u64> = None;
+        let mut returned_frames: VecDeque<u64> = VecDeque::new();
+        let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
+        let mut heap_graph = HeapGraph::new();
+        let mut heap_oracle = HeapOracle::new();
+        let mut topo: Option<TopologyStream> = None;
+
+        let ev = Event {
+            addr: 0x5555_0000_1000,
+            size: 8,
+            thread_id: 0,
+            seq: 1,
+            value: 0xDEAD_BEEF,
+            kind_flags: EVENT_READ as u32,
+            rip_lo: 0,
+        };
+        let accepted = process_event(
+            &ev, 0, &orch, &mut world, &mut addr_index, &dwarf_info,
+            &mut stacks, &mut next_frame_id, &mut relocation_delta,
+            &mut returned_frames, &mut shadow_regs, &mut heap_graph,
+            &mut heap_oracle, &mut topo,
+        );
+        assert!(accepted, "EVENT_READ must be accepted");
+        assert_eq!(world.insn_counter(), 1, "read must increment insn_counter");
     }
 
     #[test]

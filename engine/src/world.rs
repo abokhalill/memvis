@@ -20,13 +20,13 @@ pub struct FieldHeatKey {
 #[derive(Debug, Clone)]
 pub struct FieldHeatmap {
     counts: HashMap<FieldHeatKey, u64>,
-    /// (cl_addr, thread_id, type_name, field_name) for fields on contended cachelines
+    read_counts: HashMap<FieldHeatKey, u64>,
     pub contention_hits: u64,
 }
 
 impl FieldHeatmap {
     pub fn new() -> Self {
-        Self { counts: HashMap::with_capacity(512), contention_hits: 0 }
+        Self { counts: HashMap::with_capacity(512), read_counts: HashMap::with_capacity(256), contention_hits: 0 }
     }
 
     #[inline]
@@ -40,7 +40,20 @@ impl FieldHeatmap {
         *self.counts.entry(key).or_insert(0) += 1;
     }
 
+    #[inline]
+    pub fn record_read(&mut self, thread_id: u16, type_name: &str, field_name: &str, field_offset: u64) {
+        let key = FieldHeatKey {
+            thread_id,
+            type_name: type_name.to_string(),
+            field_name: field_name.to_string(),
+            field_offset,
+        };
+        *self.read_counts.entry(key).or_insert(0) += 1;
+    }
+
     pub fn len(&self) -> usize { self.counts.len() }
+
+    pub fn read_len(&self) -> usize { self.read_counts.len() }
 
     // TSV export for divergence analysis: type\tfield\toffset\tthread\twrites
     pub fn export_tsv(&self, path: &std::path::Path) -> std::io::Result<()> {
@@ -60,6 +73,13 @@ impl FieldHeatmap {
     /// Return all entries sorted by write count descending.
     pub fn top_entries(&self, limit: usize) -> Vec<(&FieldHeatKey, u64)> {
         let mut v: Vec<_> = self.counts.iter().map(|(k, &c)| (k, c)).collect();
+        v.sort_by(|a, b| b.1.cmp(&a.1));
+        v.truncate(limit);
+        v
+    }
+
+    pub fn top_read_entries(&self, limit: usize) -> Vec<(&FieldHeatKey, u64)> {
+        let mut v: Vec<_> = self.read_counts.iter().map(|(k, &c)| (k, c)).collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         v.truncate(limit);
         v

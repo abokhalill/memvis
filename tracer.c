@@ -89,6 +89,7 @@ static _Atomic uint64_t g_stat_allocs        = 0;
 static _Atomic uint64_t g_stat_frees         = 0;
 static _Atomic uint64_t g_stat_gpr_captures  = 0;
 static _Atomic uint64_t g_stat_clean_reads   = 0;
+static _Atomic uint64_t g_stat_read_vals     = 0;
 
 /* JIT-time site counters */
 static _Atomic uint64_t g_jit_gpr_sites      = 0;
@@ -113,7 +114,7 @@ static _Atomic int g_module_base_phase = 0;
 typedef struct {
     uint32_t count;
     uint32_t _pad;
-    struct { uint64_t addr; uint32_t size; uint32_t _p; } entries[RDBUF_CAP];
+    struct { uint64_t addr; uint64_t value; uint32_t size; uint32_t _p; } entries[RDBUF_CAP];
 } read_buf_t;
 
 static int g_tls_idx[TLS_SLOT_COUNT];
@@ -901,6 +902,9 @@ at_mem_read_buf(uint64_t addr, uint32_t size)
     uint32_t idx = buf->count++;
     buf->entries[idx].addr = addr;
     buf->entries[idx].size = size;
+    buf->entries[idx].value = safe_read_value(addr, size);
+    if (buf->entries[idx].value != 0)
+        atomic_fetch_add_explicit(&g_stat_read_vals, 1, memory_order_relaxed);
 }
 
 static void flush_read_buf(void);
@@ -939,7 +943,8 @@ flush_read_buf(void)
     for (uint32_t i = 0; i < n; i++) {
         uint32_t seq = tls_next_seq(drcontext);
         int rc = memvis_push_sampled(ring, buf->entries[i].addr,
-                                      buf->entries[i].size, 0,
+                                      buf->entries[i].size,
+                                      buf->entries[i].value,
                                       MEMVIS_EVENT_READ, tid, seq);
         if (rc == 0 && pad)
             pad->stat_reads++;
@@ -1652,6 +1657,7 @@ event_exit(void)
     dr_printf("memvis:   frees:   %llu\n", (unsigned long long)atomic_load(&g_stat_frees));
     dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
     dr_printf("memvis:   bb_entr: %llu\n", (unsigned long long)atomic_load(&g_stat_bb_entries));
+    dr_printf("memvis:   rd_vals: %llu\n", (unsigned long long)atomic_load(&g_stat_read_vals));
     dr_printf("memvis: --- JIT site breakdown ---\n");
     dr_printf("memvis:   imm_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_imm_sites));
     dr_printf("memvis:   gpr_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_gpr_sites));
