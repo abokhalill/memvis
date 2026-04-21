@@ -36,6 +36,7 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
 
     if let Some(ref info) = dwarf_info {
         reconciler::populate_globals(info, 0, &mut addr_index, &mut world);
+        heap_graph.init_candidates(info);
     }
 
     let mut recorder: Option<EventRecorder> = record_path.as_ref().and_then(|p| {
@@ -227,11 +228,6 @@ fn run(mut orch: RingOrchestrator, dwarf_info: Option<DwarfInfo>, once: bool, mi
             if total & 0xFFF == 0 {
                 world.cache_heat_tick();
                 world.cl_tracker_tick();
-            }
-            if heap_graph.needs_type_inference() {
-                if let Some(ref info) = dwarf_info {
-                    heap_graph.run_type_inference(info);
-                }
             }
             if total & 0xFFFF == 0 {
                 heap_graph.gc_stale(total, 500_000);
@@ -434,7 +430,7 @@ fn run_headless(
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && idle_rounds >= 50 {
                 let snap = world.snapshot();
-                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, journal, *total, orch);
+                headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, journal, *total, orch, heap_graph);
                 let _ = out.flush();
                 return;
             }
@@ -482,6 +478,7 @@ fn headless_render(
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
+    heap_graph: &HeapGraph,
 ) {
     let (lag, _) = orch.total_fill();
     let lag_str = if lag >= 1_000_000 {
@@ -627,6 +624,27 @@ fn headless_render(
                 out,
                 "  0x{:x}: type {} needs {}B but alloc only {}B",
                 m.addr, m.type_name, m.type_size, m.alloc_size
+            );
+        }
+    }
+
+    {
+        let objs = heap_graph.objects();
+        let typed = objs.values().filter(|o| o.inferred_type.is_some()).count();
+        let _ = writeln!(
+            out,
+            "\nHEAP GRAPH: {} objects, {} typed, {} rescores, {} contradictions",
+            objs.len(), typed, heap_graph.rescores, heap_graph.contradictions
+        );
+        for obj in objs.values().filter(|o| o.inferred_type.is_some()) {
+            let _ = writeln!(
+                out,
+                "  {:>12x}  {:>4}B  {:<30} conf={:.2}  fields={}  writes={}",
+                obj.base_addr, obj.inferred_size,
+                obj.inferred_type.as_deref().unwrap_or("?"),
+                obj.type_confidence,
+                obj.fields.len(),
+                obj.fields.values().map(|f| f.write_count as u64).sum::<u64>(),
             );
         }
     }
@@ -782,6 +800,9 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
     let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
     let mut heap_graph = HeapGraph::new();
     let mut heap_oracle = HeapOracle::new();
+    if let Some(ref info) = dwarf_info {
+        heap_graph.init_candidates(info);
+    }
     // dummy orchestrator for headless_render (LAG will be 0)
     let orch = RingOrchestrator::new();
 
@@ -874,11 +895,6 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
             world.cache_heat_tick();
             world.cl_tracker_tick();
         }
-        if heap_graph.needs_type_inference() {
-            if let Some(ref info) = dwarf_info {
-                heap_graph.run_type_inference(info);
-            }
-        }
         if total & 0xFFFF == 0 {
             heap_graph.gc_stale(total, 500_000);
         }
@@ -898,7 +914,7 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
     let snap = world.snapshot();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
-    headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, &journal, total, &orch);
+    headless_render(&mut out, &snap, &world.cl_tracker, &world.stm, &world.heap_allocs, &world.hazards, &world.field_heatmap, &journal, total, &orch, &heap_graph);
     let _ = out.flush();
 }
 
