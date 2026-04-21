@@ -90,6 +90,8 @@ static _Atomic uint64_t g_stat_frees         = 0;
 static _Atomic uint64_t g_stat_gpr_captures  = 0;
 static _Atomic uint64_t g_stat_clean_reads   = 0;
 static _Atomic uint64_t g_stat_read_vals     = 0;
+static _Atomic uint64_t g_stat_priority_reads = 0;
+static _Atomic uint64_t g_stat_shed_reads     = 0;
 
 /* JIT-time site counters */
 static _Atomic uint64_t g_jit_gpr_sites      = 0;
@@ -897,6 +899,15 @@ static void
 at_mem_read_buf(uint64_t addr, uint32_t size)
 {
     void *drcontext = dr_get_current_drcontext();
+    memvis_ring_header_t *ring = tls_ring(drcontext);
+    if (ring && atomic_load_explicit(&ring->backpressure, memory_order_relaxed)) {
+        if (g_ctl && memvis_bloom_query(g_ctl->priority_bloom, addr)) {
+            atomic_fetch_add_explicit(&g_stat_priority_reads, 1, memory_order_relaxed);
+        } else {
+            atomic_fetch_add_explicit(&g_stat_shed_reads, 1, memory_order_relaxed);
+            return;
+        }
+    }
     read_buf_t *buf = (read_buf_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RDBUF]);
     if (!buf || buf->count >= RDBUF_CAP) return;
     uint32_t idx = buf->count++;
@@ -1658,6 +1669,8 @@ event_exit(void)
     dr_printf("memvis:   threads: %u\n", (unsigned)atomic_load(&g_next_thread_id));
     dr_printf("memvis:   bb_entr: %llu\n", (unsigned long long)atomic_load(&g_stat_bb_entries));
     dr_printf("memvis:   rd_vals: %llu\n", (unsigned long long)atomic_load(&g_stat_read_vals));
+    dr_printf("memvis:   rd_prio: %llu\n", (unsigned long long)atomic_load(&g_stat_priority_reads));
+    dr_printf("memvis:   rd_shed: %llu\n", (unsigned long long)atomic_load(&g_stat_shed_reads));
     dr_printf("memvis: --- JIT site breakdown ---\n");
     dr_printf("memvis:   imm_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_imm_sites));
     dr_printf("memvis:   gpr_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_gpr_sites));

@@ -89,6 +89,9 @@ const THREAD_STATE_ACTIVE: u32 = 1;
 const THREAD_STATE_DEAD: u32 = 2;
 const THREAD_STATE_INITIALIZING: u32 = 3;
 
+const BLOOM_U64S: usize = 512;
+const BLOOM_BITS: u32 = (BLOOM_U64S as u32) * 64;
+
 #[repr(C)]
 struct CtlHeader {
     magic: u64,
@@ -98,7 +101,25 @@ struct CtlHeader {
     build_hash: u32,
     target_pid: u32,
     _pad0: u32,
+    priority_bloom: [u64; BLOOM_U64S],
     threads: [ThreadEntry; MAX_THREADS],
+}
+
+fn bloom_h1(addr: u64) -> u32 {
+    let mut h: u32 = 0x811c9dc5;
+    for i in 0..8 {
+        h ^= ((addr >> (i * 8)) & 0xFF) as u32;
+        h = h.wrapping_mul(0x01000193);
+    }
+    h % BLOOM_BITS
+}
+fn bloom_h2(addr: u64) -> u32 {
+    let mut h: u32 = 0x01000193;
+    for i in 0..8 {
+        h ^= ((addr >> (i * 8)) & 0xFF) as u32;
+        h = h.wrapping_mul(0x811c9dc5);
+    }
+    h % BLOOM_BITS
 }
 
 pub struct MappedShm {
@@ -416,6 +437,18 @@ impl RingOrchestrator {
     }
     pub fn active_count(&self) -> usize {
         self.rings.iter().filter(|r| r.alive).count()
+    }
+
+    pub fn bloom_insert(&self, addr: u64) {
+        let shm = match &self.ctl {
+            Some(s) => s,
+            None => return,
+        };
+        let hdr = unsafe { &mut *(shm.ptr as *mut CtlHeader) };
+        let b1 = bloom_h1(addr) as usize;
+        let b2 = bloom_h2(addr) as usize;
+        hdr.priority_bloom[b1 / 64] |= 1u64 << (b1 % 64);
+        hdr.priority_bloom[b2 / 64] |= 1u64 << (b2 % 64);
     }
 
     pub fn update_backpressure(&self) {

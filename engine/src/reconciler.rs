@@ -175,6 +175,7 @@ pub fn process_event(
                                 if let Some(pointee_ti) = info.type_registry.get(pointee_name) {
                                     world.heap_allocs.check_size(ev.value, pointee_ti);
                                     if world.stm.stamp_type(ev.value, pointee_ti, &h_name, ev.seq32() as u64) {
+                                        orch.bloom_insert(ev.value);
                                         world.stm.retrospective_scan(ev.value, heap_graph, &world.heap_allocs, &info.type_registry, ev.seq32() as u64);
                                         if let Some(ref mut ts) = topo {
                                             ts.emit_stamp(ev.seq32() as u64, ev.value, &pointee_ti.name, pointee_ti.byte_size, &h_name, pointee_ti.fields.len());

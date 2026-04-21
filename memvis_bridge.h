@@ -69,6 +69,9 @@ static inline uint32_t memvis_build_hash_compute(void) {
 #define MEMVIS_BP_HIGH_WATER  6  /* 6/8 capacity */
 #define MEMVIS_BP_LOW_WATER   3
 
+#define MEMVIS_BLOOM_U64S    512   /* 4KB = 32768 bits */
+#define MEMVIS_BLOOM_BITS    (MEMVIS_BLOOM_U64S * 64)
+
 #define MEMVIS_RAW_TLS_SLOTS     8
 #define MEMVIS_RAW_SLOT_RING     0
 #define MEMVIS_RAW_SLOT_HEAD     1
@@ -351,10 +354,34 @@ typedef struct {
     _Atomic uint32_t thread_count;
     uint32_t max_threads;
     uint32_t build_hash;
-    uint32_t target_pid;  /* tracer writes getpid() for engine-side /proc/<pid>/mem warm-scan */
+    uint32_t target_pid;
     uint32_t _pad0;
+    uint64_t priority_bloom[MEMVIS_BLOOM_U64S];
     memvis_thread_entry_t threads[MEMVIS_MAX_THREADS];
 } memvis_ctl_header_t;
+
+static inline uint32_t memvis_bloom_h1(uint64_t addr) {
+    uint32_t h = 0x811c9dc5u;
+    for (int i = 0; i < 8; i++) { h ^= (uint8_t)(addr >> (i * 8)); h *= 0x01000193u; }
+    return h % MEMVIS_BLOOM_BITS;
+}
+static inline uint32_t memvis_bloom_h2(uint64_t addr) {
+    uint32_t h = 0x01000193u;
+    for (int i = 0; i < 8; i++) { h ^= (uint8_t)(addr >> (i * 8)); h *= 0x811c9dc5u; }
+    return h % MEMVIS_BLOOM_BITS;
+}
+static inline void memvis_bloom_insert(uint64_t *bloom, uint64_t addr) {
+    uint32_t b1 = memvis_bloom_h1(addr);
+    uint32_t b2 = memvis_bloom_h2(addr);
+    bloom[b1 / 64] |= (1ULL << (b1 % 64));
+    bloom[b2 / 64] |= (1ULL << (b2 % 64));
+}
+static inline int memvis_bloom_query(const uint64_t *bloom, uint64_t addr) {
+    uint32_t b1 = memvis_bloom_h1(addr);
+    uint32_t b2 = memvis_bloom_h2(addr);
+    return (bloom[b1 / 64] & (1ULL << (b1 % 64))) &&
+           (bloom[b2 / 64] & (1ULL << (b2 % 64)));
+}
 
 static inline size_t memvis_ctl_shm_size(void) {
     return sizeof(memvis_ctl_header_t);
