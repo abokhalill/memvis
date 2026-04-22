@@ -16,9 +16,6 @@ use memvis::topology::TopologyStream;
 use memvis::tui::{self, AppState, JournalEntry};
 use memvis::world::{ShadowStack, SnapshotRing, WorldState};
 
-// process_event and populate_globals are in memvis::reconciler (library crate).
-// this file is just a thin CLI shell over the library.
-
 fn run(
     mut orch: RingOrchestrator,
     mut dwarf_info: Option<DwarfInfo>,
@@ -1334,18 +1331,15 @@ fn launch(
     eprintln!("memvis: tracer = {}", tracer.display());
     eprintln!("memvis: target = {}", target);
 
-    // clean stale shm from previous runs
     cleanup_shm();
 
     install_signal_handlers();
 
-    // fork the tracer as a child process
     let mut cmd = std::process::Command::new(&drrun);
     cmd.arg("-c").arg(&tracer).arg("--").arg(target);
     for a in target_args {
         cmd.arg(a);
     }
-    // redirect tracer stdout/stderr to /dev/null in TUI mode, keep in headless
     if !once {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
@@ -1364,7 +1358,6 @@ fn launch(
     TRACER_PID.store(child_pid, AtomicOrdering::SeqCst);
     eprintln!("memvis: tracer pid={}", child_pid);
 
-    // reaper thread: waitpid on tracer child, signal consumer when it exits
     let _reaper = thread::Builder::new()
         .name("tracer-reaper".into())
         .spawn(move || {
@@ -1386,8 +1379,6 @@ fn launch(
         })
         .expect("memvis: failed to spawn reaper thread");
 
-    // run consumer on a thread with 64MB stack (DWARF parsing of complex
-    // struct types like kernel sched.c can overflow the default 8MB stack)
     let target_owned = target.to_string();
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
@@ -1404,7 +1395,6 @@ fn launch(
         .expect("memvis: failed to spawn consumer thread");
     let _ = handle.join();
 
-    // cleanup: kill tracer if still running, reap
     if !TRACER_EXITED.load(AtomicOrdering::SeqCst) {
         unsafe {
             libc::kill(child_pid, libc::SIGTERM);
@@ -1416,137 +1406,306 @@ fn launch(
     eprintln!("memvis: done.");
 }
 
-fn print_usage() {
-    eprintln!("Usage:");
-    eprintln!("  memvis <target> [args...]        Launch target under tracer + TUI");
-    eprintln!("  memvis --once <target> [args...]  Headless mode (print to stdout, exit)");
-    eprintln!("  memvis --record <file> [--once] <target>  Record events to file");
-    eprintln!("  memvis --replay <file> [--once] <target.elf>  Replay recorded events");
-    eprintln!("  memvis --export-topology <file.jsonl> [--once] <target>  Stream graph deltas");
-    eprintln!("  memvis --export-heatmap <file.tsv> [--once] <target>  Export field write heatmap");
-    eprintln!("  memvis --consumer-only [--once] <target.elf>");
-    eprintln!("                                    Consumer-only (tracer started separately)");
+const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+fn print_help() {
+    eprintln!("memvis {} — runtime memory topology analyzer", VERSION);
     eprintln!();
-    eprintln!("Environment:");
-    eprintln!("  DYNAMORIO_HOME   Path to DynamoRIO installation");
-    eprintln!("  MEMVIS_DRRUN     Explicit path to drrun binary");
-    eprintln!("  MEMVIS_TRACER    Explicit path to libmemvis_tracer.so");
+    eprintln!("USAGE:");
+    eprintln!("  memvis <target> [args...]          Instrument and print snapshot (headless)");
+    eprintln!("  memvis <target> --live [args...]    Instrument with interactive TUI");
+    eprintln!("  memvis record -o <file> <target>   Record event trace to file");
+    eprintln!("  memvis replay <file> [--dwarf <elf>]");
+    eprintln!("                                     Replay a recorded trace");
+    eprintln!("  memvis attach [--dwarf <elf>]       Attach to already-running tracer");
+    eprintln!();
+    eprintln!("EXAMPLES:");
+    eprintln!("  memvis ./my_program                Headless snapshot of ./my_program");
+    eprintln!("  memvis ./my_program --live          Interactive TUI");
+    eprintln!("  memvis record -o trace.bin ./app    Record trace");
+    eprintln!("  memvis replay trace.bin --dwarf ./app");
+    eprintln!();
+    eprintln!("OPTIONS:");
+    eprintln!("  --live                 Interactive TUI instead of headless");
+    eprintln!("  --topology <file>      Export topology graph as JSONL");
+    eprintln!("  --heatmap <file>       Export field write heatmap as TSV");
+    eprintln!("  --min-events <N>       Minimum events before snapshot (default: 1)");
+    eprintln!("  --dwarf <elf>          Explicit DWARF source (if separate from target)");
+    eprintln!("  -o, --output <file>    Output file (for record, diff)");
+    eprintln!("  -h, --help             Show this help");
+    eprintln!("  -V, --version          Print version");
+    eprintln!();
+    eprintln!("ENVIRONMENT (optional — auto-detected if not set):");
+    eprintln!("  DYNAMORIO_HOME         DynamoRIO installation directory");
+    eprintln!("  MEMVIS_DRRUN           Explicit path to drrun binary");
+    eprintln!("  MEMVIS_TRACER          Explicit path to libmemvis_tracer.so");
+}
+
+fn die(msg: &str) -> ! {
+    eprintln!("memvis: error: {}", msg);
+    eprintln!("  Run 'memvis --help' for usage.");
+    std::process::exit(1);
+}
+
+fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
+    if let Some(pos) = args.iter().position(|a| a == flag) {
+        if pos + 1 < args.len() {
+            args.remove(pos);
+            return Some(args.remove(pos));
+        } else {
+            eprintln!("memvis: error: {} requires a value", flag);
+            std::process::exit(1);
+        }
+    }
+    None
+}
+
+fn take_flag(args: &mut Vec<String>, flag: &str) -> bool {
+    if let Some(pos) = args.iter().position(|a| a == flag) {
+        args.remove(pos);
+        true
+    } else {
+        false
+    }
 }
 
 fn main() {
-    let args: Vec<String> = env::args().collect();
+    let mut args: Vec<String> = env::args().skip(1).collect();
 
-    if args.len() < 2 || args.iter().any(|a| a == "--help" || a == "-h") {
-        print_usage();
-        std::process::exit(if args.len() < 2 { 1 } else { 0 });
+    if args.is_empty() {
+        print_help();
+        std::process::exit(1);
     }
 
-    let once = args.iter().any(|a| a == "--once");
-    let min_events: u64 = args
-        .windows(2)
-        .find(|w| w[0] == "--min-events")
-        .and_then(|w| w[1].parse().ok())
-        .unwrap_or(1);
-    let record_path: Option<String> = args
-        .windows(2)
-        .find(|w| w[0] == "--record")
-        .map(|w| w[1].clone());
-    let replay_path: Option<String> = args
-        .windows(2)
-        .find(|w| w[0] == "--replay")
-        .map(|w| w[1].clone());
-    let topo_path: Option<String> = args
-        .windows(2)
-        .find(|w| w[0] == "--export-topology")
-        .map(|w| w[1].clone());
-    let heatmap_path: Option<String> = args
-        .windows(2)
-        .find(|w| w[0] == "--export-heatmap")
-        .map(|w| w[1].clone());
-
-    // --replay mode: read events from file, no tracer needed
-    if let Some(ref rp) = replay_path {
-        let tp_ref = topo_path.as_deref().unwrap_or("");
-        let elf_path: Option<String> = args
-            .iter()
-            .filter(|a| !a.starts_with('-') && *a != &args[0] && *a != rp && a.as_str() != tp_ref)
-            .find(|a| a.parse::<u64>().is_err())
-            .cloned();
-        let rp_owned = rp.clone();
-        let tp_owned = topo_path.clone();
-        let handle = thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || run_replay(&rp_owned, elf_path.as_deref(), once, tp_owned))
-            .expect("memvis: failed to spawn replay thread");
-        let _ = handle.join();
-        return;
+    if take_flag(&mut args, "--help") || take_flag(&mut args, "-h") {
+        print_help();
+        std::process::exit(0);
+    }
+    if take_flag(&mut args, "--version") || take_flag(&mut args, "-V") {
+        eprintln!("memvis {}", VERSION);
+        std::process::exit(0);
     }
 
-    // --consumer-only: legacy mode (tracer started separately)
-    if args.iter().any(|a| a == "--consumer-only") {
-        let elf_path: Option<String> = args
-            .iter()
-            .filter(|a| !a.starts_with('-') && *a != &args[0])
-            .find(|a| a.parse::<u64>().is_err())
-            .cloned();
-        let handle = thread::Builder::new()
-            .stack_size(64 * 1024 * 1024)
-            .spawn(move || {
-                run_consumer(
-                    elf_path.as_deref(),
-                    once,
-                    min_events,
-                    record_path,
-                    topo_path,
-                    heatmap_path,
-                )
-            })
-            .expect("memvis: failed to spawn consumer thread");
-        let _ = handle.join();
-        return;
-    }
-
-    let mut skip_next = false;
-    let mut target_idx = None;
-    for (i, a) in args.iter().enumerate().skip(1) {
-        if skip_next {
-            skip_next = false;
-            continue;
+    let first = args.first().map(|s| s.as_str()).unwrap_or("");
+    match first {
+        "record" => {
+            args.remove(0);
+            cmd_record(&mut args);
         }
-        if a == "--min-events"
-            || a == "--record"
-            || a == "--replay"
-            || a == "--export-topology"
-            || a == "--export-heatmap"
-        {
-            skip_next = true;
-            continue;
+        "replay" => {
+            args.remove(0);
+            cmd_replay(&mut args);
         }
-        if a.starts_with('-') {
-            continue;
+        "attach" => {
+            args.remove(0);
+            cmd_attach(&mut args);
         }
-        target_idx = Some(i);
-        break;
+        _ => {
+            if args.iter().any(|a| a == "--replay") {
+                cmd_replay_compat(&mut args);
+            } else if take_flag(&mut args, "--consumer-only") {
+                cmd_attach(&mut args);
+            } else if args.iter().any(|a| a == "--record") {
+                cmd_record_compat(&mut args);
+            } else {
+                cmd_run(&mut args);
+            }
+        }
     }
+}
 
+fn cmd_run(args: &mut Vec<String>) {
+    let live = take_flag(args, "--live");
+    take_flag(args, "--once");
+    let once = !live;
+
+    let min_events = take_flag_value(args, "--min-events")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1u64);
+    let record_path = take_flag_value(args, "--record").or_else(|| take_flag_value(args, "-o"));
+    let topo_path =
+        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
+    let heatmap_path =
+        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+
+    let target_idx = args.iter().position(|a| !a.starts_with('-'));
     let target_idx = match target_idx {
         Some(i) => i,
-        None => {
-            eprintln!("memvis: error: no target specified");
-            print_usage();
-            std::process::exit(1);
-        }
+        None => die("no target binary specified"),
     };
 
-    let target = &args[target_idx];
+    let target = args[target_idx].clone();
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
     launch(
-        target,
+        &target,
         &target_args,
         once,
         min_events,
         record_path,
+        topo_path,
+        heatmap_path,
+    );
+}
+
+fn cmd_record(args: &mut Vec<String>) {
+    let live = take_flag(args, "--live");
+    take_flag(args, "--once");
+    let once = !live;
+
+    let output = take_flag_value(args, "-o")
+        .or_else(|| take_flag_value(args, "--output"))
+        .or_else(|| take_flag_value(args, "--record"));
+    let output = match output {
+        Some(p) => p,
+        None => die("record requires -o <file>"),
+    };
+
+    let min_events = take_flag_value(args, "--min-events")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1u64);
+    let topo_path =
+        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
+    let heatmap_path =
+        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+
+    let target_idx = args.iter().position(|a| !a.starts_with('-'));
+    let target_idx = match target_idx {
+        Some(i) => i,
+        None => die("record requires a target binary"),
+    };
+
+    let target = args[target_idx].clone();
+    let target_args: Vec<String> = args[target_idx + 1..].to_vec();
+
+    launch(
+        &target,
+        &target_args,
+        once,
+        min_events,
+        Some(output),
+        topo_path,
+        heatmap_path,
+    );
+}
+
+fn cmd_replay(args: &mut Vec<String>) {
+    take_flag(args, "--once");
+    let topo_path =
+        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
+    let dwarf_path = take_flag_value(args, "--dwarf");
+
+    let trace_path = args.iter().position(|a| !a.starts_with('-'));
+    let trace_path = match trace_path {
+        Some(i) => args.remove(i),
+        None => die("replay requires a trace file"),
+    };
+
+    let elf_path = dwarf_path.or_else(|| {
+        args.iter()
+            .position(|a| !a.starts_with('-'))
+            .map(|i| args.remove(i))
+    });
+
+    let tp_owned = topo_path;
+    let handle = thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || run_replay(&trace_path, elf_path.as_deref(), true, tp_owned))
+        .expect("memvis: failed to spawn replay thread");
+    let _ = handle.join();
+}
+
+fn cmd_attach(args: &mut Vec<String>) {
+    let live = take_flag(args, "--live");
+    take_flag(args, "--once");
+    let once = !live;
+
+    let min_events = take_flag_value(args, "--min-events")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1u64);
+    let record_path = take_flag_value(args, "-o")
+        .or_else(|| take_flag_value(args, "--output"))
+        .or_else(|| take_flag_value(args, "--record"));
+    let topo_path =
+        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
+    let heatmap_path =
+        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+    let dwarf_path = take_flag_value(args, "--dwarf");
+
+    let elf_path: Option<String> = dwarf_path.or_else(|| {
+        args.iter()
+            .position(|a| !a.starts_with('-'))
+            .map(|i| args.remove(i))
+    });
+
+    let handle = thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || {
+            run_consumer(
+                elf_path.as_deref(),
+                once,
+                min_events,
+                record_path,
+                topo_path,
+                heatmap_path,
+            )
+        })
+        .expect("memvis: failed to spawn consumer thread");
+    let _ = handle.join();
+}
+
+fn cmd_replay_compat(args: &mut Vec<String>) {
+    let replay_path = take_flag_value(args, "--replay").unwrap();
+    take_flag(args, "--once");
+    let topo_path =
+        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
+
+    let elf_path: Option<String> = args
+        .iter()
+        .position(|a| !a.starts_with('-'))
+        .map(|i| args.remove(i));
+
+    let tp_owned = topo_path;
+    let handle = thread::Builder::new()
+        .stack_size(64 * 1024 * 1024)
+        .spawn(move || run_replay(&replay_path, elf_path.as_deref(), true, tp_owned))
+        .expect("memvis: failed to spawn replay thread");
+    let _ = handle.join();
+}
+
+fn cmd_record_compat(args: &mut Vec<String>) {
+    let record_path = take_flag_value(args, "--record").unwrap();
+    cmd_run_with_record(args, record_path);
+}
+
+fn cmd_run_with_record(args: &mut Vec<String>, record_path: String) {
+    let live = take_flag(args, "--live");
+    take_flag(args, "--once");
+    let once = !live;
+
+    let min_events = take_flag_value(args, "--min-events")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(1u64);
+    let topo_path =
+        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
+    let heatmap_path =
+        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+
+    let target_idx = args.iter().position(|a| !a.starts_with('-'));
+    let target_idx = match target_idx {
+        Some(i) => i,
+        None => die("no target binary specified"),
+    };
+
+    let target = args[target_idx].clone();
+    let target_args: Vec<String> = args[target_idx + 1..].to_vec();
+
+    launch(
+        &target,
+        &target_args,
+        once,
+        min_events,
+        Some(record_path),
         topo_path,
         heatmap_path,
     );
