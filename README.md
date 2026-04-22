@@ -52,17 +52,17 @@ cargo build --release --manifest-path engine/Cargo.toml
 gcc -g examples/heap_chain.c -o heap_chain
 
 # 4. Run it
-./engine/target/release/memvis --once ./heap_chain
+./engine/target/release/memvis ./heap_chain
 ```
 
 You should see a named memory map with `g_head`, `g_tail`, heap type
 projections, and a 4-node linked list discovered via retrospective type
 reconciliation.
 
-For the interactive TUI (live, 20 Hz refresh), drop `--once`:
+For the interactive TUI (live, 20 Hz refresh):
 
 ```sh
-./engine/target/release/memvis ./heap_chain
+./engine/target/release/memvis ./heap_chain --live
 ```
 
 ## Quick start (Docker)
@@ -81,7 +81,7 @@ gcc -g examples/heap_chain.c -o heap_chain
 docker run --rm \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     -v $(pwd)/heap_chain:/app/heap_chain \
-    memvis --once /app/heap_chain
+    memvis /app/heap_chain
 ```
 
 `--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required
