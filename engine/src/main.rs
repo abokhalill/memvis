@@ -470,9 +470,13 @@ fn run_headless(
 
         if drained == 0 {
             idle_rounds += 1;
+
+            let tracer_gone = TRACER_EXITED.load(AtomicOrdering::Relaxed);
+
             // after seeing events, if the ring stays empty for 50 consecutive
             // rounds (~500ms), the target has finished. render final snapshot.
-            if *total > 0 && idle_rounds >= 50 {
+            if *total > 0 && (idle_rounds >= 50 || tracer_gone) {
+                eprintln!("memvis: {} events processed, rendering snapshot", total);
                 let snap = world.snapshot();
                 headless_render(
                     &mut out,
@@ -490,6 +494,37 @@ fn run_headless(
                 let _ = out.flush();
                 return;
             }
+
+            // zero events and tracer is already gone → nothing will ever arrive
+            if *total == 0 && tracer_gone {
+                let status = TRACER_EXIT_STATUS.load(AtomicOrdering::Relaxed);
+                eprintln!("memvis: error: tracer exited before any events were received.");
+                if libc::WIFEXITED(status) {
+                    let code = libc::WEXITSTATUS(status);
+                    eprintln!("memvis: tracer exit code: {}", code);
+                } else if libc::WIFSIGNALED(status) {
+                    let sig = libc::WTERMSIG(status);
+                    eprintln!("memvis: tracer killed by signal: {}", sig);
+                }
+                eprintln!("memvis: possible causes:");
+                eprintln!("  - target program exited before tracer could instrument it");
+                eprintln!(
+                    "  - DynamoRIO injection failed (missing --cap-add=SYS_PTRACE in Docker?)"
+                );
+                eprintln!("  - target binary is not a dynamically-linked ELF executable");
+                eprintln!("  - shared memory ring was not created (tracer init failed)");
+                std::process::exit(1);
+            }
+
+            // zero events but tracer still running; keep waiting, but warn after 5s
+            if *total == 0 && idle_rounds == 500 {
+                eprintln!("memvis: warning: 5s elapsed with no events from tracer");
+                eprintln!(
+                    "memvis: still waiting... (tracer pid {} is alive)",
+                    TRACER_PID.load(AtomicOrdering::Relaxed)
+                );
+            }
+
             thread::sleep(time::Duration::from_millis(10));
         } else {
             idle_rounds = 0;
@@ -522,8 +557,9 @@ fn run_headless(
             warm_scan_done = true;
         }
 
-        // safety valve: if we've been running a long time with no tracer, bail
+        // safety valve: user sent SIGINT/SIGTERM
         if GOT_SIGNAL.load(AtomicOrdering::Relaxed) {
+            eprintln!("memvis: interrupted, {} events processed", total);
             break;
         }
     }
@@ -1148,6 +1184,8 @@ fn find_tracer() -> Option<std::path::PathBuf> {
 
 static TRACER_PID: AtomicI32 = AtomicI32::new(0);
 static GOT_SIGNAL: AtomicBool = AtomicBool::new(false);
+static TRACER_EXITED: AtomicBool = AtomicBool::new(false);
+static TRACER_EXIT_STATUS: AtomicI32 = AtomicI32::new(0);
 
 extern "C" fn signal_handler(_sig: libc::c_int) {
     GOT_SIGNAL.store(true, AtomicOrdering::SeqCst);
@@ -1200,9 +1238,51 @@ fn run_consumer(
             eprintln!("memvis: interrupted while waiting for tracer");
             return;
         }
+        if TRACER_EXITED.load(AtomicOrdering::Relaxed) {
+            // tracer died before we could attach — give it one last chance
+            // to have created the shm (race: tracer creates shm then exits)
+            if orch.try_attach_ctl() {
+                orch.poll_new_rings();
+                if orch.ring_count() > 0 {
+                    eprintln!(
+                        "memvis: attached (tracer already exited), {} ring(s)",
+                        orch.ring_count()
+                    );
+                    run(
+                        orch,
+                        dwarf_info,
+                        once,
+                        min_events,
+                        record_path,
+                        topo_path,
+                        heatmap_path,
+                    );
+                    return;
+                }
+            }
+            let status = TRACER_EXIT_STATUS.load(AtomicOrdering::Relaxed);
+            eprintln!("memvis: error: tracer process exited before shared memory was created.");
+            if libc::WIFEXITED(status) {
+                eprintln!("memvis: tracer exit code: {}", libc::WEXITSTATUS(status));
+            } else if libc::WIFSIGNALED(status) {
+                eprintln!(
+                    "memvis: tracer killed by signal: {}",
+                    libc::WTERMSIG(status)
+                );
+            }
+            eprintln!("memvis: possible causes:");
+            eprintln!("  - DynamoRIO injection failed (missing --cap-add=SYS_PTRACE in Docker?)");
+            eprintln!("  - target binary not found or not executable");
+            eprintln!("  - tracer .so not compatible with this DynamoRIO version");
+            std::process::exit(1);
+        }
         if time::Instant::now() > deadline {
-            eprintln!("memvis: timeout waiting for tracer (30s). Is DynamoRIO running?");
-            return;
+            eprintln!("memvis: timeout waiting for tracer (30s).");
+            eprintln!("memvis: the tracer process is still running but has not created the shared memory ring.");
+            eprintln!("memvis: possible causes:");
+            eprintln!("  - DynamoRIO is still loading (very large binary)");
+            eprintln!("  - tracer initialization is blocked or hung");
+            std::process::exit(1);
         }
         if orch.try_attach_ctl() {
             orch.poll_new_rings();
@@ -1284,6 +1364,28 @@ fn launch(
     TRACER_PID.store(child_pid, AtomicOrdering::SeqCst);
     eprintln!("memvis: tracer pid={}", child_pid);
 
+    // reaper thread: waitpid on tracer child, signal consumer when it exits
+    let _reaper = thread::Builder::new()
+        .name("tracer-reaper".into())
+        .spawn(move || {
+            let mut status: libc::c_int = 0;
+            unsafe {
+                libc::waitpid(child_pid, &mut status, 0);
+            }
+            TRACER_EXIT_STATUS.store(status, AtomicOrdering::SeqCst);
+            TRACER_EXITED.store(true, AtomicOrdering::SeqCst);
+            if libc::WIFEXITED(status) {
+                let code = libc::WEXITSTATUS(status);
+                if code != 0 {
+                    eprintln!("memvis: tracer exited with code {}", code);
+                }
+            } else if libc::WIFSIGNALED(status) {
+                let sig = libc::WTERMSIG(status);
+                eprintln!("memvis: tracer killed by signal {}", sig);
+            }
+        })
+        .expect("memvis: failed to spawn reaper thread");
+
     // run consumer on a thread with 64MB stack (DWARF parsing of complex
     // struct types like kernel sched.c can overflow the default 8MB stack)
     let target_owned = target.to_string();
@@ -1303,10 +1405,12 @@ fn launch(
     let _ = handle.join();
 
     // cleanup: kill tracer if still running, reap
-    unsafe {
-        libc::kill(child_pid, libc::SIGTERM);
-        let mut status: libc::c_int = 0;
-        libc::waitpid(child_pid, &mut status, 0);
+    if !TRACER_EXITED.load(AtomicOrdering::SeqCst) {
+        unsafe {
+            libc::kill(child_pid, libc::SIGTERM);
+            let mut status: libc::c_int = 0;
+            libc::waitpid(child_pid, &mut status, 0);
+        }
     }
     cleanup_shm();
     eprintln!("memvis: done.");
