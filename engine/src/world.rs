@@ -1054,6 +1054,64 @@ impl SnapshotRing {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct SnapshotDelta {
+    pub older_seq: u64,
+    pub newer_seq: u64,
+    pub node_delta: i64,
+    pub edge_delta: i64,
+    pub nodes_added: Vec<String>,
+    pub nodes_removed: Vec<String>,
+    pub edges_added: u64,
+    pub edges_removed: u64,
+    pub value_changes: Vec<(String, u64, u64)>,
+}
+
+impl SnapshotRing {
+    pub fn delta(&self, older_idx: usize, newer_idx: usize) -> Option<SnapshotDelta> {
+        let a = self.slot(older_idx)?;
+        let b = self.slot(newer_idx)?;
+        let sa = &a.snap;
+        let sb = &b.snap;
+
+        let a_keys: std::collections::BTreeSet<&NodeId> = sa.nodes.keys().collect();
+        let b_keys: std::collections::BTreeSet<&NodeId> = sb.nodes.keys().collect();
+
+        let nodes_added: Vec<String> = b_keys
+            .difference(&a_keys)
+            .filter_map(|nid| sb.nodes.get(nid).map(|n| n.name.clone()))
+            .collect();
+        let nodes_removed: Vec<String> = a_keys
+            .difference(&b_keys)
+            .filter_map(|nid| sa.nodes.get(nid).map(|n| n.name.clone()))
+            .collect();
+
+        let a_edge_keys: std::collections::BTreeSet<&NodeId> = sa.edges.keys().collect();
+        let b_edge_keys: std::collections::BTreeSet<&NodeId> = sb.edges.keys().collect();
+
+        let mut value_changes = Vec::new();
+        for nid in a_keys.intersection(&b_keys) {
+            if let (Some(na), Some(nb)) = (sa.nodes.get(nid), sb.nodes.get(nid)) {
+                if na.raw_value != nb.raw_value {
+                    value_changes.push((na.name.clone(), na.raw_value, nb.raw_value));
+                }
+            }
+        }
+
+        Some(SnapshotDelta {
+            older_seq: a.event_seq,
+            newer_seq: b.event_seq,
+            node_delta: sb.nodes.len() as i64 - sa.nodes.len() as i64,
+            edge_delta: sb.edges.len() as i64 - sa.edges.len() as i64,
+            nodes_added,
+            nodes_removed,
+            edges_added: b_edge_keys.difference(&a_edge_keys).count() as u64,
+            edges_removed: a_edge_keys.difference(&b_edge_keys).count() as u64,
+            value_changes,
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1132,6 +1190,111 @@ mod tests {
         assert!(sr.insn <= 4);
 
         assert!(ring.find_by_insn(0).is_none());
+    }
+
+    #[test]
+    fn test_snapshot_delta_identity() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "x", &ti("int", 4, false), 0x1000, 4);
+        ws.update_value(NodeId::Global(0), 42, 1);
+
+        let mut ring = SnapshotRing::new(4);
+        let snap = ws.snapshot();
+        ring.push(snap.clone(), 0, 100);
+        ring.push(snap, 1, 101);
+
+        let d = ring.delta(0, 1).unwrap();
+        assert_eq!(d.node_delta, 0);
+        assert_eq!(d.edge_delta, 0);
+        assert!(d.nodes_added.is_empty());
+        assert!(d.nodes_removed.is_empty());
+        assert!(d.value_changes.is_empty());
+        assert_eq!(d.edges_added, 0);
+        assert_eq!(d.edges_removed, 0);
+    }
+
+    #[test]
+    fn test_snapshot_delta_known_mutation() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "x", &ti("int", 4, false), 0x1000, 4);
+        ws.update_value(NodeId::Global(0), 10, 1);
+
+        let mut ring = SnapshotRing::new(4);
+        ring.push(ws.snapshot(), 0, 100);
+
+        ws.ensure_node(NodeId::Global(1), "y", &ti("int", 4, false), 0x2000, 4);
+        ws.update_value(NodeId::Global(0), 99, 2);
+        ws.ensure_node(NodeId::Global(2), "p", &ti("*int", 8, true), 0x3000, 8);
+        ws.update_edge(NodeId::Global(2), Some(NodeId::Global(0)), 0x1000);
+        ring.push(ws.snapshot(), 1, 200);
+
+        let d = ring.delta(0, 1).unwrap();
+        assert_eq!(d.node_delta, 2); // y + p added
+        assert_eq!(d.edge_delta, 1);
+        assert_eq!(d.nodes_added.len(), 2);
+        assert!(d.nodes_added.contains(&"y".to_string()));
+        assert!(d.nodes_added.contains(&"p".to_string()));
+        assert!(d.nodes_removed.is_empty());
+        assert_eq!(d.edges_added, 1);
+        assert_eq!(d.value_changes.len(), 1);
+        assert_eq!(d.value_changes[0], ("x".to_string(), 10, 99));
+        assert_eq!(d.older_seq, 100);
+        assert_eq!(d.newer_seq, 200);
+    }
+
+    #[test]
+    fn test_snapshot_delta_wraparound() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "a", &ti("int", 4, false), 0x1000, 4);
+
+        let mut ring = SnapshotRing::new(3);
+        // push 5 snapshots into a ring of cap 3 → slots 0,1 overwritten
+        for i in 0..5u64 {
+            ws.update_value(NodeId::Global(0), i * 10, i);
+            ws.inc_insn_counter();
+            ring.push(ws.snapshot(), i, i * 100);
+        }
+        assert_eq!(ring.len(), 3);
+        // oldest is seq=200 (i=2), newest is seq=400 (i=4)
+        assert_eq!(ring.get(0).unwrap().event_seq, 200);
+        assert_eq!(ring.get(2).unwrap().event_seq, 400);
+
+        let d = ring.delta(0, 2).unwrap();
+        assert_eq!(d.older_seq, 200);
+        assert_eq!(d.newer_seq, 400);
+        // value at i=2 was 20, at i=4 was 40
+        assert_eq!(d.value_changes.len(), 1);
+        assert_eq!(d.value_changes[0], ("a".to_string(), 20, 40));
+    }
+
+    #[test]
+    fn test_snapshot_delta_node_removal() {
+        let mut ws = WorldState::new();
+        ws.ensure_node(NodeId::Global(0), "x", &ti("int", 4, false), 0x1000, 4);
+        ws.ensure_node(
+            NodeId::Local(1, 0),
+            "local_a",
+            &ti("int", 4, false),
+            0x7000,
+            4,
+        );
+
+        let mut ring = SnapshotRing::new(4);
+        ring.push(ws.snapshot(), 0, 100);
+
+        ws.remove_frame_nodes(1);
+        ring.push(ws.snapshot(), 1, 200);
+
+        let d = ring.delta(0, 1).unwrap();
+        assert_eq!(d.node_delta, -1);
+        assert!(d.nodes_removed.contains(&"local_a".to_string()));
+        assert!(d.nodes_added.is_empty());
+    }
+
+    #[test]
+    fn test_snapshot_delta_out_of_bounds() {
+        let ring = SnapshotRing::new(4);
+        assert!(ring.delta(0, 1).is_none());
     }
 
     #[test]
