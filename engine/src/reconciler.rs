@@ -568,7 +568,148 @@ pub struct WarmScanStats {
     pub globals_scanned: u64,
 }
 
-// BFS over /proc/<pid>/mem from global roots. stamps cold pointers missed by DBI.
+pub struct WarmScanner {
+    mem: File,
+    queue: VecDeque<(u64, TypeInfo, String, u32)>,
+    visited: HashSet<u64>,
+    pub stats: WarmScanStats,
+    pub passes: u32,
+    max_depth: u32,
+    pub seeded: bool,
+}
+
+impl WarmScanner {
+    pub fn new(pid: u32, max_depth: u32) -> io::Result<Self> {
+        let mem = File::open(format!("/proc/{}/mem", pid))?;
+        Ok(Self {
+            mem,
+            queue: VecDeque::new(),
+            visited: HashSet::new(),
+            stats: WarmScanStats::default(),
+            passes: 0,
+            max_depth,
+            seeded: false,
+        })
+    }
+
+    #[cfg(test)]
+    pub fn from_file(mem: File, max_depth: u32) -> Self {
+        Self {
+            mem,
+            queue: VecDeque::new(),
+            visited: HashSet::new(),
+            stats: WarmScanStats::default(),
+            passes: 0,
+            max_depth,
+            seeded: false,
+        }
+    }
+
+    pub fn is_idle(&self) -> bool {
+        self.seeded && self.queue.is_empty()
+    }
+
+    pub fn queue_len(&self) -> usize {
+        self.queue.len()
+    }
+
+    // seed queue from globals; call before first step or to re-scan.
+    pub fn seed(
+        &mut self,
+        info: &DwarfInfo,
+        delta: u64,
+        heap_oracle: &HeapOracle,
+        topo: &mut Option<TopologyStream>,
+    ) {
+        for g in &info.globals {
+            let base = g.addr.wrapping_add(delta);
+            self.stats.globals_scanned += 1;
+            scan_ptr_fields(
+                &self.mem,
+                base,
+                &g.type_info,
+                &g.name,
+                1,
+                &mut self.queue,
+                &mut self.stats,
+                heap_oracle,
+                &info.type_registry,
+                topo,
+                u64::MAX,
+            );
+        }
+        self.seeded = true;
+        self.passes += 1;
+    }
+
+    // process up to `budget` reads from the queue. returns stamps applied this step.
+    pub fn step(
+        &mut self,
+        budget: u64,
+        info: &DwarfInfo,
+        world: &mut WorldState,
+        heap_oracle: &HeapOracle,
+        topo: &mut Option<TopologyStream>,
+    ) -> u64 {
+        let start_reads = self.stats.reads;
+        let mut stamps_this_step = 0u64;
+
+        while let Some((target_addr, pointee_ti, source_name, depth)) = self.queue.pop_front() {
+            if self.stats.reads - start_reads >= budget {
+                self.queue
+                    .push_front((target_addr, pointee_ti, source_name, depth));
+                break;
+            }
+            if depth > self.max_depth {
+                continue;
+            }
+            if !self.visited.insert(target_addr) {
+                continue;
+            }
+            self.stats.queue_visits += 1;
+            self.stats.max_depth_reached = self.stats.max_depth_reached.max(depth);
+
+            if heap_oracle.is_heap(target_addr) {
+                world.heap_allocs.check_size(target_addr, &pointee_ti);
+            } else {
+                self.stats.not_heap += 1;
+            }
+            if world
+                .stm
+                .stamp_type(target_addr, &pointee_ti, &source_name, 0)
+            {
+                self.stats.stamps_applied += 1;
+                stamps_this_step += 1;
+                if let Some(ref mut ts) = topo {
+                    ts.emit_cold_stamp(
+                        target_addr,
+                        &pointee_ti.name,
+                        pointee_ti.byte_size,
+                        &source_name,
+                        pointee_ti.fields.len(),
+                        depth,
+                    );
+                }
+            }
+            scan_ptr_fields(
+                &self.mem,
+                target_addr,
+                &pointee_ti,
+                &source_name,
+                depth + 1,
+                &mut self.queue,
+                &mut self.stats,
+                heap_oracle,
+                &info.type_registry,
+                topo,
+                u64::MAX,
+            );
+        }
+        stamps_this_step
+    }
+}
+
+// one-shot BFS (retained for replay and backward compat)
 #[allow(clippy::too_many_arguments)]
 pub fn warm_scan(
     info: &DwarfInfo,
@@ -896,6 +1037,45 @@ mod tests {
     }
 
     #[test]
+    fn test_abi_event_kind_parity() {
+        // these must match memvis_bridge.h MEMVIS_EVENT_* defines exactly.
+        // any drift here is a silent data corruption bug.
+        assert_eq!(EVENT_WRITE, 0, "EVENT_WRITE != MEMVIS_EVENT_WRITE");
+        assert_eq!(EVENT_READ, 1, "EVENT_READ != MEMVIS_EVENT_READ");
+        assert_eq!(EVENT_CALL, 2, "EVENT_CALL != MEMVIS_EVENT_CALL");
+        assert_eq!(EVENT_RETURN, 3, "EVENT_RETURN != MEMVIS_EVENT_RETURN");
+        assert_eq!(
+            EVENT_REG_SNAPSHOT, 5,
+            "EVENT_REG_SNAPSHOT != MEMVIS_EVENT_REG_SNAPSHOT"
+        );
+        assert_eq!(
+            EVENT_CACHE_MISS, 6,
+            "EVENT_CACHE_MISS != MEMVIS_EVENT_CACHE_MISS"
+        );
+        assert_eq!(
+            EVENT_MODULE_LOAD, 7,
+            "EVENT_MODULE_LOAD != MEMVIS_EVENT_MODULE_LOAD"
+        );
+        assert_eq!(EVENT_ALLOC, 9, "EVENT_ALLOC != MEMVIS_EVENT_ALLOC");
+        assert_eq!(EVENT_FREE, 10, "EVENT_FREE != MEMVIS_EVENT_FREE");
+        assert_eq!(
+            EVENT_BB_ENTRY, 11,
+            "EVENT_BB_ENTRY != MEMVIS_EVENT_BB_ENTRY"
+        );
+        assert_eq!(EVENT_RELOAD, 12, "EVENT_RELOAD != MEMVIS_EVENT_RELOAD");
+    }
+
+    #[test]
+    fn test_abi_event_struct_size() {
+        // Event must be 32 bytes to match memvis_event_v3_t
+        assert_eq!(
+            std::mem::size_of::<Event>(),
+            32,
+            "Event struct size drift — ABI mismatch with memvis_event_v3_t"
+        );
+    }
+
+    #[test]
     fn test_process_event_unknown_kind_rejected() {
         let orch = RingOrchestrator::new();
         let mut world = WorldState::new();
@@ -930,5 +1110,184 @@ mod tests {
         assert!(!accepted, "unknown kind must return false");
         assert_eq!(world.insn_counter(), 0);
         assert!(world.bb_hits.is_empty());
+    }
+
+    // a→b→c pointer chain in a synthetic pread-able file
+    fn make_synthetic_mem() -> (std::fs::File, dwarf::DwarfInfo) {
+        use std::collections::BTreeMap;
+        use std::os::unix::fs::FileExt;
+        let path = "/tmp/memvis_test_synth_mem";
+        let f = std::fs::File::create(path).unwrap();
+        let mut buf = vec![0u8; 0x4000];
+        buf[0x1000..0x1008].copy_from_slice(&0x2000u64.to_le_bytes());
+        buf[0x2000..0x2008].copy_from_slice(&0x3000u64.to_le_bytes());
+        buf[0x3000..0x3004].copy_from_slice(&42u32.to_le_bytes());
+        f.write_all_at(&buf, 0).unwrap();
+
+        let mk = |name: &str, sz: u64, ptr: bool, fields: Vec<dwarf::FieldInfo>| dwarf::TypeInfo {
+            name: name.into(),
+            byte_size: sz,
+            is_pointer: ptr,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields,
+        };
+        let loc = dwarf::LocationTable { entries: vec![] };
+        let ti_c = mk(
+            "struct_c",
+            4,
+            false,
+            vec![dwarf::FieldInfo {
+                name: "val".into(),
+                byte_offset: 0,
+                byte_size: 4,
+                type_info: mk("int", 4, false, vec![]),
+                alignment: 0,
+            }],
+        );
+        let ti_b = mk(
+            "struct_b",
+            8,
+            false,
+            vec![dwarf::FieldInfo {
+                name: "ptr_to_c".into(),
+                byte_offset: 0,
+                byte_size: 8,
+                type_info: mk(
+                    "*struct_c",
+                    8,
+                    true,
+                    vec![dwarf::FieldInfo {
+                        name: "<pointee>".into(),
+                        byte_offset: 0,
+                        byte_size: 4,
+                        type_info: ti_c.clone(),
+                        alignment: 0,
+                    }],
+                ),
+                alignment: 0,
+            }],
+        );
+        let ti_a = mk(
+            "struct_a",
+            8,
+            false,
+            vec![dwarf::FieldInfo {
+                name: "ptr_to_b".into(),
+                byte_offset: 0,
+                byte_size: 8,
+                type_info: mk(
+                    "*struct_b",
+                    8,
+                    true,
+                    vec![dwarf::FieldInfo {
+                        name: "<pointee>".into(),
+                        byte_offset: 0,
+                        byte_size: 8,
+                        type_info: ti_b.clone(),
+                        alignment: 0,
+                    }],
+                ),
+                alignment: 0,
+            }],
+        );
+
+        let mut type_registry: HashMap<String, dwarf::TypeInfo> = HashMap::new();
+        type_registry.insert("struct_a".into(), ti_a.clone());
+        type_registry.insert("struct_b".into(), ti_b);
+        type_registry.insert("struct_c".into(), ti_c);
+
+        let info = dwarf::DwarfInfo {
+            globals: vec![dwarf::GlobalVar {
+                name: "global_a".into(),
+                addr: 0x1000,
+                size: 8,
+                type_info: ti_a,
+                location: loc,
+            }],
+            functions: BTreeMap::new(),
+            elf_base_vaddr: 0,
+            type_registry,
+            cfi: dwarf::CfiTable::default(),
+            elf_path: String::new(),
+        };
+        let f = std::fs::File::open(path).unwrap();
+        (f, info)
+    }
+
+    #[test]
+    fn test_warm_scanner_full_traversal() {
+        let (mem, info) = make_synthetic_mem();
+        let mut scanner = WarmScanner::from_file(mem, 8);
+        let mut world = WorldState::new();
+        let oracle = HeapOracle::new();
+        let mut topo: Option<TopologyStream> = None;
+
+        assert!(!scanner.seeded);
+        scanner.seed(&info, 0, &oracle, &mut topo);
+        assert!(scanner.seeded);
+        assert!(!scanner.is_idle());
+
+        let stamps = scanner.step(1000, &info, &mut world, &oracle, &mut topo);
+        assert!(stamps > 0);
+        assert!(scanner.is_idle());
+        assert_eq!(scanner.passes, 1);
+        assert!(scanner.stats.reads > 0);
+    }
+
+    #[test]
+    fn test_warm_scanner_budget_exhaustion_and_resume() {
+        let (mem, info) = make_synthetic_mem();
+        let mut scanner = WarmScanner::from_file(mem, 8);
+        let mut world = WorldState::new();
+        let oracle = HeapOracle::new();
+        let mut topo: Option<TopologyStream> = None;
+
+        scanner.seed(&info, 0, &oracle, &mut topo);
+        let mut total_stamps = 0u64;
+        let mut steps = 0u32;
+        while !scanner.is_idle() {
+            total_stamps += scanner.step(1, &info, &mut world, &oracle, &mut topo);
+            steps += 1;
+            assert!(steps < 100, "runaway BFS");
+        }
+
+        // parity: step-by-step == one-shot
+        let (mem2, info2) = make_synthetic_mem();
+        let mut sc2 = WarmScanner::from_file(mem2, 8);
+        let mut w2 = WorldState::new();
+        sc2.seed(&info2, 0, &oracle, &mut topo);
+        let oneshot = sc2.step(1000, &info2, &mut w2, &oracle, &mut topo);
+
+        assert_eq!(
+            total_stamps, oneshot,
+            "step-by-step stamps != one-shot stamps"
+        );
+        assert_eq!(
+            scanner.stats.reads, sc2.stats.reads,
+            "step-by-step reads != one-shot reads"
+        );
+    }
+
+    #[test]
+    fn test_warm_scanner_reseed() {
+        let (mem, info) = make_synthetic_mem();
+        let mut scanner = WarmScanner::from_file(mem, 8);
+        let mut world = WorldState::new();
+        let oracle = HeapOracle::new();
+        let mut topo: Option<TopologyStream> = None;
+
+        scanner.seed(&info, 0, &oracle, &mut topo);
+        scanner.step(1000, &info, &mut world, &oracle, &mut topo);
+        assert!(scanner.is_idle());
+        assert_eq!(scanner.passes, 1);
+        let r1 = scanner.stats.reads;
+
+        scanner.seed(&info, 0, &oracle, &mut topo);
+        assert_eq!(scanner.passes, 2);
+        scanner.step(1000, &info, &mut world, &oracle, &mut topo);
+        assert!(scanner.is_idle());
+        assert!(scanner.stats.reads >= r1);
     }
 }
