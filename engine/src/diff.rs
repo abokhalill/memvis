@@ -17,7 +17,7 @@ use memvis::world::{HazardKind, ShadowStack, WorldState};
 struct Args {
     baseline: String,
     subject: String,
-    dwarf_path: String,
+    dwarf_path: Option<String>,
     interval: u64,
     output: Option<String>,
 }
@@ -79,10 +79,7 @@ fn parse_args() -> Args {
             eprintln!("memvis-diff: --subject required");
             process::exit(1);
         }),
-        dwarf_path: dwarf_path.unwrap_or_else(|| {
-            eprintln!("memvis-diff: --dwarf required");
-            process::exit(1);
-        }),
+        dwarf_path,
         interval,
         output,
     }
@@ -670,15 +667,22 @@ fn main() {
         "memvis-diff: baseline={} subject={}",
         args.baseline, args.subject
     );
-    eprintln!("  dwarf={} interval={}", args.dwarf_path, args.interval);
+    eprintln!(
+        "  dwarf={} interval={}",
+        args.dwarf_path.as_deref().unwrap_or("<none>"),
+        args.interval
+    );
 
-    let mut dwarf_info = match dwarf::parse_elf(&args.dwarf_path) {
-        Ok(info) => Some(info),
-        Err(e) => {
-            eprintln!("memvis-diff: DWARF parse failed: {}", e);
-            None
-        }
-    };
+    let mut dwarf_info = args
+        .dwarf_path
+        .as_ref()
+        .and_then(|p| match dwarf::parse_elf(p) {
+            Ok(info) => Some(info),
+            Err(e) => {
+                eprintln!("memvis-diff: DWARF parse failed: {}", e);
+                None
+            }
+        });
 
     eprintln!("\n── Baseline ────────────────────────────────────");
     let checkpoints_a = match replay_to_checkpoints(&args.baseline, &mut dwarf_info, args.interval)
