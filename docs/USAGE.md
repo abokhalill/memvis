@@ -4,40 +4,51 @@ Full flag reference and invocation examples for all memvis binaries.
 
 ## memvis
 
-### Live instrumentation
+### Instrument and run
 
 ```sh
-# interactive TUI (6 panels, 20 Hz)
-DYNAMORIO_HOME=/path/to/DynamoRIO memvis ./my_program [args...]
+# headless (default): print snapshot to stdout, exit on idle
+memvis ./my_program [args...]
 
-# explicit DWARF source (separate debug ELF)
-DYNAMORIO_HOME=/path/to/DynamoRIO memvis --dwarf ./my_program.debug ./my_program
-
-# headless: print final snapshot to stdout, exit on 500ms idle
-DYNAMORIO_HOME=/path/to/DynamoRIO memvis --once ./my_program
+# interactive TUI
+memvis ./my_program --live [args...]
 
 # record events for offline analysis
-DYNAMORIO_HOME=/path/to/DynamoRIO memvis --record trace.bin --once ./my_program
+memvis record -o trace.bin ./my_program
 
-# stream topology deltas to JSONL
-DYNAMORIO_HOME=/path/to/DynamoRIO memvis --export-topology topo.jsonl --once ./my_program
+# export topology, heatmap, and BB coverage
+memvis ./my_program --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
 
-# export field write heatmap for lint divergence analysis
-DYNAMORIO_HOME=/path/to/DynamoRIO memvis --export-heatmap heat.tsv --once ./my_program
+# skip BB_ENTRY events (reduces volume, no topology impact)
+memvis ./my_program --no-bb
 ```
 
-### Offline replay
+### Replay
 
 ```sh
-memvis --replay trace.bin --once ./my_program
+memvis replay trace.bin --dwarf ./my_program
+memvis replay trace.bin --no-bb
 ```
 
-### Consumer-only mode
+### Attach to running tracer
 
 ```sh
-# engine attaches to an already-running tracer
-memvis --consumer-only [--once] ./my_program
+memvis attach --dwarf ./my_program
+memvis attach --live
 ```
+
+### Flags
+
+| Flag | Description |
+|---|---|
+| `--live` | Interactive TUI instead of headless |
+| `--topology <file>` | Export topology graph as JSONL |
+| `--heatmap <file>` | Export field write heatmap as TSV |
+| `--coverage <file>` | Export basic-block coverage map as TSV |
+| `--no-bb` | Skip BB_ENTRY events (reduces volume) |
+| `--min-events <N>` | Minimum events before snapshot (default: 1) |
+| `--dwarf <elf>` | Explicit DWARF source |
+| `-o, --output <file>` | Output file (for record) |
 
 ## memvis-diff
 
