@@ -8,7 +8,7 @@ use std::{env, thread, time};
 use memvis::dwarf::{self, DwarfInfo};
 use memvis::heap_graph::{HeapGraph, HeapOracle};
 use memvis::index::{AddressIndex, FrameId, NodeId};
-use memvis::reconciler::{self, EVENT_CALL, EVENT_REG_SNAPSHOT};
+use memvis::reconciler::{self, EVENT_BB_ENTRY, EVENT_CALL, EVENT_REG_SNAPSHOT};
 use memvis::record::{EventPlayer, EventRecorder};
 use memvis::ring::{Event, RingOrchestrator};
 use memvis::shadow_regs::ShadowRegisterFile;
@@ -16,15 +16,24 @@ use memvis::topology::TopologyStream;
 use memvis::tui::{self, AppState, JournalEntry};
 use memvis::world::{ShadowStack, SnapshotRing, WorldState};
 
-fn run(
-    mut orch: RingOrchestrator,
-    mut dwarf_info: Option<DwarfInfo>,
+struct RunConfig {
     once: bool,
     min_events: u64,
     record_path: Option<String>,
     topo_path: Option<String>,
     heatmap_path: Option<String>,
-) {
+    coverage_path: Option<String>,
+    no_bb: bool,
+}
+
+fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunConfig) {
+    let once = cfg.once;
+    let min_events = cfg.min_events;
+    let no_bb = cfg.no_bb;
+    let record_path = cfg.record_path;
+    let topo_path = cfg.topo_path;
+    let heatmap_path = cfg.heatmap_path;
+    let coverage_path = cfg.coverage_path;
     let mut addr_index = AddressIndex::new();
     let mut world = WorldState::new();
     let mut stacks: HashMap<u16, ShadowStack> = HashMap::new();
@@ -90,6 +99,7 @@ fn run(
             &mut heap_oracle,
             &mut recorder,
             &mut topo,
+            no_bb,
         );
         if let Some(ref mut ts) = topo {
             ts.emit_summary(
@@ -119,6 +129,9 @@ fn run(
                 Err(e) => eprintln!("memvis: heatmap export error: {}", e),
             }
         }
+        if let Some(ref cp) = coverage_path {
+            export_bb_coverage(std::path::Path::new(cp), &world.bb_hits);
+        }
         return;
     }
 
@@ -136,7 +149,7 @@ fn run(
     let mut last_render = time::Instant::now();
     let mut last_discovery = time::Instant::now();
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
-    let mut warm_scan_done = false;
+    let mut warm_scanner: Option<reconciler::WarmScanner> = None;
     let mut warm_idle_rounds: u32 = 0;
 
     loop {
@@ -168,7 +181,11 @@ fn run(
                     let (ri, ev) = batch_buf[i];
                     let ev_kind = ev.kind();
 
-                    // snapshots live fully inside batch_buf; ring side pop_n raced.
+                    if no_bb && ev_kind == EVENT_BB_ENTRY {
+                        i += 1;
+                        continue;
+                    }
+
                     if ev_kind == EVENT_REG_SNAPSHOT {
                         let slice_end = (i + 7).min(batch_buf.len());
                         let mut events7: [memvis::ring::Event; 7] =
@@ -261,23 +278,33 @@ fn run(
             } else {
                 warm_idle_rounds = 0;
             }
-            if !warm_scan_done
-                && relocation_delta.is_some()
-                && total > 2_000_000
-                && warm_idle_rounds >= 10
-            {
+            if relocation_delta.is_some() && total > 2_000_000 && warm_idle_rounds >= 5 {
                 if let (Some(ref info), Some(pid), Some(delta)) =
                     (&dwarf_info, orch.target_pid(), relocation_delta)
                 {
-                    match reconciler::warm_scan(info, pid, delta, &mut world, &heap_oracle, &mut topo, 10_000, 8) {
-                        Ok(s) => eprintln!(
-                            "memvis: warm-scan: globals={} reads={} null={} missing_ti={} enqueued={} stamps={} depth={} errors={} not_heap={}",
-                            s.globals_scanned, s.reads, s.null_ptrs, s.missing_pointee_ti,
-                            s.enqueued, s.stamps_applied, s.max_depth_reached, s.read_errors, s.not_heap),
-                        Err(e) => eprintln!("memvis: warm-scan failed: {}", e),
+                    let scanner = warm_scanner.get_or_insert_with(|| {
+                        match reconciler::WarmScanner::new(pid, 12) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("memvis: warm-scan init failed: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    });
+                    if !scanner.seeded || scanner.is_idle() {
+                        scanner.seed(info, delta, &heap_oracle, &mut topo);
+                    }
+                    let stamps = scanner.step(500, info, &mut world, &heap_oracle, &mut topo);
+                    if stamps > 0 {
+                        eprintln!(
+                            "memvis: warm-scan pass={} stamps={} reads={} queue={}",
+                            scanner.passes,
+                            scanner.stats.stamps_applied,
+                            scanner.stats.reads,
+                            scanner.queue_len()
+                        );
                     }
                 }
-                warm_scan_done = true;
             }
         }
 
@@ -367,6 +394,7 @@ fn run_headless(
     heap_oracle: &mut HeapOracle,
     recorder: &mut Option<EventRecorder>,
     recorder_topo: &mut Option<TopologyStream>,
+    no_bb: bool,
 ) {
     use std::io::Write;
     let stdout = io::stdout();
@@ -374,7 +402,7 @@ fn run_headless(
     let mut last_discovery = time::Instant::now();
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
     let mut idle_rounds: u32 = 0;
-    let mut warm_scan_done = false;
+    let mut warm_scanner: Option<reconciler::WarmScanner> = None;
 
     loop {
         let now_disc = time::Instant::now();
@@ -400,6 +428,11 @@ fn run_headless(
             while i < batch_buf.len() {
                 let (ri, ev) = batch_buf[i];
                 let ev_kind = ev.kind();
+
+                if no_bb && ev_kind == EVENT_BB_ENTRY {
+                    i += 1;
+                    continue;
+                }
 
                 if ev_kind == EVENT_REG_SNAPSHOT {
                     let slice_end = (i + 7).min(batch_buf.len());
@@ -487,12 +520,13 @@ fn run_headless(
                     *total,
                     orch,
                     heap_graph,
+                    &world.bb_hits,
                 );
                 let _ = out.flush();
                 return;
             }
 
-            // zero events and tracer is already gone → nothing will ever arrive
+            // zero events and tracer is already gone -> nothing will ever arrive
             if *total == 0 && tracer_gone {
                 let status = TRACER_EXIT_STATUS.load(AtomicOrdering::Relaxed);
                 eprintln!("memvis: error: tracer exited before any events were received.");
@@ -534,24 +568,34 @@ fn run_headless(
             world.cl_tracker_tick();
         }
 
-        if !warm_scan_done
-            && relocation_delta.is_some()
-            && *total > 2_000_000
-            && drained == 0
-            && idle_rounds >= 10
-        {
+        if relocation_delta.is_some() && *total > 2_000_000 && drained == 0 && idle_rounds >= 5 {
             if let (Some(ref info), Some(pid), Some(delta)) =
                 (&*dwarf_info, orch.target_pid(), *relocation_delta)
             {
-                match reconciler::warm_scan(info, pid, delta, world, heap_oracle, recorder_topo, 10_000, 8) {
-                    Ok(s) => eprintln!(
-                        "memvis: warm-scan: globals={} reads={} null={} missing_ti={} enqueued={} stamps={} depth={} errors={} not_heap={}",
-                        s.globals_scanned, s.reads, s.null_ptrs, s.missing_pointee_ti,
-                        s.enqueued, s.stamps_applied, s.max_depth_reached, s.read_errors, s.not_heap),
-                    Err(e) => eprintln!("memvis: warm-scan failed: {}", e),
+                let scanner =
+                    warm_scanner.get_or_insert_with(|| {
+                        match reconciler::WarmScanner::new(pid, 12) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("memvis: warm-scan init failed: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    });
+                if !scanner.seeded || scanner.is_idle() {
+                    scanner.seed(info, delta, heap_oracle, recorder_topo);
+                }
+                let stamps = scanner.step(500, info, world, heap_oracle, recorder_topo);
+                if stamps > 0 {
+                    eprintln!(
+                        "memvis: warm-scan pass={} stamps={} reads={} queue={}",
+                        scanner.passes,
+                        scanner.stats.stamps_applied,
+                        scanner.stats.reads,
+                        scanner.queue_len()
+                    );
                 }
             }
-            warm_scan_done = true;
         }
 
         // safety valve: user sent SIGINT/SIGTERM
@@ -575,6 +619,7 @@ fn headless_render(
     total: u64,
     orch: &RingOrchestrator,
     heap_graph: &HeapGraph,
+    bb_hits: &HashMap<u32, u64>,
 ) {
     let (lag, _) = orch.total_fill();
     let lag_str = if lag >= 1_000_000 {
@@ -895,6 +940,22 @@ fn headless_render(
         }
     }
 
+    if !bb_hits.is_empty() {
+        let total_hits: u64 = bb_hits.values().sum();
+        let _ = writeln!(
+            out,
+            "\nBB COVERAGE: {} unique blocks, {} total hits",
+            bb_hits.len(),
+            total_hits
+        );
+        let mut top: Vec<_> = bb_hits.iter().collect();
+        top.sort_by(|a, b| b.1.cmp(a.1));
+        let _ = writeln!(out, "  Top 10 hottest basic blocks (rip_offset, hits):");
+        for (&rip, &count) in top.iter().take(10) {
+            let _ = writeln!(out, "    0x{:<12x} {:>10}", rip, count);
+        }
+    }
+
     let tail_n = 12usize;
     let start = if journal.len() > tail_n {
         journal.len() - tail_n
@@ -913,6 +974,7 @@ fn headless_render(
             6 => "CMIS",
             7 => "MLOAD",
             8 => "TCALL",
+            11 => "BB",
             12 => "RLOAD",
             _ => "?",
         };
@@ -924,7 +986,36 @@ fn headless_render(
     }
 }
 
-fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path: Option<String>) {
+fn export_bb_coverage(path: &std::path::Path, bb_hits: &HashMap<u32, u64>) {
+    use std::io::Write;
+    let file = match std::fs::File::create(path) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("memvis: failed to create coverage file: {}", e);
+            return;
+        }
+    };
+    let mut out = io::BufWriter::new(file);
+    let mut sorted: Vec<_> = bb_hits.iter().collect();
+    sorted.sort_by_key(|(rip, _)| *rip);
+    let _ = writeln!(out, "rip_offset\thits");
+    for (&rip, &count) in &sorted {
+        let _ = writeln!(out, "0x{:x}\t{}", rip, count);
+    }
+    eprintln!(
+        "memvis: coverage exported to {} ({} BBs)",
+        path.display(),
+        sorted.len()
+    );
+}
+
+fn run_replay(
+    replay_path: &str,
+    elf_path: Option<&str>,
+    _once: bool,
+    topo_path: Option<String>,
+    no_bb: bool,
+) {
     use std::io::Write;
 
     let mut dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
@@ -1012,6 +1103,11 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
         while i < event_buf.len() {
             let ev = &event_buf[i];
             let ev_kind = ev.kind();
+
+            if no_bb && ev_kind == EVENT_BB_ENTRY {
+                i += 1;
+                continue;
+            }
 
             if ev_kind == EVENT_REG_SNAPSHOT {
                 let consumed =
@@ -1105,6 +1201,7 @@ fn run_replay(replay_path: &str, elf_path: Option<&str>, _once: bool, topo_path:
         total,
         &orch,
         &heap_graph,
+        &world.bb_hits,
     );
     let _ = out.flush();
 }
@@ -1201,14 +1298,7 @@ fn install_signal_handlers() {
     }
 }
 
-fn run_consumer(
-    elf_path: Option<&str>,
-    once: bool,
-    min_events: u64,
-    record_path: Option<String>,
-    topo_path: Option<String>,
-    heatmap_path: Option<String>,
-) {
+fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
         eprintln!("memvis: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
@@ -1245,15 +1335,7 @@ fn run_consumer(
                         "memvis: attached (tracer already exited), {} ring(s)",
                         orch.ring_count()
                     );
-                    run(
-                        orch,
-                        dwarf_info,
-                        once,
-                        min_events,
-                        record_path,
-                        topo_path,
-                        heatmap_path,
-                    );
+                    run(orch, dwarf_info, cfg);
                     return;
                 }
             }
@@ -1285,15 +1367,7 @@ fn run_consumer(
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
                 eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
-                run(
-                    orch,
-                    dwarf_info,
-                    once,
-                    min_events,
-                    record_path,
-                    topo_path,
-                    heatmap_path,
-                );
+                run(orch, dwarf_info, cfg);
                 return;
             }
         }
@@ -1301,15 +1375,7 @@ fn run_consumer(
     }
 }
 
-fn launch(
-    target: &str,
-    target_args: &[String],
-    once: bool,
-    min_events: u64,
-    record_path: Option<String>,
-    topo_path: Option<String>,
-    heatmap_path: Option<String>,
-) {
+fn launch(target: &str, target_args: &[String], cfg: RunConfig) {
     let drrun = match find_drrun() {
         Some(p) => p,
         None => {
@@ -1340,7 +1406,7 @@ fn launch(
     for a in target_args {
         cmd.arg(a);
     }
-    if !once {
+    if !cfg.once {
         cmd.stdout(std::process::Stdio::null());
         cmd.stderr(std::process::Stdio::null());
     }
@@ -1382,16 +1448,7 @@ fn launch(
     let target_owned = target.to_string();
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || {
-            run_consumer(
-                Some(&target_owned),
-                once,
-                min_events,
-                record_path,
-                topo_path,
-                heatmap_path,
-            )
-        })
+        .spawn(move || run_consumer(Some(&target_owned), cfg))
         .expect("memvis: failed to spawn consumer thread");
     let _ = handle.join();
 
@@ -1431,6 +1488,8 @@ fn print_help() {
     eprintln!("  --heatmap <file>       Export field write heatmap as TSV");
     eprintln!("  --min-events <N>       Minimum events before snapshot (default: 1)");
     eprintln!("  --dwarf <elf>          Explicit DWARF source (if separate from target)");
+    eprintln!("  --no-bb                Skip BB_ENTRY events (reduces volume)");
+    eprintln!("  --coverage <file>      Export basic-block coverage map as TSV");
     eprintln!("  -o, --output <file>    Output file (for record, diff)");
     eprintln!("  -h, --help             Show this help");
     eprintln!("  -V, --version          Print version");
@@ -1514,19 +1573,29 @@ fn main() {
     }
 }
 
-fn cmd_run(args: &mut Vec<String>) {
+fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
     let live = take_flag(args, "--live");
     take_flag(args, "--once");
-    let once = !live;
+    let no_bb = take_flag(args, "--no-bb");
+    RunConfig {
+        once: !live,
+        min_events: take_flag_value(args, "--min-events")
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(1u64),
+        record_path: take_flag_value(args, "--record")
+            .or_else(|| take_flag_value(args, "-o"))
+            .or_else(|| take_flag_value(args, "--output")),
+        topo_path: take_flag_value(args, "--topology")
+            .or_else(|| take_flag_value(args, "--export-topology")),
+        heatmap_path: take_flag_value(args, "--heatmap")
+            .or_else(|| take_flag_value(args, "--export-heatmap")),
+        coverage_path: take_flag_value(args, "--coverage"),
+        no_bb,
+    }
+}
 
-    let min_events = take_flag_value(args, "--min-events")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1u64);
-    let record_path = take_flag_value(args, "--record").or_else(|| take_flag_value(args, "-o"));
-    let topo_path =
-        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
-    let heatmap_path =
-        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+fn cmd_run(args: &mut Vec<String>) {
+    let cfg = parse_common_flags(args);
 
     let target_idx = args.iter().position(|a| !a.starts_with('-'));
     let target_idx = match target_idx {
@@ -1537,37 +1606,14 @@ fn cmd_run(args: &mut Vec<String>) {
     let target = args[target_idx].clone();
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(
-        &target,
-        &target_args,
-        once,
-        min_events,
-        record_path,
-        topo_path,
-        heatmap_path,
-    );
+    launch(&target, &target_args, cfg);
 }
 
 fn cmd_record(args: &mut Vec<String>) {
-    let live = take_flag(args, "--live");
-    take_flag(args, "--once");
-    let once = !live;
-
-    let output = take_flag_value(args, "-o")
-        .or_else(|| take_flag_value(args, "--output"))
-        .or_else(|| take_flag_value(args, "--record"));
-    let output = match output {
-        Some(p) => p,
-        None => die("record requires -o <file>"),
-    };
-
-    let min_events = take_flag_value(args, "--min-events")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1u64);
-    let topo_path =
-        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
-    let heatmap_path =
-        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+    let cfg = parse_common_flags(args);
+    if cfg.record_path.is_none() {
+        die("record requires -o <file>");
+    }
 
     let target_idx = args.iter().position(|a| !a.starts_with('-'));
     let target_idx = match target_idx {
@@ -1578,19 +1624,12 @@ fn cmd_record(args: &mut Vec<String>) {
     let target = args[target_idx].clone();
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(
-        &target,
-        &target_args,
-        once,
-        min_events,
-        Some(output),
-        topo_path,
-        heatmap_path,
-    );
+    launch(&target, &target_args, cfg);
 }
 
 fn cmd_replay(args: &mut Vec<String>) {
     take_flag(args, "--once");
+    let no_bb = take_flag(args, "--no-bb");
     let topo_path =
         take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
     let dwarf_path = take_flag_value(args, "--dwarf");
@@ -1610,26 +1649,13 @@ fn cmd_replay(args: &mut Vec<String>) {
     let tp_owned = topo_path;
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_replay(&trace_path, elf_path.as_deref(), true, tp_owned))
+        .spawn(move || run_replay(&trace_path, elf_path.as_deref(), true, tp_owned, no_bb))
         .expect("memvis: failed to spawn replay thread");
     let _ = handle.join();
 }
 
 fn cmd_attach(args: &mut Vec<String>) {
-    let live = take_flag(args, "--live");
-    take_flag(args, "--once");
-    let once = !live;
-
-    let min_events = take_flag_value(args, "--min-events")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1u64);
-    let record_path = take_flag_value(args, "-o")
-        .or_else(|| take_flag_value(args, "--output"))
-        .or_else(|| take_flag_value(args, "--record"));
-    let topo_path =
-        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
-    let heatmap_path =
-        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+    let cfg = parse_common_flags(args);
     let dwarf_path = take_flag_value(args, "--dwarf");
 
     let elf_path: Option<String> = dwarf_path.or_else(|| {
@@ -1640,16 +1666,7 @@ fn cmd_attach(args: &mut Vec<String>) {
 
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || {
-            run_consumer(
-                elf_path.as_deref(),
-                once,
-                min_events,
-                record_path,
-                topo_path,
-                heatmap_path,
-            )
-        })
+        .spawn(move || run_consumer(elf_path.as_deref(), cfg))
         .expect("memvis: failed to spawn consumer thread");
     let _ = handle.join();
 }
@@ -1657,6 +1674,7 @@ fn cmd_attach(args: &mut Vec<String>) {
 fn cmd_replay_compat(args: &mut Vec<String>) {
     let replay_path = take_flag_value(args, "--replay").unwrap();
     take_flag(args, "--once");
+    let no_bb = take_flag(args, "--no-bb");
     let topo_path =
         take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
 
@@ -1668,7 +1686,7 @@ fn cmd_replay_compat(args: &mut Vec<String>) {
     let tp_owned = topo_path;
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
-        .spawn(move || run_replay(&replay_path, elf_path.as_deref(), true, tp_owned))
+        .spawn(move || run_replay(&replay_path, elf_path.as_deref(), true, tp_owned, no_bb))
         .expect("memvis: failed to spawn replay thread");
     let _ = handle.join();
 }
@@ -1679,17 +1697,8 @@ fn cmd_record_compat(args: &mut Vec<String>) {
 }
 
 fn cmd_run_with_record(args: &mut Vec<String>, record_path: String) {
-    let live = take_flag(args, "--live");
-    take_flag(args, "--once");
-    let once = !live;
-
-    let min_events = take_flag_value(args, "--min-events")
-        .and_then(|s| s.parse().ok())
-        .unwrap_or(1u64);
-    let topo_path =
-        take_flag_value(args, "--topology").or_else(|| take_flag_value(args, "--export-topology"));
-    let heatmap_path =
-        take_flag_value(args, "--heatmap").or_else(|| take_flag_value(args, "--export-heatmap"));
+    let mut cfg = parse_common_flags(args);
+    cfg.record_path = Some(record_path);
 
     let target_idx = args.iter().position(|a| !a.starts_with('-'));
     let target_idx = match target_idx {
@@ -1700,13 +1709,5 @@ fn cmd_run_with_record(args: &mut Vec<String>, record_path: String) {
     let target = args[target_idx].clone();
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(
-        &target,
-        &target_args,
-        once,
-        min_events,
-        Some(record_path),
-        topo_path,
-        heatmap_path,
-    );
+    launch(&target, &target_args, cfg);
 }
