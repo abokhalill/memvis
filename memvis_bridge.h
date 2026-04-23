@@ -306,12 +306,13 @@ static inline uint32_t memvis_ring_fill_eighths(memvis_ring_header_t *ring)
     return (uint32_t)(((h - t) << 3) / ring->capacity);
 }
 
+/* shed reads and bb_entry under backpressure; lifecycle events always land */
 static inline int memvis_push_sampled(memvis_ring_header_t *ring,
                                        uint64_t addr, uint32_t size,
                                        uint64_t value, uint8_t kind,
                                        uint16_t thread_id, uint32_t seq)
 {
-    if (kind == MEMVIS_EVENT_READ &&
+    if ((kind == MEMVIS_EVENT_READ || kind == MEMVIS_EVENT_BB_ENTRY) &&
         atomic_load_explicit(&ring->backpressure, memory_order_relaxed))
         return 1;
     return memvis_push_ex(ring, addr, size, value, kind, thread_id, seq);
