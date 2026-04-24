@@ -71,7 +71,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 | File | Module | Role |
 |---|---|---|
-| `reconciler.rs` | `reconciler` | Extracted event dispatch: `process_event`, `populate_globals`, `warm_scan` |
+| `reconciler.rs` | `reconciler` | Event dispatch: `process_event`, `populate_globals`, `warm_scan` (legacy one-shot), `WarmScanner` (continuous BFS with `seed()`/`step(budget)`) |
 | `dwarf.rs` | `dwarf` | DWARF parser + ELF symtab fallback + CFI table + JIT deep resolution: globals, functions, locals, types, type_registry, `.eh_frame` |
 | `ring.rs` | `ring` | SHM mapping, ring consumer, orchestrator, `new_offline()` for replay |
 | `index.rs` | `index` | Two-tier interval map. O(log N) address-to-variable lookup |
@@ -87,7 +87,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 | File | Binary | Role |
 |---|---|---|
-| `main.rs` | `memvis` | CLI shell: launch, consumer-only, record, replay, export-topology, export-heatmap |
+| `main.rs` | `memvis` | CLI shell with subcommands (`record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` struct carries `--live`, `--no-bb`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path. |
 | `lint.rs` | `memvis-lint` | Static cacheline lint: struct analysis, divergence report, diff mode |
 | `diff.rs` | `memvis-diff` | Replay two `.bin` traces, diff ASLR-invariant topology |
 | `check.rs` | `memvis-check` | Evaluate `.assertions` against JSONL topology |
@@ -133,10 +133,12 @@ modules re-exported from `lib.rs`, with four binary entry points.
    `process_event` takes `dwarf_info: &mut Option<DwarfInfo>` to allow
    mutable access for `resolve_deep` and `patch_shallow_fields`.
 
-5. **Warm-scan** (`reconciler.rs`). Engine-side BFS over `/proc/<pid>/mem`.
-   Reads global pointer fields from the target's memory after quiescence
-   (2M events + 10 idle rounds). Discovers typed structures built before
-   tracing. Emits COLD_STAMP and COLD_LINK events to the topology stream.
+5. **Warm-scan** (`reconciler.rs`). `WarmScanner`: persistent incremental BFS
+   over `/proc/<pid>/mem`. `seed()` enqueues globals; `step(budget)` processes
+   up to `budget` reads per call, yielding on exhaustion and resuming on the
+   next invocation. Depth-limited (12). Triggered after 2M events + 5 idle
+   rounds in both TUI and headless loops. Emits COLD_STAMP and COLD_LINK to
+   topology stream. Legacy one-shot `warm_scan` retained for replay.
 
 6. **Ring orchestration** (`ring.rs`). Attaches to control ring with protocol
    handshake. Discovers per-thread data rings. Batch pops up to 20,000
@@ -276,14 +278,14 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 ### Recording path (live → `.bin` → replay)
 
 ```
- live run (memvis --record trace.bin)
+ live run (memvis record -o trace.bin ./target)
          │
          ▼
  EventRecorder writes events to .bin (32 bytes each)
  REG_SNAPSHOT: header + 6 continuations = 7 events (18 registers)
          │
          ▼
- offline replay (memvis --replay trace.bin)
+ offline replay (memvis replay trace.bin [--no-bb])
    or    offline diff (memvis-diff --baseline a.bin --subject b.bin)
          │
          ▼
@@ -294,11 +296,11 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 ### Warm-scan path (cold discovery)
 
 ```
- target quiesces (2M events + 10 idle rounds)
+ target quiesces (2M events + 5 idle rounds)
          │
          ▼
- reconciler::warm_scan reads /proc/<pid>/mem
- BFS from DWARF globals → pointer fields → typed structs
+ WarmScanner::seed() enqueues globals from DWARF
+ WarmScanner::step(500) reads /proc/<pid>/mem, budget-bounded BFS
          │
          ▼
  COLD_STAMP + COLD_LINK events → topology stream
@@ -408,41 +410,44 @@ cd engine && cargo build --release
 ## Invocation
 
 ```sh
-# launch mode: tracer + engine together (interactive TUI)
+# default: headless instrumentation, print snapshot, exit on 500ms idle
 memvis <target> [args...]
 
-# explicit DWARF source (separate ELF)
-memvis --dwarf <elf> <target> [args...]
+# interactive TUI (20 Hz)
+memvis <target> --live
 
-# headless: print final snapshot, exit on 500ms idle
-memvis --once <target>
+# explicit DWARF source
+memvis <target> --dwarf <elf>
 
 # record events for offline analysis
-memvis --record trace.bin [--once] <target>
+memvis record -o trace.bin <target>
 
-# replay recorded events (no tracer needed)
-memvis --replay trace.bin [--once] <target.elf>
+# replay (with optional --no-bb filter)
+memvis replay trace.bin [--no-bb] [--dwarf <elf>]
 
-# stream topology deltas to JSONL
-memvis --export-topology topo.jsonl [--once] <target>
+# attach to running tracer
+memvis attach [--dwarf <elf>] [--live]
 
-# export field write heatmap for divergence analysis
-memvis --export-heatmap heat.tsv [--once] <target>
+# export topology, heatmap, BB coverage
+memvis <target> --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
+
+# skip BB_ENTRY events (reduces volume, no topology impact)
+memvis <target> --no-bb
 
 # static cacheline lint
 memvis-lint <binary> --struct <name>
 memvis-lint <binary> --struct <name> --heatmap heat.tsv
 
-# differential comparison of two recordings
-memvis-diff --baseline a.bin --subject b.bin --dwarf <target.elf> \
+# differential comparison (--dwarf optional)
+memvis-diff --baseline a.bin --subject b.bin [--dwarf <elf>] \
     [--interval N] [--output diff.jsonl]
 
 # structural assertions (CI/CD)
 memvis-check <topology.jsonl> <assertions.txt>
-
-# consumer-only: engine attaches to already-running tracer
-memvis --consumer-only [--once] <target.elf>
 ```
+
+Legacy flags `--once`, `--record`, `--replay`, `--consumer-only` are accepted
+via compatibility shims.
 
 | Variable | Purpose |
 |---|---|

@@ -55,8 +55,10 @@ extracts four categories of information.
 
 A global variable is a `DW_TAG_variable` with a `DW_AT_location` attribute
 that resolves to a fixed address (`DW_OP_addr`). The parser extracts name,
-address, and type information via recursive `DW_AT_type` resolution (including
-struct field decomposition, depth-limited to 2 levels).
+address, size, type information, and location table. Struct field
+decomposition follows the same depth caps as type resolution (8 levels for
+field extraction, 16 for type resolution). Globals are stored as `GlobalVar`
+structs.
 
 **ELF symtab fallback**: Globals with `DW_AT_specification` but no
 `DW_AT_location` (common in C++ and large C programs like Redis) have their
@@ -609,14 +611,44 @@ pub struct SnapshotRing {
 
 Each entry: snapshot + instruction counter + render tick + event sequence.
 
+### SnapshotDelta
+
+Temporal self-diff between two `SnapshotRing` entries. Compares `WorldInner`
+snapshots by index and reports:
+
+- **`node_delta`**: `newer.nodes.len() as i64 - older.nodes.len() as i64`
+- **`edge_delta`**: `newer.edges.len() as i64 - older.edges.len() as i64`
+- **`added_nodes`**: node IDs present in newer but absent in older.
+- **`removed_nodes`**: node IDs present in older but absent in newer.
+- **`changed_edges`**: edges where the target address differs.
+- **`value_changes`**: nodes where `last_value` differs between snapshots.
+
+`SnapshotRing::delta(older_idx, newer_idx)` returns `None` if either index is
+out of bounds. Five unit tests cover identity, known mutation, wraparound,
+node removal, and OOB.
+
+### BB coverage
+
+Per-basic-block hit counters tracked in `WorldState`. `record_bb_entry(rip_lo)`
+increments the counter for the given RIP offset and bumps `insn_counter`.
+
+Headless output includes a `BB COVERAGE` section with unique block count, total
+hits, and top-10 hottest blocks by hit count. `--coverage <file>` exports the
+full map as TSV (`rip_offset\thits`).
+
+The `--no-bb` flag filters `EVENT_BB_ENTRY` events in both live and replay
+paths, suppressing coverage tracking without affecting topology correctness.
+
 ## Event reconciler (`reconciler.rs`)
 
 Extracted from `main.rs` into a library module for consumption by both the
-live engine and `memvis-diff`. Contains three public functions:
+live engine and `memvis-diff`. Public API:
 
 - **`process_event`**: Central dispatch for all event types.
 - **`populate_globals`**: Inserts DWARF globals into the address index.
-- **`warm_scan`**: Engine-side BFS over `/proc/<pid>/mem`.
+- **`warm_scan`**: Legacy one-shot BFS over `/proc/<pid>/mem` (retained for replay).
+- **`WarmScanner`**: Persistent incremental BFS (see Warm-scan section below).
+- **`apply_reg_snapshot`**: Processes 7-slot register snapshot runs.
 
 ### Event dispatch table
 
@@ -640,21 +672,44 @@ writes in typical workloads).
 
 ### Warm-scan
 
-Engine-side BFS that reads `/proc/<pid>/mem` to discover cold data structures.
-Triggered after target quiescence (2M events + 10 consecutive idle rounds).
+#### `WarmScanner` (continuous, production path)
 
-```
-for each DWARF global with pointer fields:
-    read pointer value from /proc/<pid>/mem
-    if value is a live heap allocation:
-        resolve pointee type from type_registry
-        stm.stamp_type(value, pointee_type, field_name)
-        enqueue for recursive scan (depth-limited)
+Persistent incremental BFS over `/proc/<pid>/mem`. Used in both TUI and
+headless loops.
+
+```rust
+pub struct WarmScanner {
+    mem: File,                                    // /proc/<pid>/mem
+    queue: VecDeque<(u64, TypeInfo, String, u32)>, // (addr, type, source, depth)
+    visited: HashSet<u64>,
+    pub stats: WarmScanStats,
+    pub passes: u32,
+    max_depth: u32,                               // 12 in production
+    pub seeded: bool,
+}
 ```
 
-Emits `COLD_STAMP` and `COLD_LINK` events to the topology stream.
-Discovery statistics: globals scanned, reads, null pointers, missing
-pointee types, stamps, max depth, read errors, non-heap pointers.
+- **`seed(info, delta, heap_oracle, topo)`**: Enqueues all DWARF globals with
+  pointer fields. Reads pointer values from `/proc/<pid>/mem` via
+  `scan_ptr_fields`. Increments `passes`.
+- **`step(budget, info, world, heap_oracle, topo)`**: Processes up to `budget`
+  reads from the queue. On each item: skip if depth > `max_depth` or already
+  visited, stamp via `stm.stamp_type`, emit `COLD_STAMP`/`COLD_LINK`, recurse
+  via `scan_ptr_fields`. Returns stamp count. If budget exhausted, remaining
+  items stay in queue for the next call.
+- **`is_idle()`**: `seeded && queue.is_empty()`. Re-seed triggers on idle.
+
+Triggered in headless loop when `total > 2M && idle_rounds >= 5`. Budget per
+step: 500 reads. Scanner is lazily initialized on first trigger.
+
+#### `warm_scan` (legacy one-shot)
+
+Retained for replay and backward compatibility. Runs the full BFS in a single
+call with no budget limit.
+
+Both paths emit `COLD_STAMP` and `COLD_LINK` to the topology stream.
+Stats: globals scanned, reads, null pointers, missing pointee types, stamps,
+max depth, read errors, non-heap pointers.
 
 ### Periodic maintenance
 
@@ -807,9 +862,12 @@ configurable intervals, and reports structural divergence.
 ### Usage
 
 ```sh
-memvis-diff --baseline a.bin --subject b.bin --dwarf <elf> \
+memvis-diff --baseline a.bin --subject b.bin [--dwarf <elf>] \
     [--interval N] [--output diff.jsonl]
 ```
+
+`--dwarf` is optional. Without it, the diff still compares alloc counts,
+hazard counts, and raw topology, but type stamps will be empty.
 
 ### Canonical stamps
 
@@ -937,10 +995,13 @@ Exit code 1 if any warnings are emitted (CI/CD gatekeeper).
 
 Full startup when the user runs `memvis <target>`:
 
-1. Parse CLI arguments (`--once`, `--consumer-only`, `--record`, `--replay`,
-   `--export-topology`, `--export-heatmap`, `--min-events`).
-2. If `--replay`: spawn replay thread, call `run_replay`. No tracer needed.
-3. If `--consumer-only`: spawn consumer thread, attach to existing tracer.
+1. Parse CLI: subcommand routing (`record`, `replay`, `attach`, or default
+   run). Legacy flags (`--once`, `--record`, `--replay`, `--consumer-only`)
+   accepted via compat shims. `parse_common_flags` builds a `RunConfig`
+   struct carrying `once` (default true; `--live` sets false), `no_bb`,
+   `min_events`, `record_path`, `topo_path`, `heatmap_path`, `coverage_path`.
+2. If `replay`: spawn replay thread, call `run_replay(no_bb)`. No tracer.
+3. If `attach`: spawn consumer thread, attach to existing tracer.
 4. Otherwise (launch mode):
    a. Locate `drrun` (via `DYNAMORIO_HOME`, `MEMVIS_DRRUN`, or PATH).
    b. Locate `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to binary).

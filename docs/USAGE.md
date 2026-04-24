@@ -57,6 +57,9 @@ Offline differential topology comparison of two recorded traces.
 ```sh
 memvis-diff --baseline a.bin --subject b.bin --dwarf ./my_program \
     --interval 500000 --output diff.jsonl
+
+# --dwarf is optional; without it, diff compares alloc/hazard topology only
+memvis-diff --baseline a.bin --subject b.bin --interval 50000
 ```
 
 ## memvis-check

@@ -89,7 +89,7 @@ for both formats.
 | `TAIL_CALL` | 8 | Callee PC | 0 | Frame base (RSP) | JMP >4KB, main module |
 | `ALLOC` | 9 | Pointer returned | Alloc size (bytes) | (unused) | `drwrap` post-malloc/calloc/realloc |
 | `FREE` | 10 | Pointer freed | 0 | 0 | `drwrap` pre-free / pre-realloc(old) |
-| `BB_ENTRY` | 11 | — | — | — | Reserved (not yet emitted) |
+| `BB_ENTRY` | 11 | BB start PC | 0 | 0 | Fully inline, main module only. Shed under backpressure. |
 | `RELOAD` | 12 | Source address | Load size | Register index | MOV to callee-saved |
 
 ### Register snapshots
@@ -263,13 +263,15 @@ Fill <  3/8 capacity:  consumer stores backpressure = 0  (release)
 ```
 
 The producer checks `backpressure` with a relaxed load. When backpressure is
-active, `memvis_push_sampled()` silently drops `READ` events (returns 1
-instead of 0). `WRITE`, `CALL`, `RETURN`, `TAIL_CALL`, `RELOAD`, and other
-control events are **never** dropped by backpressure.
+active, `memvis_push_sampled()` silently drops `READ` and `BB_ENTRY` events
+(returns 1 instead of 0). `WRITE`, `CALL`, `RETURN`, `TAIL_CALL`, `ALLOC`,
+`FREE`, `RELOAD`, `MODULE_LOAD`, and `REG_SNAPSHOT` are **never** dropped by
+backpressure.
 
-This mechanism degrades gracefully under load: read events are low-priority
-(they do not carry post-read values), so shedding them reduces ring pressure
-without losing higher-value write and control events.
+This mechanism degrades gracefully under load: read and BB_ENTRY events are
+low-priority observability data (reads carry no post-read values; BB_ENTRY
+affects only coverage counters, not topology). Shedding them reduces ring
+pressure without losing writes, lifecycle events, or control events.
 
 ## Spin-on-full
 
