@@ -506,6 +506,44 @@ fn run_headless(
             // after seeing events, if the ring stays empty for 50 consecutive
             // rounds (~500ms), the target has finished. render final snapshot.
             if *total > 0 && (idle_rounds >= 50 || tracer_gone) {
+                // final ring discovery sweep: catch rings from short-lived
+                // threads that spawned and died between poll intervals.
+                orch.poll_new_rings();
+                let mut final_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(4096);
+                loop {
+                    final_buf.clear();
+                    let got = orch.batch_drain(4096, &mut final_buf);
+                    if got == 0 {
+                        break;
+                    }
+                    for &(ri, ref ev) in &final_buf {
+                        let ev_kind = ev.kind();
+                        if no_bb && ev_kind == EVENT_BB_ENTRY {
+                            continue;
+                        }
+                        *total += 1;
+                        world.inc_insn_counter();
+                        reconciler::process_event(
+                            ev,
+                            ri,
+                            orch,
+                            world,
+                            addr_index,
+                            &mut *dwarf_info,
+                            stacks,
+                            next_frame_id,
+                            relocation_delta,
+                            returned_frames,
+                            shadow_regs,
+                            heap_graph,
+                            heap_oracle,
+                            recorder_topo,
+                        );
+                        if let Some(ref mut rec) = recorder {
+                            let _ = rec.record(ev);
+                        }
+                    }
+                }
                 eprintln!("memvis: {} events processed, rendering snapshot", total);
                 let snap = world.snapshot();
                 headless_render(
