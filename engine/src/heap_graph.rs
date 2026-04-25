@@ -72,7 +72,7 @@ impl HeapOracle {
         Self::in_user_range(addr)
     }
 
-    fn is_plausible_ptr(&self, val: u64) -> bool {
+    pub fn is_plausible_ptr(&self, val: u64) -> bool {
         Self::in_user_range(val)
     }
 
