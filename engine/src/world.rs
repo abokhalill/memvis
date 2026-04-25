@@ -205,7 +205,11 @@ const CL_MASK: usize = CL_SLOTS - 1;
 pub struct ClSlot {
     pub cl_addr: u64,
     pub write_count: u16,
-    pub writers: u16, // bitmask: bit i = thread i has written
+    pub writers: u16,
+    // per-writer counts for observation-bias correction.
+    // indexed by thread_id & 15. allows distinguishing real
+    // contention from asymmetric backpressure artifacts.
+    pub per_writer: [u16; 16],
 }
 
 #[derive(Debug, Clone)]
@@ -230,20 +234,25 @@ impl CacheLineTracker {
     pub fn record_write(&mut self, addr: u64, thread_id: u16) -> u16 {
         let cl = addr >> CL_SHIFT;
         let idx = (cl as usize) & CL_MASK;
+        let ti = (thread_id & 15) as usize;
         let s = unsafe { self.slots.get_unchecked_mut(idx) };
         if s.cl_addr != cl {
             *s = ClSlot {
                 cl_addr: cl,
                 write_count: 1,
-                writers: 1u16 << (thread_id & 15),
+                writers: 1u16 << ti,
+                ..ClSlot::default()
             };
+            s.per_writer[ti] = 1;
             return s.writers;
         }
         s.write_count = s.write_count.saturating_add(1);
-        s.writers |= 1u16 << (thread_id & 15);
+        s.writers |= 1u16 << ti;
+        s.per_writer[ti] = s.per_writer[ti].saturating_add(1);
         s.writers
     }
 
+    // raw thread count, no bias correction
     pub fn contention_score(&self, addr: u64) -> u32 {
         let cl = addr >> CL_SHIFT;
         let idx = (cl as usize) & CL_MASK;
@@ -255,12 +264,69 @@ impl CacheLineTracker {
         }
     }
 
+    // bias-corrected: only count threads whose write fraction exceeds
+    // `min_frac` of the total writes to this cache line. filters out
+    // threads that wrote once due to backpressure asymmetry or noise.
+    // min_frac=0.01 means a thread must account for >=1% of writes.
+    pub fn contention_score_weighted(&self, addr: u64, min_frac: f32) -> u32 {
+        let cl = addr >> CL_SHIFT;
+        let idx = (cl as usize) & CL_MASK;
+        let s = &self.slots[idx];
+        if s.cl_addr != cl || s.write_count == 0 {
+            return 0;
+        }
+        let total = s.write_count as f32;
+        let threshold = (total * min_frac).max(1.0);
+        let mut count = 0u32;
+        let mut mask = s.writers;
+        while mask != 0 {
+            let bit = mask.trailing_zeros() as usize;
+            if s.per_writer[bit] as f32 >= threshold {
+                count += 1;
+            }
+            mask &= mask - 1;
+        }
+        count
+    }
+
+    // per writer breakdown for a cache line. returns (thread_idx, writes) pairs.
+    pub fn writer_breakdown(&self, addr: u64) -> Vec<(u8, u16)> {
+        let cl = addr >> CL_SHIFT;
+        let idx = (cl as usize) & CL_MASK;
+        let s = &self.slots[idx];
+        if s.cl_addr != cl {
+            return Vec::new();
+        }
+        let mut out = Vec::new();
+        let mut mask = s.writers;
+        while mask != 0 {
+            let bit = mask.trailing_zeros() as u8;
+            out.push((bit, s.per_writer[bit as usize]));
+            mask &= mask - 1;
+        }
+        out
+    }
+
     pub fn tick(&mut self) {
         for s in self.slots.iter_mut() {
             s.write_count >>= 1;
             if s.write_count == 0 {
                 s.writers = 0;
                 s.cl_addr = 0;
+                s.per_writer = [0; 16];
+            } else {
+                // decay per-writer counts in lockstep
+                for pw in s.per_writer.iter_mut() {
+                    *pw >>= 1;
+                }
+                // recompute writer mask from surviving counts
+                let mut new_mask = 0u16;
+                for (i, &pw) in s.per_writer.iter().enumerate() {
+                    if pw > 0 {
+                        new_mask |= 1u16 << i;
+                    }
+                }
+                s.writers = new_mask;
             }
         }
     }
@@ -863,6 +929,7 @@ pub struct ShadowFrame {
 pub struct ShadowStack {
     pub frames: Vec<ShadowFrame>,
     pub mismatches: u64,
+    pub non_local_jumps: u64,
     pub max_depth: usize,
 }
 
@@ -872,6 +939,7 @@ impl ShadowStack {
         Self {
             frames: Vec::with_capacity(64),
             mismatches: 0,
+            non_local_jumps: 0,
             max_depth: 0,
         }
     }
@@ -894,6 +962,49 @@ impl ShadowStack {
             None => {
                 self.mismatches += 1;
                 None
+            }
+        }
+    }
+
+    // longjmp-aware return: if `return_pc` doesn't match the top frame's
+    // callee, scan the stack for a frame whose caller pushed this PC.
+    // if found, unwind to that point (non-local jump). if not found,
+    // fall back to normal pop and count as true mismatch.
+    // returns (popped_frame, frames_unwound). frames_unwound > 1 means
+    // non-local jump detected.
+    pub fn pop_return_checked(&mut self, return_pc: u64) -> (Option<ShadowFrame>, usize) {
+        if self.frames.is_empty() {
+            self.mismatches += 1;
+            return (None, 0);
+        }
+        // fast path: normal return matches top of stack
+        let top = self.frames.last().unwrap();
+        if top.callee_pc == return_pc {
+            return (self.frames.pop(), 1);
+        }
+        // scan for non-local jump target deeper in the stack.
+        // search from top-1 downward for a frame whose callee_pc matches.
+        let mut found_idx = None;
+        for i in (0..self.frames.len().saturating_sub(1)).rev() {
+            if self.frames[i].callee_pc == return_pc {
+                found_idx = Some(i);
+                break;
+            }
+        }
+        match found_idx {
+            Some(idx) => {
+                // non-local jump: unwind frames from top down to idx
+                let unwound = self.frames.len() - idx;
+                self.frames.truncate(idx);
+                self.non_local_jumps += 1;
+                // return the target frame (already removed by truncate,
+                // but we need a ShadowFrame to return)
+                (None, unwound)
+            }
+            None => {
+                // true mismatch: return_pc not on stack at all
+                self.mismatches += 1;
+                (self.frames.pop(), 1)
             }
         }
     }
@@ -1311,5 +1422,171 @@ mod tests {
         assert_eq!(ws.bb_hits.len(), 2);
         assert_eq!(ws.bb_hits[&0x1234], 2);
         assert_eq!(ws.bb_hits[&0x5678], 1);
+    }
+
+    #[test]
+    fn test_cl_tracker_per_writer_counts() {
+        let mut cl = CacheLineTracker::new();
+        let addr = 0x1000u64;
+        // thread 0 writes 100 times, thread 1 writes once
+        for _ in 0..100 {
+            cl.record_write(addr, 0);
+        }
+        cl.record_write(addr, 1);
+
+        // raw score: 2 threads
+        assert_eq!(cl.contention_score(addr), 2);
+
+        // weighted at 5%: thread 1 has 1/101 ≈ 0.99% < 5%, filtered out
+        assert_eq!(cl.contention_score_weighted(addr, 0.05), 1);
+
+        // weighted at 0.5%: thread 1 has ~0.99% >= 0.5%, both count
+        assert_eq!(cl.contention_score_weighted(addr, 0.005), 2);
+    }
+
+    #[test]
+    fn test_cl_tracker_symmetric_writers() {
+        let mut cl = CacheLineTracker::new();
+        let addr = 0x2000u64;
+        // two threads write equally
+        for _ in 0..50 {
+            cl.record_write(addr, 0);
+            cl.record_write(addr, 1);
+        }
+        assert_eq!(cl.contention_score(addr), 2);
+        // both exceed any reasonable threshold
+        assert_eq!(cl.contention_score_weighted(addr, 0.10), 2);
+    }
+
+    #[test]
+    fn test_cl_tracker_writer_breakdown() {
+        let mut cl = CacheLineTracker::new();
+        let addr = 0x3000u64;
+        for _ in 0..10 { cl.record_write(addr, 2); }
+        for _ in 0..20 { cl.record_write(addr, 5); }
+
+        let breakdown = cl.writer_breakdown(addr);
+        assert_eq!(breakdown.len(), 2);
+        // check both threads present with correct counts
+        let t2 = breakdown.iter().find(|(t, _)| *t == 2).unwrap();
+        let t5 = breakdown.iter().find(|(t, _)| *t == 5).unwrap();
+        assert_eq!(t2.1, 10);
+        assert_eq!(t5.1, 20);
+    }
+
+    #[test]
+    fn test_cl_tracker_tick_decays_per_writer() {
+        let mut cl = CacheLineTracker::new();
+        let addr = 0x4000u64;
+        for _ in 0..100 { cl.record_write(addr, 0); }
+        cl.record_write(addr, 1);
+
+        assert_eq!(cl.contention_score(addr), 2);
+
+        // after one tick, write_count halves. thread 1's single write
+        // decays to 0, removing it from the writer mask.
+        cl.tick();
+        assert_eq!(cl.contention_score(addr), 1);
+
+        let breakdown = cl.writer_breakdown(addr);
+        assert_eq!(breakdown.len(), 1);
+        assert_eq!(breakdown[0].0, 0);
+    }
+
+    #[test]
+    fn test_cl_tracker_empty_line() {
+        let cl = CacheLineTracker::new();
+        assert_eq!(cl.contention_score(0x5000), 0);
+        assert_eq!(cl.contention_score_weighted(0x5000, 0.01), 0);
+        assert!(cl.writer_breakdown(0x5000).is_empty());
+    }
+
+    #[test]
+    fn test_cl_tracker_collision_evicts() {
+        let mut cl = CacheLineTracker::new();
+        let addr_a = 0x6000u64;
+        cl.record_write(addr_a, 0);
+        assert_eq!(cl.contention_score(addr_a), 1);
+
+        // different cache line that maps to the same slot
+        let addr_b = addr_a + ((CL_SLOTS as u64) << CL_SHIFT);
+        cl.record_write(addr_b, 1);
+        // addr_a evicted
+        assert_eq!(cl.contention_score(addr_a), 0);
+        assert_eq!(cl.contention_score(addr_b), 1);
+    }
+
+    // --- longjmp-aware shadow stack tests ---
+
+    #[test]
+    fn test_shadow_stack_normal_return() {
+        let mut ss = ShadowStack::new();
+        ss.push_call(1, 0xA000, "foo".into());
+        ss.push_call(2, 0xB000, "bar".into());
+
+        let (frame, unwound) = ss.pop_return_checked(0xB000);
+        assert!(frame.is_some());
+        assert_eq!(unwound, 1);
+        assert_eq!(frame.unwrap().name, "bar");
+        assert_eq!(ss.depth(), 1);
+        assert_eq!(ss.mismatches, 0);
+        assert_eq!(ss.non_local_jumps, 0);
+    }
+
+    #[test]
+    fn test_shadow_stack_longjmp_unwind() {
+        let mut ss = ShadowStack::new();
+        // simulate: main -> f1 -> f2 -> f3, then longjmp back to f1
+        ss.push_call(1, 0xA000, "main".into());
+        ss.push_call(2, 0xB000, "f1".into());
+        ss.push_call(3, 0xC000, "f2".into());
+        ss.push_call(4, 0xD000, "f3".into());
+        assert_eq!(ss.depth(), 4);
+
+        // longjmp returns to f1's callee_pc, unwinding f2+f3+f4
+        let (frame, unwound) = ss.pop_return_checked(0xB000);
+        assert!(frame.is_none()); // container_of unwind, no single frame
+        assert_eq!(unwound, 3); // f2, f3, f4 unwound
+        assert_eq!(ss.depth(), 1); // only main remains
+        assert_eq!(ss.non_local_jumps, 1);
+        assert_eq!(ss.mismatches, 0);
+    }
+
+    #[test]
+    fn test_shadow_stack_true_mismatch() {
+        let mut ss = ShadowStack::new();
+        ss.push_call(1, 0xA000, "foo".into());
+        ss.push_call(2, 0xB000, "bar".into());
+
+        // return to an address not on the stack at all
+        let (frame, unwound) = ss.pop_return_checked(0xDEAD);
+        assert!(frame.is_some()); // pops top frame as fallback
+        assert_eq!(unwound, 1);
+        assert_eq!(ss.mismatches, 1);
+        assert_eq!(ss.non_local_jumps, 0);
+    }
+
+    #[test]
+    fn test_shadow_stack_empty_mismatch() {
+        let mut ss = ShadowStack::new();
+        let (frame, unwound) = ss.pop_return_checked(0x1234);
+        assert!(frame.is_none());
+        assert_eq!(unwound, 0);
+        assert_eq!(ss.mismatches, 1);
+    }
+
+    #[test]
+    fn test_shadow_stack_longjmp_to_bottom() {
+        let mut ss = ShadowStack::new();
+        ss.push_call(1, 0xA000, "main".into());
+        ss.push_call(2, 0xB000, "deep1".into());
+        ss.push_call(3, 0xC000, "deep2".into());
+
+        // longjmp all the way back to main's callee_pc
+        let (_, unwound) = ss.pop_return_checked(0xA000);
+        assert_eq!(unwound, 3);
+        assert_eq!(ss.depth(), 0);
+        assert_eq!(ss.non_local_jumps, 1);
+        assert_eq!(ss.mismatches, 0);
     }
 }
