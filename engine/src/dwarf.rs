@@ -451,6 +451,16 @@ impl CfiTable {
     }
 }
 
+// container_of inference: maps an embedded struct type to its enclosing
+// containers. used by WarmScanner to adjust stamp addresses when following
+// intrusive links (e.g. list_head embedded at offset 16 within task_struct).
+#[derive(Debug, Clone)]
+pub struct ContainerOfEntry {
+    pub container_type: String,
+    pub field_name: String,
+    pub field_offset: u64,
+}
+
 pub struct DwarfInfo {
     pub globals: Vec<GlobalVar>,
     pub functions: BTreeMap<u64, FunctionMeta>,
@@ -458,6 +468,7 @@ pub struct DwarfInfo {
     pub type_registry: HashMap<String, TypeInfo>,
     pub cfi: CfiTable,
     pub elf_path: String,
+    pub container_of_map: HashMap<String, Vec<ContainerOfEntry>>,
 }
 
 impl DwarfInfo {
@@ -748,6 +759,12 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         eprintln!("dwarf: {} CFI entries from .eh_frame", cfi.len());
     }
 
+    let container_of_map = build_container_of_map(&type_registry);
+    if !container_of_map.is_empty() {
+        let total: usize = container_of_map.values().map(|v| v.len()).sum();
+        eprintln!("dwarf: {} container_of entries across {} embedded types", total, container_of_map.len());
+    }
+
     Ok(DwarfInfo {
         globals,
         functions,
@@ -755,7 +772,41 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         type_registry,
         cfi,
         elf_path: path.to_string(),
+        container_of_map,
     })
+}
+
+// scan type_registry for structs that embed other named structs at non-zero
+// offsets. these are intrusive container patterns (list_head, rb_node, etc).
+fn build_container_of_map(registry: &HashMap<String, TypeInfo>) -> HashMap<String, Vec<ContainerOfEntry>> {
+    let mut map: HashMap<String, Vec<ContainerOfEntry>> = HashMap::new();
+    for (container_name, container_ti) in registry {
+        for field in &container_ti.fields {
+            if field.byte_offset == 0 || field.type_info.is_pointer {
+                continue;
+            }
+            let embedded_name = &field.type_info.name;
+            if embedded_name.is_empty() || embedded_name == "<anon>" {
+                continue;
+            }
+            // only record if the embedded type is itself a known struct
+            if !registry.contains_key(embedded_name) {
+                continue;
+            }
+            // skip trivial scalar types masquerading as structs
+            if field.type_info.fields.is_empty() {
+                continue;
+            }
+            map.entry(embedded_name.clone()).or_default().push(
+                ContainerOfEntry {
+                    container_type: container_name.clone(),
+                    field_name: field.name.clone(),
+                    field_offset: field.byte_offset,
+                },
+            );
+        }
+    }
+    map
 }
 
 fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
@@ -1858,6 +1909,7 @@ mod tests {
             globals: Vec::new(),
             functions: BTreeMap::new(),
             elf_base_vaddr: 0,
+            container_of_map: HashMap::new(),
             type_registry: registry,
             cfi: CfiTable::new(),
             elf_path: String::new(),
@@ -1953,5 +2005,150 @@ mod tests {
                 depth
             );
         }
+    }
+
+    #[test]
+    fn test_build_container_of_map() {
+        // simulate: struct list_head { next, prev } embedded at offset 16
+        // inside struct task_struct { pid: i32, comm: [u8; 16], tasks: list_head }
+        let list_head_ti = TypeInfo {
+            name: "list_head".into(),
+            byte_size: 16,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: vec![
+                FieldInfo {
+                    name: "next".into(),
+                    byte_offset: 0,
+                    byte_size: 8,
+                    type_info: TypeInfo {
+                        name: "*list_head".into(),
+                        byte_size: 8,
+                        is_pointer: true,
+                        is_volatile: false,
+                        is_atomic: false,
+                        shallow: false,
+                        fields: Vec::new(),
+                    },
+                    alignment: 0,
+                },
+                FieldInfo {
+                    name: "prev".into(),
+                    byte_offset: 8,
+                    byte_size: 8,
+                    type_info: TypeInfo {
+                        name: "*list_head".into(),
+                        byte_size: 8,
+                        is_pointer: true,
+                        is_volatile: false,
+                        is_atomic: false,
+                        shallow: false,
+                        fields: Vec::new(),
+                    },
+                    alignment: 0,
+                },
+            ],
+        };
+
+        let task_struct_ti = TypeInfo {
+            name: "task_struct".into(),
+            byte_size: 36,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: vec![
+                FieldInfo {
+                    name: "pid".into(),
+                    byte_offset: 0,
+                    byte_size: 4,
+                    type_info: TypeInfo {
+                        name: "int".into(),
+                        byte_size: 4,
+                        is_pointer: false,
+                        is_volatile: false,
+                        is_atomic: false,
+                        shallow: false,
+                        fields: Vec::new(),
+                    },
+                    alignment: 0,
+                },
+                FieldInfo {
+                    name: "tasks".into(),
+                    byte_offset: 20,
+                    byte_size: 16,
+                    type_info: list_head_ti.clone(),
+                    alignment: 0,
+                },
+            ],
+        };
+
+        let mut registry = HashMap::new();
+        registry.insert("list_head".into(), list_head_ti);
+        registry.insert("task_struct".into(), task_struct_ti);
+
+        let map = build_container_of_map(&registry);
+
+        // list_head should have a container_of entry pointing to task_struct
+        let entries = map.get("list_head").expect("list_head should be in map");
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].container_type, "task_struct");
+        assert_eq!(entries[0].field_name, "tasks");
+        assert_eq!(entries[0].field_offset, 20);
+
+        // task_struct should NOT be in the map (not embedded anywhere)
+        assert!(map.get("task_struct").is_none());
+    }
+
+    #[test]
+    fn test_container_of_map_skips_zero_offset() {
+        // struct at offset 0 is not intrusive — it's just the first field
+        let inner = TypeInfo {
+            name: "inner_t".into(),
+            byte_size: 8,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: vec![FieldInfo {
+                name: "val".into(),
+                byte_offset: 0,
+                byte_size: 8,
+                type_info: TypeInfo {
+                    name: "long".into(),
+                    byte_size: 8,
+                    is_pointer: false,
+                    is_volatile: false,
+                    is_atomic: false,
+                    shallow: false,
+                    fields: Vec::new(),
+                },
+                alignment: 0,
+            }],
+        };
+        let outer = TypeInfo {
+            name: "outer_t".into(),
+            byte_size: 16,
+            is_pointer: false,
+            is_volatile: false,
+            is_atomic: false,
+            shallow: false,
+            fields: vec![FieldInfo {
+                name: "head".into(),
+                byte_offset: 0, // offset 0 — should be skipped
+                byte_size: 8,
+                type_info: inner.clone(),
+                alignment: 0,
+            }],
+        };
+
+        let mut registry = HashMap::new();
+        registry.insert("inner_t".into(), inner);
+        registry.insert("outer_t".into(), outer);
+
+        let map = build_container_of_map(&registry);
+        assert!(map.is_empty(), "offset-0 embeddings should not produce entries");
     }
 }
