@@ -15,6 +15,7 @@ struct AllocEvent {
     addr: u64,
     size: u64,
     freed: bool,
+    free_seq: u64,
 }
 
 #[allow(dead_code)]
@@ -98,10 +99,12 @@ impl TopoGraph {
                         addr: json_hex(line, "addr"),
                         size: json_u64(line, "size"),
                         freed: false,
+                        free_seq: 0,
                     });
                 }
                 "FREE" => {
                     let addr = json_hex(line, "addr");
+                    let fseq = json_u64(line, "seq");
                     if let Some(a) = g
                         .allocs
                         .iter_mut()
@@ -109,6 +112,7 @@ impl TopoGraph {
                         .find(|a| a.addr == addr && !a.freed)
                     {
                         a.freed = true;
+                        a.free_seq = fseq;
                     }
                     g.addr_type.remove(&addr);
                 }
@@ -471,10 +475,11 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
             (violations == 0, msg)
         }
         Assertion::NoUseAfterFree => {
+            // map addr -> free_seq (the seq of the FREE event, not the ALLOC)
             let mut freed: HashMap<u64, u64> = HashMap::new();
             for a in &g.allocs {
-                if a.freed {
-                    freed.insert(a.addr, a.seq);
+                if a.freed && a.free_seq > 0 {
+                    freed.insert(a.addr, a.free_seq);
                 }
             }
             let mut violations = 0usize;
