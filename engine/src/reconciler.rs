@@ -566,6 +566,7 @@ pub struct WarmScanStats {
     pub missing_pointee_ti: u64,
     pub not_heap: u64,
     pub globals_scanned: u64,
+    pub container_of_stamps: u64,
 }
 
 pub struct WarmScanner {
@@ -634,6 +635,7 @@ impl WarmScanner {
                 &mut self.stats,
                 heap_oracle,
                 &info.type_registry,
+                &info.container_of_map,
                 topo,
                 u64::MAX,
             );
@@ -701,6 +703,7 @@ impl WarmScanner {
                 &mut self.stats,
                 heap_oracle,
                 &info.type_registry,
+                &info.container_of_map,
                 topo,
                 u64::MAX,
             );
@@ -743,6 +746,7 @@ pub fn warm_scan(
             &mut stats,
             heap_oracle,
             &info.type_registry,
+            &info.container_of_map,
             topo,
             max_reads,
         );
@@ -793,6 +797,7 @@ pub fn warm_scan(
             &mut stats,
             heap_oracle,
             &info.type_registry,
+            &info.container_of_map,
             topo,
             max_reads,
         );
@@ -812,6 +817,7 @@ fn scan_ptr_fields(
     stats: &mut WarmScanStats,
     heap_oracle: &HeapOracle,
     type_registry: &HashMap<String, TypeInfo>,
+    container_of_map: &HashMap<String, Vec<dwarf::ContainerOfEntry>>,
     topo: &mut Option<TopologyStream>,
     max_reads: u64,
 ) {
@@ -847,6 +853,23 @@ fn scan_ptr_fields(
                             if let Some(ref mut ts) = topo {
                                 ts.emit_cold_link(source, faddr, ptr, pointee_name, &f.name);
                             }
+                            // container_of: if this pointee type is embedded inside
+                            // a larger struct at a non-zero offset, also enqueue the
+                            // container base (ptr - offset) with the container type.
+                            if let Some(containers) = container_of_map.get(pointee_name) {
+                                for entry in containers {
+                                    let container_base = ptr.wrapping_sub(entry.field_offset);
+                                    if container_base != 0 && heap_oracle.is_plausible_ptr(container_base) {
+                                        if let Some(container_ti) = type_registry.get(&entry.container_type) {
+                                            let cof_source = format!("{}->container_of({}.{})",
+                                                qualified, entry.container_type, entry.field_name);
+                                            queue.push_back((container_base, container_ti.clone(), cof_source, depth));
+                                            stats.container_of_stamps += 1;
+                                            stats.enqueued += 1;
+                                        }
+                                    }
+                                }
+                            }
                             queue.push_back((ptr, pointee_ti, qualified, depth));
                             stats.enqueued += 1;
                         }
@@ -868,6 +891,7 @@ fn scan_ptr_fields(
                 stats,
                 heap_oracle,
                 type_registry,
+                container_of_map,
                 topo,
                 max_reads,
             );
@@ -1116,7 +1140,7 @@ mod tests {
     fn make_synthetic_mem() -> (std::fs::File, dwarf::DwarfInfo) {
         use std::collections::BTreeMap;
         use std::os::unix::fs::FileExt;
-        let path = "/tmp/memvis_test_synth_mem";
+        let path = &format!("/tmp/memvis_test_synth_mem_{:?}", std::thread::current().id());
         let f = std::fs::File::create(path).unwrap();
         let mut buf = vec![0u8; 0x4000];
         buf[0x1000..0x1008].copy_from_slice(&0x2000u64.to_le_bytes());
@@ -1209,6 +1233,7 @@ mod tests {
             functions: BTreeMap::new(),
             elf_base_vaddr: 0,
             type_registry,
+            container_of_map: HashMap::new(),
             cfi: dwarf::CfiTable::default(),
             elf_path: String::new(),
         };
