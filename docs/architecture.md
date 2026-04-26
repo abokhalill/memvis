@@ -138,7 +138,11 @@ modules re-exported from `lib.rs`, with four binary entry points.
    up to `budget` reads per call, yielding on exhaustion and resuming on the
    next invocation. Depth-limited (12). Triggered after 2M events + 5 idle
    rounds in both TUI and headless loops. Emits COLD_STAMP and COLD_LINK to
-   topology stream. Legacy one-shot `warm_scan` retained for replay.
+   topology stream. `scan_ptr_fields` uses `DwarfInfo.container_of_map` for
+   intrusive container discovery: when following a pointer to an embedded
+   struct (e.g. `list_head*`), also enqueues the container base
+   (`ptr - field_offset`) with the container type. Legacy one-shot
+   `warm_scan` retained for replay.
 
 6. **Ring orchestration** (`ring.rs`). Attaches to control ring with protocol
    handshake. Discovers per-thread data rings. Batch pops up to 20,000
@@ -171,7 +175,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
     | `CfiVerified` | `cfi` | CFI `.eh_frame` confirms preservation |
     | `Observed` | `obs` | Direct `REG_SNAPSHOT` from tracer |
 
-    Key methods: `on_call`, `on_return`, `on_return_cfi` (D7: promotes
+    Key methods: `on_call`, `on_return`, `on_return_cfi` (promotes
     callee-saved registers to `CfiVerified` when CFI data is available),
     `on_reload`, `on_snapshot`, `check_coherence`. `callee_pc()` returns
     the current top-of-stack callee PC for CFI lookup.
@@ -196,10 +200,19 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 14. **World state** (`world.rs`). CoW snapshots via `Arc<WorldInner>`.
     Circular snapshot ring (512 entries) for time-travel. Cache-line
-    contention tracker. Live register file.
+    contention tracker with per-writer counts and observation-bias
+    correction (`contention_score_weighted`). Longjmp-aware shadow stacks
+    (`pop_return_checked`, `non_local_jumps` counter). Live register file.
 
 15. **Rendering** (`tui.rs`, `main.rs`). Interactive ratatui TUI at 20 Hz
-    with six panels. Headless mode exits on 500ms idle timeout.
+    with six panels.
+
+### Headless exit path
+
+On idle timeout (500ms) or tracer exit, the engine performs a final
+`poll_new_rings()` sweep to discover rings from short-lived threads that
+spawned and died between poll intervals, drains all remaining events,
+then renders the final snapshot and exits.
 
 ### Shared memory protocol (`memvis_bridge.h`)
 
@@ -259,7 +272,7 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
      TUI renders at 20 Hz
 ```
 
-### RETURN path (CFI-hardened)
+### RETURN path (CFI-hardened, longjmp-aware)
 
 ```
  [1] reconciler::process_event (EVENT_RETURN):
@@ -273,6 +286,13 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
  [3a] srf.on_return_cfi(saved)   [3b] srf.on_return()
       restores callee-saved,          restores callee-saved,
       promotes to CfiVerified         retains prior confidence
+         │
+         ▼
+ [4] shadow_stack.pop_return()
+     (or pop_return_checked for longjmp detection:
+      if return_pc ≠ top.callee_pc, scan stack for
+      matching frame, unwind intermediate frames,
+      increment non_local_jumps)
 ```
 
 ### Recording path (live → `.bin` → replay)
@@ -302,6 +322,10 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
  WarmScanner::seed() enqueues globals from DWARF
  WarmScanner::step(500) reads /proc/<pid>/mem, budget-bounded BFS
          │
+         ├─ scan_ptr_fields follows pointer fields
+         │   ├─ if pointee type has container_of entries:
+         │   │   enqueue container base (ptr - offset) with container type
+         │   └─ enqueue pointee with pointee type
          ▼
  COLD_STAMP + COLD_LINK events → topology stream
  stm.stamp_type for each discovered allocation

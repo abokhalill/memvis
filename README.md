@@ -99,8 +99,14 @@ for DynamoRIO's process injection.
 - **Continuous warm-scan.** `WarmScanner` performs persistent incremental BFS
   over `/proc/<pid>/mem` from DWARF globals. Budget-bounded `seed()`/`step()`
   API. Discovers typed structures built before tracing began.
+- **Container-of inference.** `build_container_of_map` detects intrusive
+  container patterns (e.g., `list_head` embedded in `task_struct`). Warm-scan
+  adjusts stamp addresses by subtracting field offsets to discover full
+  enclosing objects from intrusive link pointers.
 - **CFI-hardened shadow stacks.** Callee-saved register preservation verified
-  against `.eh_frame` CFI data on every function return.
+  against `.eh_frame` CFI data on every function return. Longjmp-aware:
+  `pop_return_checked` detects non-local returns and unwinds intermediate
+  frames, distinguishing `longjmp`/`setjmp` from true mismatches.
 - **JIT DWARF resolution.** Deeply nested struct types resolved on demand via
   `patch_shallow_fields` and `resolve_deep`.
 - **Backpressure.** Under load, `READ` and `BB_ENTRY` events are shed while
@@ -109,12 +115,16 @@ for DynamoRIO's process injection.
   Headless output includes top-10 hottest blocks.
 - **Visual ASan.** Real-time out-of-bounds and heap-hole detection with
   type-aware symbolic context and register snapshots.
-- **False-sharing detection.** Runtime cacheline contention tracking;
-  `memvis-lint` predicts statically from DWARF.
+- **False-sharing detection.** Runtime cacheline contention tracking with
+  per-writer counts and observation-bias correction
+  (`contention_score_weighted`); `memvis-lint` predicts statically from DWARF.
 - **SnapshotDelta.** Temporal self-diff on SnapshotRing entries. Reports
   node/edge deltas, value mutations, added/removed nodes.
 - **Event recording and replay.** Full trace capture to `.bin`. Replay
   supports `--no-bb` filter for topology-preserving event reduction.
+- **Post-exit ring sweep.** On tracer exit or idle timeout, a final
+  `poll_new_rings()` + drain captures events from short-lived pthreads that
+  spawned and died between normal poll intervals.
 
 See [docs/engine.md](docs/engine.md) for implementation details.
 

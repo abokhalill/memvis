@@ -117,6 +117,37 @@ Top-level registry entries are resolved at depth 0 and have full field
 trees. The `shallow` flag only appears on field-embedded `TypeInfo` that
 was resolved recursively from a parent struct and hit the depth-8 cap.
 
+### Container-of inference
+
+`build_container_of_map(registry)` scans the type registry for structs
+that embed other named structs at non-zero offsets — the intrusive
+container pattern (e.g., `list_head` embedded at offset 16 within
+`task_struct`). Produces a `HashMap<String, Vec<ContainerOfEntry>>`
+mapping embedded type names to their enclosing containers:
+
+```rust
+pub struct ContainerOfEntry {
+    pub container_type: String,
+    pub field_name: String,
+    pub field_offset: u64,
+}
+```
+
+Filtering rules:
+- **Skip offset 0**: a field at offset 0 is not intrusive — it is the
+  first field of the containing struct.
+- **Skip pointers**: pointer fields are not embedded structs.
+- **Skip anonymous/empty types**: `<anon>` and types with no fields are
+  excluded.
+- **Require registry presence**: the embedded type must itself be a
+  known struct in the type registry.
+
+The map is stored as `DwarfInfo.container_of_map` and consumed by
+`scan_ptr_fields` during warm-scan BFS. When the scanner follows a
+pointer to an embedded struct (e.g., `list_head*`), it also enqueues
+the container base address (`ptr - field_offset`) with the container
+type, enabling discovery of the full enclosing object.
+
 ### CFI table
 
 `parse_eh_frame` reads the `.eh_frame` section via gimli and builds a
@@ -572,10 +603,24 @@ When a tracked pointer variable is written:
 ### Cache-line contention tracking
 
 `CacheLineTracker` monitors which threads write to each 64-byte cache line.
-`contention_score(addr)` returns the number of distinct writer threads. The
-TUI annotates cache lines with `FALSE_SHARE T=N` when N > 1.
+Each `ClSlot` stores a `per_writer: [u16; 16]` array indexed by
+`thread_id & 15`, enabling observation-bias correction.
 
-`tick()` decays write counts by half and evicts dead entries. Called every
+- **`contention_score(addr)`**: Raw distinct writer count (bitmask popcount).
+  Susceptible to noise from threads that wrote once due to backpressure
+  asymmetry.
+- **`contention_score_weighted(addr, min_frac)`**: Bias-corrected score.
+  Only counts threads whose write fraction exceeds `min_frac` of total
+  writes to the cache line. `min_frac=0.01` means a thread must account
+  for ≥1% of writes. Filters out backpressure artifacts.
+- **`writer_breakdown(addr)`**: Returns `Vec<(u8, u16)>` of (thread_idx,
+  write_count) pairs for diagnostic output.
+
+The TUI annotates cache lines with `FALSE_SHARE T=N` when N > 1.
+
+`tick()` halves all `per_writer` counts and `write_count`, then evicts
+slots where `write_count` decayed to zero. Writers whose `per_writer`
+count drops to zero are removed from the `writers` bitmask. Called every
 4,096 events alongside `cache_heat_tick()`.
 
 ### Shadow stacks
@@ -586,6 +631,7 @@ Per-thread shadow stacks mirror the target's call stack:
 pub struct ShadowStack {
     pub frames: Vec<ShadowFrame>,
     pub mismatches: u64,
+    pub non_local_jumps: u64,
     pub max_depth: usize,
 }
 ```
@@ -593,8 +639,17 @@ pub struct ShadowStack {
 - **CALL**: Push frame with ID, callee PC, function name.
 - **RETURN**: Pop frame. Remove locals from index. Queue nodes for deferred
   removal (32-frame delay for renderer visibility).
-- **Mismatch**: Incremented when RETURN has empty stack (missed CALL,
-  indirect calls, `longjmp`).
+- **`pop_return_checked(return_pc)`**: Longjmp-aware return. If `return_pc`
+  matches the top frame's `callee_pc`, normal pop. If not, scans the stack
+  downward for a frame whose `callee_pc` matches — if found, unwinds all
+  frames above it (non-local jump) and increments `non_local_jumps`. If
+  not found, falls back to normal pop and increments `mismatches`.
+  Returns `(Option<ShadowFrame>, frames_unwound)`.
+- **Mismatch**: Incremented when RETURN has empty stack or `return_pc` is
+  not on the stack at all (missed CALL, indirect calls).
+- **Non-local jump**: Incremented when `pop_return_checked` detects a
+  `longjmp`/`setjmp` return — `return_pc` matches a frame deeper than
+  the top of stack.
 
 ### Snapshot ring
 
@@ -699,8 +754,15 @@ pub struct WarmScanner {
   items stay in queue for the next call.
 - **`is_idle()`**: `seeded && queue.is_empty()`. Re-seed triggers on idle.
 
-Triggered in headless loop when `total > 2M && idle_rounds >= 5`. Budget per
-step: 500 reads. Scanner is lazily initialized on first trigger.
+Triggered in both TUI and headless loops when `total > 2M && idle_rounds >= 5`.
+Budget per step: 500 reads. Scanner is lazily initialized on first trigger.
+
+`scan_ptr_fields` accepts the `container_of_map` from `DwarfInfo`. When a
+pointer field's pointee type has container-of entries, the scanner also
+enqueues the container base address (`ptr - field_offset`) with the container
+type. This enables discovery of full enclosing objects when following intrusive
+links (e.g., `list_head*` → `task_struct`). The `container_of_stamps` stat
+tracks how many objects were discovered via this path.
 
 #### `warm_scan` (legacy one-shot)
 
@@ -709,7 +771,7 @@ call with no budget limit.
 
 Both paths emit `COLD_STAMP` and `COLD_LINK` to the topology stream.
 Stats: globals scanned, reads, null pointers, missing pointee types, stamps,
-max depth, read errors, non-heap pointers.
+max depth, read errors, non-heap pointers, container_of_stamps, enqueued.
 
 ### Periodic maintenance
 
@@ -779,7 +841,10 @@ Filter state shown in panel title: `Events [W only, T3]`.
 
 Plain-text output to stdout. Exits via idle-timeout: after events begin
 flowing, if the ring stays empty for 500ms (50 consecutive 10ms polls),
-the engine renders the final snapshot and exits.
+the engine performs a **final ring discovery sweep** (`poll_new_rings`)
+followed by a drain loop to capture any remaining events from short-lived
+threads that spawned and died between poll intervals, then renders the
+final snapshot and exits.
 
 Headless output sections:
 1. **Status line**: insn count, events, nodes, edges, rings, LAG, alloc stats.
@@ -925,6 +990,29 @@ memvis-check topo.jsonl assertions.txt
 
 Exit code 0 = all assertions pass. Non-zero = at least one failure.
 
+### Assertion DSL
+
+Each line in the `.assertions` file is either blank, a comment (`#`), or
+an assertion of the form `assert <predicate>`. Supported predicates:
+
+| Assertion | Syntax | Semantics |
+|---|---|---|
+| `NoHazards` | `assert no_hazards` | Zero `HAZARD` events in topology |
+| `LiveAllocsLt` | `assert live_allocs < N` | Fewer than N live allocations at SUMMARY |
+| `StmProjectionsGt` | `assert stm_projections > N` | More than N STM projections at SUMMARY |
+| `MaxChain` | `assert max_chain(type("T"), "field") < N` | Longest pointer chain via `T.field` is < N |
+| `TypeStable` | `assert type_stable(global("src"), "T")` | All stamps from source `src` have type `T` |
+| `NoFalseSharing` | `assert no_false_sharing("A", "B")` | Variables A and B do not share a cacheline |
+| `AllocBeforeStamp` | `assert alloc_before_stamp` | Every heap STAMP has a preceding ALLOC at the same address |
+| `NoUseAfterFree` | `assert no_use_after_free` | No STAMP or LINK targets a freed address (compares STAMP seq against FREE seq, not ALLOC seq) |
+| `MonotonicSeq` | `assert monotonic_seq` | ALLOC, STAMP, and LINK sequences are each monotonically increasing |
+| `StampBeforeLink` | `assert stamp_before_link` | Every LINK target was stamped before the link event |
+
+**`no_use_after_free` implementation note**: `AllocEvent` tracks both
+`seq` (ALLOC event sequence) and `free_seq` (FREE event sequence). The
+assertion compares STAMP/LINK `seq` against `free_seq`, not `seq`. This
+prevents false positives where a STAMP occurs after ALLOC but before FREE.
+
 ## Static cacheline lint (`lint.rs`, `memvis-lint`)
 
 `memvis-lint` is a pure static analysis tool. It reads DWARF from a compiled
@@ -1014,7 +1102,7 @@ Full startup when the user runs `memvis <target>`:
 7. Discover the first thread ring and attach (validating magic + proto).
 8. Spawn the consumer on a 64 MB stack thread (deep DWARF resolution).
 9. Consumer enters the main event loop (TUI or headless).
-10. Warm-scan triggers after 2M events + 10 idle rounds (reads `/proc/<pid>/mem`).
+10. Warm-scan triggers after 2M events + 5 idle rounds (reads `/proc/<pid>/mem`).
 11. If `--record`: `EventRecorder` writes events (compound REG_SNAPSHOT).
 12. If `--export-topology`: `TopologyStream` writes JSONL.
 13. On exit: finalize recorder/topology, send SIGTERM to tracer, reap child,

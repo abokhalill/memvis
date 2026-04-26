@@ -72,6 +72,46 @@ memvis-check topo.jsonl assertions.txt
 
 Exit code 0 = all assertions pass. Non-zero = at least one failure.
 
+### Assertion DSL
+
+Each line in the `.assertions` file is either blank, a comment (`#`), or
+an assertion of the form `assert <predicate>`. Supported predicates:
+
+| Assertion | Syntax | Semantics |
+|---|---|---|
+| `NoHazards` | `assert no_hazards` | Zero `HAZARD` events in topology |
+| `LiveAllocsLt` | `assert live_allocs < N` | Fewer than N live allocations at SUMMARY |
+| `StmProjectionsGt` | `assert stm_projections > N` | More than N STM projections at SUMMARY |
+| `MaxChain` | `assert max_chain(type("T"), "field") < N` | Longest pointer chain via `T.field` is < N |
+| `TypeStable` | `assert type_stable(global("src"), "T")` | All stamps from source `src` have type `T` |
+| `NoFalseSharing` | `assert no_false_sharing("A", "B")` | Variables A and B do not share a cacheline |
+| `AllocBeforeStamp` | `assert alloc_before_stamp` | Every heap STAMP has a preceding ALLOC at the same address |
+| `NoUseAfterFree` | `assert no_use_after_free` | No STAMP or LINK targets a freed address (compares against FREE seq) |
+| `MonotonicSeq` | `assert monotonic_seq` | ALLOC, STAMP, and LINK sequences are each monotonically increasing |
+| `StampBeforeLink` | `assert stamp_before_link` | Every LINK target was stamped before the link event |
+
+Example `.assertions` file:
+
+```
+# Ensure no heap hazards detected
+assert no_hazards
+
+# All heap accesses must be preceded by allocation
+assert alloc_before_stamp
+
+# No use-after-free violations
+assert no_use_after_free
+
+# Node chain length bounded
+assert max_chain(type("node"), "next") < 100
+
+# Global variable type stability
+assert type_stable(global("head"), "node*")
+
+# No false sharing between hot counters
+assert no_false_sharing("counter_a", "counter_b")
+```
+
 ## memvis-lint
 
 Static cacheline false-sharing detector.
