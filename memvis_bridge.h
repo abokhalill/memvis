@@ -19,16 +19,14 @@
 #define MEMVIS_PROTO_VERSION 3
 #define MEMVIS_SHM_ENV       "MEMVIS_SHM_PATH"
 
-/* hash me baby; detects C<->Rust header mismatch */
-static inline uint32_t memvis_build_hash_compute(void) {
-    const char stamp[] = __DATE__ " " __TIME__;
-    uint32_t h = 0x811c9dc5u;
-    for (int i = 0; stamp[i]; i++) {
-        h ^= (uint8_t)stamp[i];
-        h *= 0x01000193u;
-    }
-    return h;
-}
+/*hash me baby*/
+#define _MV_FNV(h, v) do { \
+    uint32_t _v = (uint32_t)(v); \
+    for (int _i = 0; _i < 4; _i++) { \
+        (h) ^= (_v >> (_i * 8)) & 0xFF; \
+        (h) *= 0x01000193u; \
+    } \
+} while(0)
 
 #define MEMVIS_EVENT_WRITE    0
 #define MEMVIS_EVENT_READ     1
@@ -189,6 +187,25 @@ static inline memvis_event_v3_t *memvis_ring_data_v3(memvis_ring_header_t *hdr) 
 
 static inline size_t memvis_shm_size(uint32_t capacity) {
     return sizeof(memvis_ring_header_t) + (size_t)capacity * sizeof(memvis_event_v3_t);
+}
+
+/* must match engine-side memvis_abi_hash() */
+static inline uint32_t memvis_build_hash_compute(void) {
+    uint32_t h = 0x811c9dc5u;
+    _MV_FNV(h, sizeof(memvis_event_v3_t));
+    _MV_FNV(h, offsetof(memvis_event_v3_t, addr));
+    _MV_FNV(h, offsetof(memvis_event_v3_t, value));
+    _MV_FNV(h, offsetof(memvis_event_v3_t, kind_flags));
+    _MV_FNV(h, offsetof(memvis_event_v3_t, rip_lo));
+    _MV_FNV(h, sizeof(memvis_ring_header_t));
+    _MV_FNV(h, offsetof(memvis_ring_header_t, head));
+    _MV_FNV(h, offsetof(memvis_ring_header_t, tail));
+    _MV_FNV(h, offsetof(memvis_ring_header_t, status));
+    _MV_FNV(h, sizeof(memvis_scratch_pad_t));
+    _MV_FNV(h, offsetof(memvis_scratch_pad_t, nesting_level));
+    _MV_FNV(h, offsetof(memvis_scratch_pad_t, stat_reentrant_drops));
+    _MV_FNV(h, offsetof(memvis_scratch_pad_t, stat_truncated_writes));
+    return h;
 }
 
 static inline int memvis_push_ex_flags(memvis_ring_header_t *ring,

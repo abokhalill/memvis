@@ -13,6 +13,40 @@ pub const MEMVIS_PROTO_VERSION: u32 = 3;
 pub const MAX_THREADS: usize = 256;
 pub const RING_NAME_LEN: usize = 48;
 
+fn fnv_feed(h: &mut u32, v: u32) {
+    for i in 0..4 {
+        *h ^= (v >> (i * 8)) & 0xFF;
+        *h = h.wrapping_mul(0x01000193);
+    }
+}
+
+macro_rules! field_offset {
+    ($T:ty, $field:ident) => {{
+        let uninit = mem::MaybeUninit::<$T>::uninit();
+        let base = uninit.as_ptr() as usize;
+        let field = unsafe { &(*uninit.as_ptr()).$field as *const _ as usize };
+        (field - base) as u32
+    }};
+}
+
+pub fn memvis_abi_hash() -> u32 {
+    let mut h = 0x811c9dc5u32;
+    fnv_feed(&mut h, mem::size_of::<Event>() as u32);
+    fnv_feed(&mut h, field_offset!(Event, addr));
+    fnv_feed(&mut h, field_offset!(Event, value));
+    fnv_feed(&mut h, field_offset!(Event, kind_flags));
+    fnv_feed(&mut h, field_offset!(Event, rip_lo));
+    fnv_feed(&mut h, mem::size_of::<RingHeader>() as u32);
+    fnv_feed(&mut h, field_offset!(RingHeader, head));
+    fnv_feed(&mut h, field_offset!(RingHeader, tail));
+    fnv_feed(&mut h, field_offset!(RingHeader, status));
+    fnv_feed(&mut h, 128); // sizeof(memvis_scratch_pad_t)
+    fnv_feed(&mut h, 28);   // nesting_level
+    fnv_feed(&mut h, 32);   // stat_reentrant_drops
+    fnv_feed(&mut h, 40);   // stat_truncated_writes
+    h
+}
+
 #[derive(Clone, Copy)]
 #[repr(C, align(32))]
 pub struct Event {
@@ -323,8 +357,17 @@ impl RingOrchestrator {
             );
             return false;
         }
+        let expected_hash = memvis_abi_hash();
+        if hdr.build_hash != expected_hash {
+            eprintln!(
+                "memvis: ABI MISMATCH: tracer hash=0x{:08x}, engine hash=0x{:08x}",
+                hdr.build_hash, expected_hash
+            );
+            eprintln!("memvis: rebuild both tracer and engine from the same memvis_bridge.h");
+            return false;
+        }
         eprintln!(
-            "memvis: ctl attached (proto={}, build_hash=0x{:08x}, target_pid={})",
+            "memvis: ctl attached (proto={}, abi_hash=0x{:08x}, target_pid={})",
             hdr.proto_version, hdr.build_hash, hdr.target_pid
         );
         self.ctl = Some(shm);
