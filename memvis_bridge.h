@@ -158,14 +158,19 @@ static inline uint64_t memvis_make_kind_flags(uint8_t kind, uint8_t flags) {
 /* per-event flags (bits 8-15 of kind_flags) */
 #define MEMVIS_FLAG_TRUNCATED     0x80
 
+/* ring lifecycle status (ring_header.status) */
+#define MV_STATUS_ACTIVE          0
+#define MV_STATUS_TERMINAL        1
+
 typedef struct {
     uint64_t magic;
     uint32_t capacity;
     uint32_t entry_size;
     uint64_t flags;
     _Atomic uint32_t backpressure;
-    uint32_t proto_version;     
-    uint8_t  _pad0[MEMVIS_CACHE_LINE - 28 - sizeof(_Atomic uint32_t)];
+    uint32_t proto_version;
+    _Atomic uint32_t status;
+    uint8_t  _pad0[MEMVIS_CACHE_LINE - 36];
     _Alignas(MEMVIS_CACHE_LINE) _Atomic uint64_t head;
     uint8_t  _pad1[MEMVIS_CACHE_LINE - sizeof(_Atomic uint64_t)];
     _Alignas(MEMVIS_CACHE_LINE) _Atomic uint64_t tail;
