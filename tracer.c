@@ -64,6 +64,7 @@ _Static_assert(offsetof(memvis_ring_header_t, tail) == 2 * MEMVIS_CACHE_LINE, "r
 
 #include <sys/mman.h>
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <string.h>
@@ -1683,10 +1684,36 @@ event_thread_init(void *drcontext)
               (unsigned)tid, (void *)ring, (void *)pad, name);
 }
 
+/* flush cached head to shared ring before blocking syscalls; mark terminal on exit */
+static bool
+event_pre_syscall(void *drcontext, int sysnum)
+{
+    memvis_ring_header_t *ring = (memvis_ring_header_t *)raw_tls_get(
+        drcontext, RAW_TLS(MEMVIS_RAW_SLOT_RING));
+    if (!ring) return true;
+
+    uint64_t cached = (uint64_t)(uintptr_t)raw_tls_get(
+        drcontext, RAW_TLS(MEMVIS_RAW_SLOT_HEAD));
+    uint64_t published = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    if (cached != published)
+        atomic_store_explicit(&ring->head, cached, memory_order_release);
+
+    if (sysnum == SYS_exit || sysnum == SYS_exit_group)
+        atomic_store_explicit(&ring->status, MV_STATUS_TERMINAL, memory_order_release);
+
+    return true;
+}
+
 static void
 event_thread_exit(void *drcontext)
 {
-    flush_head_cache(drcontext);
+    /* terminal flush: publish any remaining cached events */
+    memvis_ring_header_t *ring_hdr = (memvis_ring_header_t *)raw_tls_get(
+        drcontext, RAW_TLS(MEMVIS_RAW_SLOT_RING));
+    if (ring_hdr) {
+        flush_head_cache(drcontext);
+        atomic_store_explicit(&ring_hdr->status, MV_STATUS_TERMINAL, memory_order_release);
+    }
 
     int ctl_idx = (int)(uintptr_t)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_CTL_IDX]) - 1;
     if (ctl_idx >= 0 && g_ctl)
@@ -1808,6 +1835,7 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
     drmgr_register_exit_event(event_exit);
     drmgr_register_thread_init_event(event_thread_init);
     drmgr_register_thread_exit_event(event_thread_exit);
+    drmgr_register_pre_syscall_event(event_pre_syscall);
 
     drmgr_register_bb_instrumentation_event(event_bb_analysis,
                                             event_bb_insert, NULL);
