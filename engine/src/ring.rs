@@ -61,6 +61,9 @@ impl Event {
     }
 }
 
+pub const MV_STATUS_ACTIVE: u32 = 0;
+pub const MV_STATUS_TERMINAL: u32 = 1;
+
 #[repr(C)]
 pub struct RingHeader {
     pub magic: u64,
@@ -69,7 +72,8 @@ pub struct RingHeader {
     pub flags: u64,
     pub backpressure: AtomicU32,
     pub proto_version: u32,
-    _pad0: [u8; CACHE_LINE - 28 - mem::size_of::<AtomicU32>()],
+    pub status: AtomicU32,
+    _pad0: [u8; CACHE_LINE - 36],
     pub head: AtomicU64,
     _pad1: [u8; CACHE_LINE - mem::size_of::<AtomicU64>()],
     pub tail: AtomicU64,
@@ -211,6 +215,10 @@ impl ThreadRing {
 
     pub fn header(&self) -> &RingHeader {
         unsafe { &*(self.shm.ptr as *const RingHeader) }
+    }
+
+    pub fn is_terminal(&self) -> bool {
+        self.header().status.load(Ordering::Acquire) == MV_STATUS_TERMINAL
     }
 
     #[inline]
@@ -500,6 +508,17 @@ impl RingOrchestrator {
                 buf.push((i, self.scratch[j]));
             }
             total += got;
+
+            /* last-gasp: if ring is terminal and fully drained, retire it */
+            if self.rings[i].alive && self.rings[i].is_terminal() {
+                let hdr = self.rings[i].header();
+                let h = hdr.head.load(Ordering::Acquire);
+                let t = hdr.tail.load(Ordering::Relaxed);
+                if h == t {
+                    eprintln!("memvis: ring {} terminal, retired", self.rings[i].thread_id);
+                    self.rings[i].alive = false;
+                }
+            }
         }
         self.rr_idx = (self.rr_idx + 1) % n.max(1);
         total
