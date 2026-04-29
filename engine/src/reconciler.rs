@@ -79,6 +79,10 @@ pub fn process_event(
     let ev_kind = ev.kind();
     match ev_kind {
         EVENT_WRITE => {
+            let truncated = ev.is_truncated();
+            // value is only the low 8B prefix when truncated; zero-poison
+            // all value-semantic paths to prevent phantom pointer chasing
+            let val = if truncated { 0u64 } else { ev.value };
             let cl_writers = world.record_cl_write(ev.addr, ev.thread_id);
             if let Some(ref info) = dwarf_info {
                 if addr_index.in_universe(ev.addr) {
@@ -88,13 +92,13 @@ pub fn process_event(
                     };
                     let func = info.func_containing(elf_pc);
                     let srf = shadow_regs.entry(ev.thread_id).or_default();
-                    srf.observe_write(ev.addr, ev.value, elf_pc, ev.seq32() as u64, func);
+                    srf.observe_write(ev.addr, val, elf_pc, ev.seq32() as u64, func);
                 }
             }
-            if cl_writers.count_ones() > 1 {
+            if !truncated && cl_writers.count_ones() > 1 {
                 for (&tid, srf) in shadow_regs.iter_mut() {
                     if tid != ev.thread_id {
-                        srf.check_coherence(ev.addr, ev.value, ev.size, ev.seq32() as u64);
+                        srf.check_coherence(ev.addr, val, ev.size, ev.seq32() as u64);
                     }
                 }
             }
@@ -102,7 +106,7 @@ pub fn process_event(
                 heap_graph.process_write(
                     ev.addr,
                     ev.size,
-                    ev.value,
+                    val,
                     ev.seq32() as u64,
                     heap_oracle,
                 );
@@ -127,7 +131,7 @@ pub fn process_event(
                             .record(ev.thread_id, tn, "<unresolved>", offset);
                     }
                 }
-                if ev.size == 8 && ev.value != 0 {
+                if ev.size == 8 && val != 0 {
                     if let Some(ref mut ts) = topo {
                         if let Some(covering) = world.stm.covering(ev.addr) {
                             let offset = ev.addr - covering.base_addr;
@@ -146,7 +150,7 @@ pub fn process_event(
                                     ev.seq32() as u64,
                                     &covering.type_info.name,
                                     ev.addr,
-                                    ev.value,
+                                    val,
                                     pointee,
                                     &field.name,
                                 );
@@ -158,7 +162,7 @@ pub fn process_event(
                     let before = world.stm.len();
                     world.stm.propagate_field_write(
                         ev.addr,
-                        ev.value,
+                        val,
                         ev.size,
                         ev.seq32() as u64,
                         &info.type_registry,
@@ -166,7 +170,7 @@ pub fn process_event(
                     let after = world.stm.len();
                     if after > before {
                         world.stm.retrospective_scan(
-                            ev.value,
+                            val,
                             heap_graph,
                             &world.heap_allocs,
                             &info.type_registry,
@@ -175,10 +179,10 @@ pub fn process_event(
                     }
                     if after > before {
                         if let Some(ref mut ts) = topo {
-                            if let Some(proj) = world.stm.lookup(ev.value) {
+                            if let Some(proj) = world.stm.lookup(val) {
                                 ts.emit_stamp(
                                     ev.seq32() as u64,
-                                    ev.value,
+                                    val,
                                     &proj.type_info.name,
                                     proj.type_info.byte_size,
                                     &proj.source_name,
@@ -228,7 +232,7 @@ pub fn process_event(
                 let h_type = h.type_info.clone();
                 let is_ptr = h.type_info.is_pointer;
                 world.ensure_node(nid, &h_name, &h_type, ev.addr, ev.size as u64);
-                world.update_value(nid, ev.value, world.insn_counter());
+                world.update_value(nid, val, world.insn_counter());
                 if is_ptr && ev.size == 8 {
                     let target = if ev.value == 0 {
                         None

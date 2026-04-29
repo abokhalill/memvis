@@ -33,6 +33,16 @@ impl Event {
     }
 
     #[inline(always)]
+    pub fn flags(&self) -> u8 {
+        ((self.kind_flags >> 8) & 0xFF) as u8
+    }
+
+    #[inline(always)]
+    pub fn is_truncated(&self) -> bool {
+        self.flags() & 0x80 != 0
+    }
+
+    #[inline(always)]
     pub fn seq32(&self) -> u32 {
         let hi = self.kind_flags >> 16;
         (hi << 16) | (self.seq as u32)
