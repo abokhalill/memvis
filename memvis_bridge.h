@@ -90,8 +90,10 @@ typedef struct __attribute__((aligned(MEMVIS_CACHE_LINE))) {
     uint64_t scratch[2];
     uint64_t ring_data;
     uint32_t ring_mask;
-    uint32_t _pad0;
-    uint64_t _cl0_reserved[4];
+    uint32_t nesting_level;
+    uint64_t stat_reentrant_drops;
+    uint64_t stat_truncated_writes;
+    uint64_t _cl0_reserved[2];
     /* cl1: stats */
     uint64_t stat_inline_writes;
     uint64_t stat_reads;
@@ -152,6 +154,9 @@ static inline uint64_t memvis_make_kind_flags(uint8_t kind, uint8_t flags) {
 
 #define MEMVIS_FLAG_DROP_ON_FULL  0x0
 #define MEMVIS_FLAG_SPIN_ON_FULL  0x1
+
+/* per-event flags (bits 8-15 of kind_flags) */
+#define MEMVIS_FLAG_TRUNCATED     0x80
 
 typedef struct {
     uint64_t magic;
