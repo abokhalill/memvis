@@ -18,10 +18,16 @@
 #define OFF_PAD_STAT_RETURNS   ((int)offsetof(memvis_scratch_pad_t, stat_returns))
 #define OFF_PAD_STAT_DROPPED   ((int)offsetof(memvis_scratch_pad_t, stat_dropped))
 #define OFF_PAD_AUDIT_CTR      ((int)offsetof(memvis_scratch_pad_t, ccc_audit_ctr))
+#define OFF_PAD_NESTING        ((int)offsetof(memvis_scratch_pad_t, nesting_level))
+#define OFF_PAD_REENTRANT      ((int)offsetof(memvis_scratch_pad_t, stat_reentrant_drops))
+#define OFF_PAD_TRUNCATED      ((int)offsetof(memvis_scratch_pad_t, stat_truncated_writes))
 
 _Static_assert(offsetof(memvis_scratch_pad_t, scratch[0]) ==  0, "pad.scratch[0] drift");
 _Static_assert(offsetof(memvis_scratch_pad_t, ring_data)  == 16, "pad.ring_data drift");
 _Static_assert(offsetof(memvis_scratch_pad_t, ring_mask)  == 24, "pad.ring_mask drift");
+_Static_assert(offsetof(memvis_scratch_pad_t, nesting_level) == 28, "pad.nesting drift");
+_Static_assert(offsetof(memvis_scratch_pad_t, stat_reentrant_drops) == 32, "pad.reentrant drift");
+_Static_assert(offsetof(memvis_scratch_pad_t, stat_truncated_writes) == 40, "pad.truncated drift");
 _Static_assert(offsetof(memvis_scratch_pad_t, stat_inline_writes) == 64, "pad.stat_inline drift");
 _Static_assert(sizeof(memvis_scratch_pad_t) == 128, "pad size drift");
 
@@ -92,6 +98,8 @@ static _Atomic uint64_t g_stat_clean_reads   = 0;
 static _Atomic uint64_t g_stat_read_vals     = 0;
 static _Atomic uint64_t g_stat_priority_reads = 0;
 static _Atomic uint64_t g_stat_shed_reads     = 0;
+static _Atomic uint64_t g_stat_reentrant_drops = 0;
+static _Atomic uint64_t g_stat_truncated_writes = 0;
 
 /* JIT-time site counters */
 static _Atomic uint64_t g_jit_gpr_sites      = 0;
@@ -162,6 +170,7 @@ typedef struct {
     bool     has_reads;
     bool     value_inline;
     bool     value_is_imm;
+    bool     wide_write;
     bool     bb_emitted;
 } instru_data_t;
 
@@ -379,12 +388,16 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
                reg_id_t reg_addr, reg_id_t scratch,
                uint32_t sz, app_pc app_pc_val,
                reg_id_t src_reg, bool has_imm, uint64_t imm_val,
-               bool *value_captured)
+               bool *value_captured, bool wide_write)
 {
     uint32_t rip_offset = (uint32_t)((uint64_t)(ptr_uint_t)app_pc_val
                                      - g_module_base);
+    /* JIT-time constant: kind byte + flags byte (TRUNCATED if wide) */
+    uint32_t kind_or = (uint32_t)MEMVIS_EVENT_WRITE
+                     | (wide_write ? ((uint32_t)MEMVIS_FLAG_TRUNCATED << 8) : 0);
 
-    instr_t *skip_label = INSTR_CREATE_label(drcontext);
+    instr_t *skip_label     = INSTR_CREATE_label(drcontext);
+    instr_t *reentrant_skip = INSTR_CREATE_label(drcontext);
 
     drreg_reserve_aflags(drcontext, bb, where);
 
@@ -398,6 +411,15 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
         INSTR_CREATE_mov_st(drcontext,
             OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH0),
             opnd_create_reg(reg_addr)));
+
+    /* signal re-entrancy guard: if nesting_level != 0, torn event; drop */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_cmp(drcontext,
+            opnd_create_base_disp(scratch, DR_REG_NULL, 0,
+                OFF_PAD_NESTING, OPSZ_4),
+            OPND_CREATE_INT32(0)));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_jcc(drcontext, OP_jnz, opnd_create_instr(reentrant_skip)));
 
     instrlist_meta_preinsert(bb, where,
         XINST_CREATE_load(drcontext,
@@ -497,7 +519,7 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_or(drcontext,
             opnd_create_reg(scratch),
-            OPND_CREATE_INT32(MEMVIS_EVENT_WRITE)));
+            OPND_CREATE_INT32((int)kind_or)));
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_st(drcontext,
             opnd_create_base_disp(reg_addr, DR_REG_NULL, 0,
@@ -537,6 +559,13 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
             OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1),
             opnd_create_reg(reg_addr)));
 
+    /* arm nesting guard; post-write will clear */
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(scratch, DR_REG_NULL, 0,
+                OFF_PAD_NESTING, OPSZ_4),
+            OPND_CREATE_INT32(1)));
+
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_mov_ld(drcontext,
             opnd_create_reg(reg_addr),
@@ -545,6 +574,18 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instr_t *done_label = INSTR_CREATE_label(drcontext);
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jmp(drcontext, opnd_create_instr(done_label)));
+
+    /* reentrant skip: bump stat, fall through to normal skip */
+    instrlist_meta_preinsert(bb, where, reentrant_skip);
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(scratch),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_add(drcontext,
+            OPND_CREATE_MEMPTR(scratch, OFF_PAD_REENTRANT),
+            OPND_CREATE_INT32(1)));
 
     /* skip: zero scratch[1], restore EA */
     instrlist_meta_preinsert(bb, where, skip_label);
@@ -632,7 +673,7 @@ safe_read_into_slot(uint64_t addr, uint32_t size, memvis_event_v3_t *slot)
 static void
 emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 reg_id_t reg_addr, uint32_t sz, bool value_inline,
-                bool value_is_imm, reg_id_t src_reg)
+                bool value_is_imm, reg_id_t src_reg, bool wide_write)
 {
     reg_id_t scratch;
     if (drreg_reserve_register(drcontext, bb, where, NULL, &scratch) != DRREG_SUCCESS) {
@@ -658,8 +699,8 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     instrlist_meta_preinsert(bb, where,
         INSTR_CREATE_jcc(drcontext, OP_jz, opnd_create_instr(skip_label)));
 
-    if (!value_inline && sz <= 8) {
-        /* vector 7: inline EA re-read, all meta-instrs, drreg-free */
+    if (!value_inline && (sz <= 8 || wide_write)) {
+        /* vector 7: inline EA re-read (8B prefix for wide writes) */
         atomic_fetch_add_explicit(&g_jit_gpr_sites, 1, memory_order_relaxed);
 
         instrlist_meta_preinsert(bb, where,
@@ -681,7 +722,7 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 opnd_create_reg(scratch),
                 OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1)));
 
-        /* read [EA]; engine masks to ev.size */
+        /* read [EA] low 8B; TRUNCATED flag tells engine value is partial */
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_ld(drcontext,
                 opnd_create_reg(reg_addr),
@@ -690,12 +731,26 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
             INSTR_CREATE_mov_st(drcontext,
                 OPND_CREATE_MEMPTR(scratch, OFF_EV3_VALUE),
                 opnd_create_reg(reg_addr)));
+
+        if (wide_write) {
+            /* bump truncated stat on pad (scratch clobbered, reload) */
+            instrlist_meta_preinsert(bb, where,
+                XINST_CREATE_load(drcontext,
+                    opnd_create_reg(scratch),
+                    dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                        RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+            instrlist_meta_preinsert(bb, where,
+                INSTR_CREATE_add(drcontext,
+                    OPND_CREATE_MEMPTR(scratch, OFF_PAD_TRUNCATED),
+                    OPND_CREATE_INT32(1)));
+        }
 #ifdef MEMVIS_CCC_AUDIT
-        dr_insert_clean_call(drcontext, bb, where,
-            (void *)ccc_count_gpr, false, 0);
+        if (!wide_write)
+            dr_insert_clean_call(drcontext, bb, where,
+                (void *)ccc_count_gpr, false, 0);
 #endif
     } else if (!value_inline) {
-        /* sz > 8: clean-call fallback (REP/wide) */
+        /* sz > 8 non-wide (REP/LOCK): clean-call fallback */
         atomic_fetch_add_explicit(&g_jit_clean_sites, 1, memory_order_relaxed);
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_ld(drcontext,
@@ -786,6 +841,19 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
 
     instrlist_meta_preinsert(bb, where, no_flush_label);
     instrlist_meta_preinsert(bb, where, skip_label);
+
+    /* disarm nesting guard unconditionally; harmless if never armed */
+    instrlist_meta_preinsert(bb, where,
+        XINST_CREATE_load(drcontext,
+            opnd_create_reg(reg_addr),
+            dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
+                RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
+    instrlist_meta_preinsert(bb, where,
+        INSTR_CREATE_mov_st(drcontext,
+            opnd_create_base_disp(reg_addr, DR_REG_NULL, 0,
+                OFF_PAD_NESTING, OPSZ_4),
+            OPND_CREATE_INT32(0)));
+
     drreg_unreserve_aflags(drcontext, bb, where);
 
     if (drreg_unreserve_register(drcontext, bb, where, scratch) != DRREG_SUCCESS)
@@ -1124,6 +1192,7 @@ event_bb_analysis(void *drcontext, void *tag, instrlist_t *bb,
     data->write_sz = 0;
     data->has_reads = false;
     data->value_is_imm = false;
+    data->wide_write = false;
     data->value_inline = false;
     data->bb_emitted = false;
     for (instr_t *i = instrlist_first_app(bb); i != NULL; i = instr_get_next_app(i)) {
@@ -1140,7 +1209,8 @@ handle_pending_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
     if (data->reg_addr == DR_REG_NULL)
         return;
     emit_post_write(drcontext, bb, where, data->reg_addr, data->write_sz,
-                    data->value_inline, data->value_is_imm, data->src_reg);
+                    data->value_inline, data->value_is_imm, data->src_reg,
+                    data->wide_write);
     if (drreg_unreserve_register(drcontext, bb, where, data->reg_addr) != DRREG_SUCCESS)
         DR_ASSERT(false);
     data->reg_addr = DR_REG_NULL;
@@ -1298,11 +1368,12 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                 }
 
                 bool vi = ccc_has_imm;
+                bool is_wide = (sz > 8) && !ccc_force_clean;
 
                 emit_pre_write(drcontext, bb, instr,
                                reg_addr, pre_scratch, sz, write_pc,
                                ccc_src_reg, ccc_has_imm, ccc_imm_val,
-                               &vi);
+                               &vi, is_wide);
 
                 drreg_unreserve_register(drcontext, bb, instr, pre_scratch);
 
@@ -1311,6 +1382,7 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
                 data->write_sz = sz;
                 data->value_inline = vi;
                 data->value_is_imm = ccc_has_imm;
+                data->wide_write = is_wide;
             } else {
                 drreg_unreserve_register(drcontext, bb, instr, reg_addr);
             }
@@ -1641,6 +1713,8 @@ event_thread_exit(void *drcontext)
         atomic_fetch_add_explicit(&g_stat_returns,       pad->stat_returns,        memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_tail_calls,    pad->stat_tail_calls,     memory_order_relaxed);
         atomic_fetch_add_explicit(&g_stat_dropped,       pad->stat_dropped,        memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_stat_reentrant_drops, pad->stat_reentrant_drops, memory_order_relaxed);
+        atomic_fetch_add_explicit(&g_stat_truncated_writes, pad->stat_truncated_writes, memory_order_relaxed);
         dr_thread_free(drcontext, pad, sizeof(memvis_scratch_pad_t));
     }
 
@@ -1671,6 +1745,8 @@ event_exit(void)
     dr_printf("memvis:   rd_vals: %llu\n", (unsigned long long)atomic_load(&g_stat_read_vals));
     dr_printf("memvis:   rd_prio: %llu\n", (unsigned long long)atomic_load(&g_stat_priority_reads));
     dr_printf("memvis:   rd_shed: %llu\n", (unsigned long long)atomic_load(&g_stat_shed_reads));
+    dr_printf("memvis:   reentry: %llu\n", (unsigned long long)atomic_load(&g_stat_reentrant_drops));
+    dr_printf("memvis:   wr_trunc:%llu\n", (unsigned long long)atomic_load(&g_stat_truncated_writes));
     dr_printf("memvis: --- JIT site breakdown ---\n");
     dr_printf("memvis:   imm_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_imm_sites));
     dr_printf("memvis:   gpr_sites:   %llu\n", (unsigned long long)atomic_load(&g_jit_gpr_sites));
