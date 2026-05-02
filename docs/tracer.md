@@ -93,7 +93,7 @@ were tested and all failed (see Design Decisions below).
    - `size` = write size (JIT-time constant)
    - `thread_id` = from raw TLS
    - `seq_lo` = from raw TLS
-   - `kind_flags` = `MEMVIS_EVENT_WRITE` | `(seq_hi << 16)`
+   - `kind_flags` = `MEMVIS_EVENT_WRITE | (wide_write ? MEMVIS_FLAG_TRUNCATED << 8 : 0) | (seq_hi << 16)`
    - `rip_lo` = app PC offset from module base (JIT-time constant)
 8. Save slot pointer to `pad.scratch[1]` (0 if skipped).
 9. Unreserve `scratch`. Keep `reg_addr` reserved across the app store.
@@ -101,19 +101,26 @@ were tested and all failed (see Design Decisions below).
 **Phase 2: `emit_post_write` (inline + clean call, AFTER the store)**
 
 1. Load `pad.scratch[1]`. If 0 → skip (pre-write was skipped).
-2. **Value capture** (two tiers, selected at JIT time):
+2. **Value capture** (three tiers, selected at JIT time):
    - **Cat-A (imm)**: value already written in pre-write. No action.
-   - **Cat-B (vector 7, generalized)**: inline EA re-read for ALL writes
+   - **Cat-B (vector 7, generalized)**: inline EA re-read for writes
      where `sz ≤ 8`. Load EA from `pad.scratch[0]` via raw TLS, 8-byte
      `mov_ld` from `[EA]`, store into `slot->value`. Engine masks to
      actual size via `ev.size`. All meta-instructions — bypasses drreg
      entirely. ~10 cycles. Covers GPR-sourced, RMW, LOCK, and all other
      ≤ 8-byte stores. The app just committed to `[EA]` so the cache
      line is hot.
+   - **Cat-B wide (vector 7, truncated)**: inline EA re-read for writes
+     where `sz > 8` and no REP/LOCK prefix (`!ccc_force_clean`). Reads
+     the low 8 bytes from `[EA]` as a prefix hint. Sets
+     `MEMVIS_FLAG_TRUNCATED` in `kind_flags`. Bumps
+     `pad->stat_truncated_writes` inline. Engine zero-poisons the value
+     to prevent phantom pointer chasing.
    - **Cat-B fallback**: clean call to `safe_read_into_slot(EA, size, slot)`.
      `DR_TRY_EXCEPT`-guarded `memcpy`. ~100 cycles. Only used for
-     `sz > 8` (REP MOVS/STOS, wide writes).
-3. Increment `pad->stat_inline_writes` inline.
+     REP MOVS/STOS and LOCK-prefixed wide writes (`ccc_force_clean`).
+3. Increment `pad->stat_inline_writes` inline. (Wide writes also increment
+   `pad->stat_truncated_writes` in the vector 7 path.)
 4. Increment per-thread `seq` counter (raw TLS).
 5. Increment cached `head` counter (raw TLS).
 6. Conditional head flush: if `head & 0x3F == 0`, flush to `ring->head`
@@ -292,12 +299,38 @@ the main executable. The CAS ensures exactly one thread emits the event.
 
 ## Reentrancy guard
 
-Every clean_call function (except `at_mem_read_buf`) checks the per-thread
-reentrancy guard in `TLS_SLOT_GUARD`. The guard prevents recursive
-instrumentation: if a clean_call triggers a memory operation that would itself
-be instrumented, the inner call sees the guard is set and returns immediately.
+The inline write path uses `pad->nesting_level` (per-thread, in
+`memvis_scratch_pad_t`) to detect reentrant writes. `emit_pre_write`
+increments `nesting_level` before writing event metadata; `emit_post_write`
+decrements it after. If `nesting_level > 0` at entry, the write is dropped
+and `pad->stat_reentrant_drops` is incremented.
 
-NULL = inactive. Non-NULL = clean_call in progress.
+Clean-call functions (except `at_mem_read_buf`) also check `TLS_SLOT_GUARD`.
+NULL = inactive, non-NULL = clean call in progress.
+
+DynamoRIO delivers signals at basic block boundaries, so the nesting guard
+rarely fires in practice. The chaos monkey validates stability under 50µs
+signal storms (42K+ signals delivered, zero crashes).
+
+## Pre-syscall flush
+
+`event_pre_syscall` is registered via `drmgr_register_pre_syscall_event`. On
+every syscall, if the cached head is dirty (non-zero), it is flushed to
+`ring->head` with release ordering. On `SYS_exit` and `SYS_exit_group`, the
+ring status is set to `MV_STATUS_TERMINAL` before the flush. This ensures the
+engine sees all pending events before the thread vanishes.
+
+## Terminal handshake
+
+`event_thread_exit` performs a belt-and-suspenders terminal flush:
+1. Flushes cached head to `ring->head` (release store).
+2. Sets `ring->status = MV_STATUS_TERMINAL` (release store).
+3. Drains per-thread pad stats into global atomics.
+4. Marks the thread `DEAD` in the control ring.
+5. Unmaps and unlinks the ring shared memory.
+
+The engine's `batch_drain` checks for terminal status after consuming events.
+A terminal ring with `head == tail` (fully drained) is retired.
 
 ## Statistics
 
@@ -307,6 +340,9 @@ Stats use a two-tier architecture for zero-contention hot-path counting:
 
 | Field | Meaning |
 |---|---|
+| `pad->nesting_level` | Inline reentrancy nesting depth |
+| `pad->stat_reentrant_drops` | Writes dropped due to nesting |
+| `pad->stat_truncated_writes` | Wide writes (>8B) with truncated prefix |
 | `pad->stat_inline_writes` | Write events emitted via inline path |
 | `pad->stat_reads` | Read events pushed to ring |
 | `pad->stat_reloads` | Reload events emitted |
@@ -325,6 +361,8 @@ Stats use a two-tier architecture for zero-contention hot-path counting:
 | `g_stat_calls` | Sum of all threads' call counts |
 | `g_stat_returns` | Sum of all threads' return counts |
 | `g_stat_dropped` | Sum of all threads' dropped counts |
+| `g_stat_reentrant_drops` | Sum of all threads' reentrant drop counts |
+| `g_stat_truncated_writes` | Sum of all threads' truncated write counts |
 | `g_stat_reg_snaps` | Register snapshots pushed (global, per-call) |
 | `g_stat_rdbuf_flushes` | Read buffer flushes performed (global) |
 

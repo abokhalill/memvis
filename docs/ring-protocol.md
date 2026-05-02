@@ -143,7 +143,8 @@ Byte offset   Size   Field            Cache line
 16            8      flags
 24            4      backpressure     (atomic)
 28            4      proto_version
-32            28     padding
+32            4      status           (atomic, MV_STATUS_{ACTIVE,TERMINAL})
+36            24     padding
 
 64            8      head             CL 1 (atomic, producer-owned)
 72            56     padding
@@ -174,6 +175,11 @@ The event data array begins immediately after the header, at byte offset 192.
 - **`proto_version`** (u32): `MEMVIS_PROTO_VERSION` (currently 3). Written by
   `memvis_ring_init`. The consumer validates this on attach and rejects
   mismatched versions with a diagnostic message to stderr.
+- **`status`** (atomic u32): Ring lifecycle state. `MV_STATUS_ACTIVE` (0) is
+  the initial state. The tracer sets `MV_STATUS_TERMINAL` (1) on thread exit
+  or on `SYS_exit`/`SYS_exit_group` via the pre-syscall hook. The engine
+  checks this after each `batch_drain`: a terminal ring with `head == tail`
+  is retired (set `alive = false`), implementing the last-gasp drain.
 - **`head`** (atomic u64): Write cursor. Owned by the producer. Monotonically
   increasing (wraps at 2^64, masked to capacity for indexing).
 - **`tail`** (atomic u64): Read cursor. Owned by the consumer. Monotonically
@@ -355,12 +361,17 @@ The engine polls the control ring every drain cycle:
 
 When a thread exits:
 
-1. The tracer stores `state = DEAD` with release ordering
-   (`memvis_ctl_mark_dead`).
-2. The tracer unmaps and unlinks the shared memory ring.
-3. The engine detects the `DEAD` state on its next poll and marks the ring
-   as inactive. Inactive rings are still drained (the thread may have
-   produced events before exiting).
+1. The tracer's pre-syscall hook flushes the cached head on every syscall.
+   On `SYS_exit`/`SYS_exit_group`, it also sets `ring->status =
+   MV_STATUS_TERMINAL`.
+2. `event_thread_exit` performs a terminal flush (belt-and-suspenders):
+   flushes cached head, sets `status = MV_STATUS_TERMINAL`, then marks
+   the thread `DEAD` in the control ring.
+3. The tracer unmaps and unlinks the shared memory ring.
+4. The engine's `batch_drain` consumes remaining events from the ring.
+   After consuming, if `is_terminal()` and `head == tail` (fully drained),
+   the ring is retired (`alive = false`). This is the last-gasp drain.
+5. The engine detects the `DEAD` state on its next poll.
 
 ### Protocol version handshake
 
@@ -372,6 +383,22 @@ Both the ring header and control ring header carry `proto_version`:
   attach and rejects mismatches.
 - The engine's `try_attach_ctl` validates `proto_version` on ctl attach
   and rejects mismatches.
+
+### Structural ABI hash
+
+The control ring header carries `build_hash` (u32), computed by
+`memvis_build_hash_compute()`. This is a deterministic FNV-1a over
+`sizeof`/`offsetof` of the three ABI-critical structs:
+`memvis_event_v3_t`, `memvis_ring_header_t`, and `memvis_scratch_pad_t`.
+
+The engine computes the same hash via `memvis_abi_hash()` and compares
+on ctl attach. If the hashes differ, the engine refuses to connect and
+prints a diagnostic:
+
+```
+memvis: ABI MISMATCH: tracer hash=0x..., engine hash=0x...
+memvis: rebuild both tracer and engine from the same memvis_bridge.h
+```
 
 This prevents silent data corruption when the tracer and engine are built
 against different versions of `memvis_bridge.h`.

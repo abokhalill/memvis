@@ -226,13 +226,16 @@ The orchestrator manages all shared memory connections to the tracer.
   `ThreadRing`s. Provides `try_attach_ctl`, `poll_new_rings`,
   `batch_drain`, `merge_pop`, `total_fill`, and `update_backpressure`.
 
-### Protocol version handshake
+### Protocol version + ABI hash handshake
 
-On attach, both `try_attach_ctl` and `ThreadRing::from_shm` validate:
+On attach, `try_attach_ctl` validates:
 1. `magic` matches the expected constant.
 2. `proto_version == MEMVIS_PROTO_VERSION` (currently 3).
+3. `build_hash == memvis_abi_hash()` — structural ABI hash over `sizeof`/`offsetof`
+   of `Event`, `RingHeader`, and scratch pad offsets. Mismatches are rejected
+   with `ABI MISMATCH` diagnostic and the engine refuses to attach.
 
-Mismatches are rejected with a diagnostic message to stderr.
+`ThreadRing::from_shm` validates magic + proto_version on ring attach.
 
 ### Batch drain
 
@@ -241,7 +244,12 @@ The primary drain method is `batch_drain(per_ring, buf)`:
 1. Iterates all rings from the current round-robin index.
 2. Per ring: loads `tail` (relaxed) and `head` (acquire) once, reads up
    to `per_ring` events via `read_volatile`, stores `tail + n` (release).
-3. Appends `(ring_index, event)` pairs to the output buffer.
+3. After consuming events from each ring, checks `is_terminal()` and
+   whether `head == tail` (fully drained). If both, retires the ring
+   (`alive = false`). This is the last-gasp drain: the normal consume
+   reads remaining events, and the terminal check retires only after all
+   events are consumed.
+4. Appends `(ring_index, event)` pairs to the output buffer.
 
 With `per_ring = 20,000` and 6 rings, a single call can return up to
 120,000 events with 12 atomic operations total.
@@ -709,7 +717,7 @@ live engine and `memvis-diff`. Public API:
 
 | Event | Action |
 |---|---|
-| `WRITE` (0) | `cl_tracker.record_write`. `shadow_regs.check_coherence`. If heap: `heap_graph.process_write`, `stm.propagate_field_write` (+ RTR on new stamp), `heap_allocs.check_write_bounds` (Visual ASan, populates `pc` + `reg_snapshot` on hazard). `addr_index.lookup` → `world.update_value` + `world.update_edge`. If pointer to heap: clone type from registry, `patch_shallow_fields`, `stm.stamp_type` + RTR scan. |
+| `WRITE` (0) | `cl_tracker.record_write`. `shadow_regs.check_coherence`. **TRUNCATED gate**: if `ev.is_truncated()`, `val` is zero-poisoned to prevent phantom pointer chasing, type stamping, and coherence checks on partial values. If heap: `heap_graph.process_write`, `stm.propagate_field_write` (+ RTR on new stamp), `heap_allocs.check_write_bounds` (Visual ASan, populates `pc` + `reg_snapshot` on hazard). `addr_index.lookup` → `world.update_value` + `world.update_edge`. If pointer to heap: clone type from registry, `patch_shallow_fields`, `stm.stamp_type` + RTR scan. |
 | `READ` (1) | Journal only (no state mutation). |
 | `CALL` (2) | DWARF function lookup (relocated PC). Push shadow frame. Insert locals into index. |
 | `RETURN` (3) | Look up callee PC via `srf.callee_pc()`. If CFI data exists in `DwarfInfo.cfi` for that PC: `srf.on_return_cfi(saved)` (promotes callee-saved to `CfiVerified`). Otherwise: `srf.on_return()`. Pop shadow frame. Remove locals. Queue deferred node removal. |

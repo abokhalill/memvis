@@ -21,53 +21,48 @@ HEAP TYPES (Shadow Type Map: 2 projections)
     7b6201c00328     8B  next                 *void
   7b6201c00380    24B  node                 (via g_tail)
     7b6201c00380     4B  value                int
-    7b6201c00388     8B  next                 *void
+    7b6201c00380     8B  next                 *void
 
 BB COVERAGE: 42 unique blocks, 641 total hits
-```
 
 Default mode is headless: prints the final snapshot to stdout and exits on
 500ms idle. The surviving nodes were discovered by retrospective type
 reconciliation — no writes occurred after `g_head` was re-pointed.
 
-## Quick start (native)
+## Quick start
 
 Prerequisites: Linux x86-64, Rust 1.74+, CMake 3.7+, a C compiler.
 
 ```sh
-# 1. Install DynamoRIO (one-time, ~30s)
+# 1. Install DynamoRIO (one-time)
 curl -fSL https://github.com/DynamoRIO/dynamorio/releases/download/cronbuild-11.91.20552/DynamoRIO-Linux-11.91.20552.tar.gz \
   | tar -xzC /opt
 export DYNAMORIO_HOME=/opt/DynamoRIO-Linux-11.91.20552
 
-# 2. Build memvis (~60s first time)
+# 2. Build
 cmake -B build -DDynamoRIO_DIR=$DYNAMORIO_HOME/cmake
 cmake --build build -j$(nproc)
 cargo build --release --manifest-path engine/Cargo.toml
 
-# 3. Compile a test target with debug info
+# 3. Compile a target with debug info
 gcc -g examples/heap_chain.c -o heap_chain
 
 # 4. Run (headless, default)
 ./engine/target/release/memvis ./heap_chain
 
-# 5. Interactive TUI (20 Hz refresh)
+# 5. Interactive TUI (20 Hz)
 ./engine/target/release/memvis ./heap_chain --live
 ```
 
-## Quick start (Docker)
+### Docker
 
 ```sh
 DOCKER_BUILDKIT=1 docker build -t memvis .
-gcc -g examples/heap_chain.c -o heap_chain
 docker run --rm \
     --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     -v $(pwd)/heap_chain:/app/heap_chain \
     memvis /app/heap_chain
 ```
-
-`--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required
-for DynamoRIO's process injection.
 
 ## Troubleshooting
 
@@ -76,6 +71,7 @@ for DynamoRIO's process injection.
 | `cannot find drrun` | `DYNAMORIO_HOME` not set | `export DYNAMORIO_HOME=/path/to/DynamoRIO-Linux-*` |
 | `cannot find libmemvis_tracer.so` | Tracer not built or wrong cwd | `cmake --build build` from repo root, or `MEMVIS_TRACER=/path/to/libmemvis_tracer.so` |
 | Empty output / no events | Target lacks DWARF info | Recompile with `gcc -g` |
+| `ABI MISMATCH` | Tracer and engine built from different `memvis_bridge.h` | Rebuild both from the same source |
 | Docker permission denied | Missing ptrace capability | Add `--cap-add=SYS_PTRACE --security-opt seccomp=unconfined` |
 
 ## Binaries
@@ -165,19 +161,21 @@ See [USAGE.md](docs/USAGE.md) for the full flag reference and TUI keybindings.
  │                           │                │  memvis-diff (offline)    │
  │                           │                │  memvis-check (CI/CD)     │
  └───────────────────────────┘                └───────────────────────────┘
-       runs inside                                  separate process
-    target's address space
+      runs inside                                  separate process
+   target's address space
 ```
 
 - [**Architecture**](docs/architecture.md) — system overview, data flow,
   concurrency model, shared memory lifecycle.
 - [**Ring Protocol**](docs/ring-protocol.md) — v3 event format, SPSC memory
-  ordering, backpressure, control ring, protocol handshake.
+  ordering, backpressure, control ring, protocol handshake, ABI hash.
 - [**Tracer**](docs/tracer.md) — DynamoRIO client internals, inline write
-  path, value capture, allocator hooks, tail-call/reload detection.
+  path, value capture, wide-write truncation, re-entrancy guard, pre-syscall
+  flush, terminal handshake, allocator hooks.
 - [**Engine**](docs/engine.md) — DWARF parser, CFI table, JIT DWARF resolution,
-  reconciler, STM, RTR, WarmScanner, Visual ASan, Shadow Register File, event
-  recording, topology streaming, heap graph, BB coverage, SnapshotDelta, TUI.
+  reconciler, STM, RTR, WarmScanner, Visual ASan, Shadow Register File,
+  TRUNCATED flag gating, terminal ring drain, event recording, topology
+  streaming, heap graph, BB coverage, SnapshotDelta, TUI.
 
 ## License
 

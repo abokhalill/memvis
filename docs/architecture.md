@@ -222,7 +222,7 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
   + `rip_lo` (u32: app PC offset). Extended 32-bit sequence numbers.
 - **Ring header**: 192 bytes (3 cache lines). Head and tail on separate lines.
 - **Control ring**: 256 thread slots. Dead-slot reclamation via CAS.
-- **Build hash**: FNV-1a of `__DATE__ __TIME__` for C/Rust mismatch detection.
+- **Build hash**: structural FNV-1a over `sizeof`/`offsetof` of `memvis_event_v3_t`, `memvis_ring_header_t`, and `memvis_scratch_pad_t`. Engine refuses to attach on mismatch.
 
 ## Data flow
 
@@ -349,12 +349,14 @@ Default capacity: 2^20 (1,048,576 entries), ~32 MB per ring.
 | Phase | Actor | Action |
 |---|---|---|
 | Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` |
-| Startup | Tracer | Creates `/memvis_ctl`, inits header (magic + proto_version) |
+| Startup | Tracer | Creates `/memvis_ctl`, inits header (magic + proto + abi_hash) |
 | Thread init | Tracer | Creates `/memvis_ring_N`, registers via CAS reclaim or alloc |
-| Attach | Engine | Opens `/memvis_ctl`, validates magic + proto_version |
-| Discovery | Engine | Opens `/memvis_ring_N`, validates magic + proto_version |
+| Attach | Engine | Opens `/memvis_ctl`, validates magic + proto + abi_hash |
+| Discovery | Engine | Opens `/memvis_ring_N`, validates magic + proto |
 | Runtime | Both | Producer writes events, consumer drains them |
-| Thread exit | Tracer | Marks DEAD (release store), unmaps/unlinks ring SHM |
+| Pre-syscall | Tracer | Flushes cached head; marks terminal on exit/exit_group |
+| Thread exit | Tracer | Terminal flush: sets `status = MV_STATUS_TERMINAL`, marks DEAD, unmaps/unlinks |
+| Ring drain | Engine | `batch_drain`: consumes events, retires terminal rings when `head == tail` |
 | Shutdown | Tracer | Unmaps and unlinks `/memvis_ctl` |
 | Shutdown | Engine | Unmaps all rings |
 
