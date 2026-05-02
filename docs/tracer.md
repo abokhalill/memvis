@@ -110,15 +110,18 @@ were tested and all failed (see Design Decisions below).
      entirely. ~10 cycles. Covers GPR-sourced, RMW, LOCK, and all other
      ≤ 8-byte stores. The app just committed to `[EA]` so the cache
      line is hot.
-   - **Cat-B wide (vector 7, truncated)**: inline EA re-read for writes
-     where `sz > 8` and no REP/LOCK prefix (`!ccc_force_clean`). Reads
-     the low 8 bytes from `[EA]` as a prefix hint. Sets
-     `MEMVIS_FLAG_TRUNCATED` in `kind_flags`. Bumps
-     `pad->stat_truncated_writes` inline. Engine zero-poisons the value
-     to prevent phantom pointer chasing.
+   - **Cat-B wide (compound multi-slot)**: for writes where `sz > 8` and
+     no REP/LOCK prefix (`!ccc_force_clean`). Header event reads the low
+     8 bytes inline (vector 7) with `MEMVIS_FLAG_COMPOUND` in `kind_flags`.
+     A clean call to `compound_fill_continuations` then writes N-1
+     continuation events (each with `MEMVIS_FLAG_CONTINUATION`, 8B chunk
+     value, chunk EA) into consecutive ring slots and advances the cached
+     head. Max 8 slots (64B). Engine reassembles full value per-chunk —
+     no data loss, no zero-poisoning. Bumps `pad->stat_truncated_writes`.
    - **Cat-B fallback**: clean call to `safe_read_into_slot(EA, size, slot)`.
      `DR_TRY_EXCEPT`-guarded `memcpy`. ~100 cycles. Only used for
      REP MOVS/STOS and LOCK-prefixed wide writes (`ccc_force_clean`).
+     These retain `MEMVIS_FLAG_TRUNCATED` and the engine zero-poisons.
 3. Increment `pad->stat_inline_writes` inline. (Wide writes also increment
    `pad->stat_truncated_writes` in the vector 7 path.)
 4. Increment per-thread `seq` counter (raw TLS).

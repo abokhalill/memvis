@@ -92,6 +92,70 @@ for both formats.
 | `BB_ENTRY` | 11 | BB start PC | 0 | 0 | Fully inline, main module only. Shed under backpressure. |
 | `RELOAD` | 12 | Source address | Load size | Register index | MOV to callee-saved |
 
+### Compound wide writes
+
+A compound wide write captures the full value of a memory store >8 bytes by
+occupying multiple consecutive ring slots. The protocol mirrors the register
+snapshot pattern (atomic multi-slot run).
+
+**Header event** (slot 0):
+
+| Field | Value |
+|---|---|
+| `kind` | `WRITE` (0) |
+| `flags` | `MEMVIS_FLAG_COMPOUND` (0x40) |
+| `addr` | Effective address of the write |
+| `size` | Full write size in bytes (e.g. 16, 32, 64) |
+| `value` | Low 8 bytes of the written value |
+| `rip_lo` | App PC offset from module base |
+| `seq_lo` / `seq_hi` | Per-thread sequence number |
+
+**Continuation events** (slots 1..N-1):
+
+| Field | Value |
+|---|---|
+| `kind` | `WRITE` (0) |
+| `flags` | `MEMVIS_FLAG_CONTINUATION` (0x20) |
+| `addr` | `EA + k*8` (chunk effective address) |
+| `size` | `min(8, remaining_bytes)` |
+| `value` | 8-byte chunk at that offset |
+| `rip_lo` | 0 |
+| `seq_lo` | 0 |
+
+**Slot count**: `ceil(write_size / 8)`, capped at `MEMVIS_COMPOUND_MAX_SLOTS`
+(8). A 64-byte AVX-512 / cache-line write uses all 8 slots (header + 7
+continuations). Writes >64 bytes capture the first 64 bytes.
+
+**Atomicity**: `consume_batch` treats compound writes the same as register
+snapshots — if the full run does not fit in the remaining batch capacity, the
+batch ends before the header. This guarantees compound writes are never split
+across batch boundaries.
+
+**Engine processing**: Each continuation event flows through `process_event` as
+an independent `WRITE` with correct `addr`, `size`, and `value`. Continuations
+skip `shadow_regs.observe_write` and cross-thread coherence checks (they carry
+no meaningful sequence number). The header event's value is real data (not
+zero-poisoned).
+
+**Tracer emission**: The header slot is written inline (vector 7 path). A clean
+call to `compound_fill_continuations` writes the continuation slots with
+`DR_TRY_EXCEPT`-guarded reads and advances the cached head by the continuation
+count.
+
+**Flag definitions** (`memvis_bridge.h`):
+
+```c
+#define MEMVIS_FLAG_COMPOUND      0x40  /* header of multi-slot wide write */
+#define MEMVIS_FLAG_CONTINUATION  0x20  /* continuation slot of compound write */
+#define MEMVIS_COMPOUND_MAX_SLOTS 8     /* header + 7 continuations = 64B max */
+```
+
+**Distinction from TRUNCATED**: `MEMVIS_FLAG_TRUNCATED` (0x80) is retained for
+REP MOVS/STOS and LOCK-prefixed wide writes that use the `safe_read_into_slot`
+clean-call fallback. Those events carry only the low 8 bytes and the engine
+zero-poisons their values. Compound writes replace truncation for all other
+wide stores.
+
 ### Register snapshots
 
 A register snapshot occupies 7 consecutive event slots. The first slot is the
