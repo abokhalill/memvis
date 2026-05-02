@@ -215,12 +215,15 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     total += 1;
                     world.inc_insn_counter();
 
-                    let s32 = ev.seq32();
-                    let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
-                    if s32 != *exp {
-                        seq_gaps += 1;
+                    // continuation events have no meaningful seq; skip tracking
+                    if !ev.is_continuation() {
+                        let s32 = ev.seq32();
+                        let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
+                        if s32 != *exp {
+                            seq_gaps += 1;
+                        }
+                        *exp = s32.wrapping_add(1);
                     }
-                    *exp = s32.wrapping_add(1);
 
                     let interesting = reconciler::process_event(
                         &ev,
@@ -241,7 +244,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     if let Some(ref mut rec) = recorder {
                         let _ = rec.record(&ev);
                     }
-                    if interesting {
+                    if interesting && !ev.is_continuation() {
                         journal.push_back(JournalEntry {
                             seq: total,
                             kind: ev_kind,
@@ -474,7 +477,7 @@ fn run_headless(
                 if let Some(ref mut rec) = recorder {
                     let _ = rec.record(&ev);
                 }
-                if interesting {
+                if interesting && !ev.is_continuation() {
                     journal.push_back(JournalEntry {
                         seq: *total,
                         kind: ev_kind,
@@ -1176,7 +1179,7 @@ fn run_replay(
                 &mut heap_oracle,
                 &mut topo,
             );
-            if interesting {
+            if interesting && !ev.is_continuation() {
                 journal.push_back(JournalEntry {
                     seq: total,
                     kind: ev_kind,

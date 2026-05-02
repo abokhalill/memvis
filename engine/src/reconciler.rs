@@ -80,22 +80,26 @@ pub fn process_event(
     match ev_kind {
         EVENT_WRITE => {
             let truncated = ev.is_truncated();
-            // value is only the low 8B prefix when truncated; zero-poison
-            // all value-semantic paths to prevent phantom pointer chasing
+            let continuation = ev.is_continuation();
+            // compound header: value is real low 8B, no poison needed.
+            // continuation: value is real 8B chunk at chunk addr.
+            // truncated (REP/LOCK fallback): zero-poison to block phantom ptrs.
             let val = if truncated { 0u64 } else { ev.value };
             let cl_writers = world.record_cl_write(ev.addr, ev.thread_id);
-            if let Some(ref info) = dwarf_info {
-                if addr_index.in_universe(ev.addr) {
-                    let elf_pc = match *relocation_delta {
-                        Some(d) => ev.addr.wrapping_sub(d),
-                        None => ev.addr,
-                    };
-                    let func = info.func_containing(elf_pc);
-                    let srf = shadow_regs.entry(ev.thread_id).or_default();
-                    srf.observe_write(ev.addr, val, elf_pc, ev.seq32() as u64, func);
+            if !continuation {
+                if let Some(ref info) = dwarf_info {
+                    if addr_index.in_universe(ev.addr) {
+                        let elf_pc = match *relocation_delta {
+                            Some(d) => ev.addr.wrapping_sub(d),
+                            None => ev.addr,
+                        };
+                        let func = info.func_containing(elf_pc);
+                        let srf = shadow_regs.entry(ev.thread_id).or_default();
+                        srf.observe_write(ev.addr, val, elf_pc, ev.seq32() as u64, func);
+                    }
                 }
             }
-            if !truncated && cl_writers.count_ones() > 1 {
+            if !truncated && !continuation && cl_writers.count_ones() > 1 {
                 for (&tid, srf) in shadow_regs.iter_mut() {
                     if tid != ev.thread_id {
                         srf.check_coherence(ev.addr, val, ev.size, ev.seq32() as u64);
