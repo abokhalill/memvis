@@ -393,9 +393,9 @@ emit_pre_write(void *drcontext, instrlist_t *bb, instr_t *where,
 {
     uint32_t rip_offset = (uint32_t)((uint64_t)(ptr_uint_t)app_pc_val
                                      - g_module_base);
-    /* JIT-time constant: kind byte + flags byte (TRUNCATED if wide) */
+    /* JIT-time constant: kind byte + flags byte (COMPOUND if wide) */
     uint32_t kind_or = (uint32_t)MEMVIS_EVENT_WRITE
-                     | (wide_write ? ((uint32_t)MEMVIS_FLAG_TRUNCATED << 8) : 0);
+                     | (wide_write ? ((uint32_t)MEMVIS_FLAG_COMPOUND << 8) : 0);
 
     instr_t *skip_label     = INSTR_CREATE_label(drcontext);
     instr_t *reentrant_skip = INSTR_CREATE_label(drcontext);
@@ -671,6 +671,62 @@ safe_read_into_slot(uint64_t addr, uint32_t size, memvis_event_v3_t *slot)
     slot->value = val;
 }
 
+/* compound wide write: fill continuation slots after the inline header.
+ * header slot (slot[0]) already has value = low 8B, flags = COMPOUND.
+ * this writes slots 1..N-1 with CONTINUATION flag + next 8B chunks.
+ * called from post write path for wide_write && !ccc_force_clean. */
+static void
+compound_fill_continuations(uint32_t write_size)
+{
+    void *drcontext = dr_get_current_drcontext();
+    memvis_scratch_pad_t *pad = tls_pad(drcontext);
+    if (!pad) return;
+
+    uint64_t ea = pad->scratch[0];
+    memvis_event_v3_t *header = (memvis_event_v3_t *)(uintptr_t)pad->scratch[1];
+    if (!header) return;
+
+    uint32_t total_slots = (write_size + 7) / 8;
+    if (total_slots > MEMVIS_COMPOUND_MAX_SLOTS)
+        total_slots = MEMVIS_COMPOUND_MAX_SLOTS;
+    if (total_slots <= 1) return;
+
+    uint32_t cont_count = total_slots - 1;
+    uint16_t tid = header->thread_id;
+    uint32_t kf_cont = memvis_v3_make_kf(MEMVIS_EVENT_WRITE,
+                                          MEMVIS_FLAG_CONTINUATION, 0);
+
+    for (uint32_t k = 0; k < cont_count; k++) {
+        memvis_event_v3_t *slot = header + 1 + k;
+        uint64_t chunk_ea = ea + (uint64_t)(k + 1) * 8;
+        uint32_t chunk_sz = write_size - (k + 1) * 8;
+        if (chunk_sz > 8) chunk_sz = 8;
+
+        uint64_t val = 0;
+        DR_TRY_EXCEPT(drcontext, {
+            memcpy(&val, (void *)(uintptr_t)chunk_ea, chunk_sz);
+        }, { /* fault: val stays 0 */ });
+
+        slot->addr       = chunk_ea;
+        slot->size       = chunk_sz;
+        slot->thread_id  = tid;
+        slot->seq_lo     = 0;
+        slot->value      = val;
+        slot->kind_flags = kf_cont;
+        slot->rip_lo     = 0;
+    }
+
+    /* advance head by cont_count additional slots */
+    uint64_t *head_cache = (uint64_t *)raw_tls_get(drcontext,
+                                RAW_TLS(MEMVIS_RAW_SLOT_HEAD));
+    /* head_cache is the value, not a pointer; use raw TLS directly */
+    void **base = (void **)dr_get_dr_segment_base(g_raw_tls_seg);
+    uintptr_t cur = (uintptr_t)*(void **)((char *)base + RAW_TLS(MEMVIS_RAW_SLOT_HEAD));
+    *(void **)((char *)base + RAW_TLS(MEMVIS_RAW_SLOT_HEAD)) = (void *)(cur + cont_count);
+
+    pad->stat_truncated_writes += 1;
+}
+
 static void
 emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 reg_id_t reg_addr, uint32_t sz, bool value_inline,
@@ -723,7 +779,7 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 opnd_create_reg(scratch),
                 OPND_CREATE_MEMPTR(scratch, OFF_PAD_SCRATCH1)));
 
-        /* read [EA] low 8B; TRUNCATED flag tells engine value is partial */
+        /* read [EA] low 8B into header slot; compound path fills continuations */
         instrlist_meta_preinsert(bb, where,
             INSTR_CREATE_mov_ld(drcontext,
                 opnd_create_reg(reg_addr),
@@ -734,16 +790,10 @@ emit_post_write(void *drcontext, instrlist_t *bb, instr_t *where,
                 opnd_create_reg(reg_addr)));
 
         if (wide_write) {
-            /* bump truncated stat on pad (scratch clobbered, reload) */
-            instrlist_meta_preinsert(bb, where,
-                XINST_CREATE_load(drcontext,
-                    opnd_create_reg(scratch),
-                    dr_raw_tls_opnd(drcontext, g_raw_tls_seg,
-                        RAW_TLS(MEMVIS_RAW_SLOT_SCRATCH))));
-            instrlist_meta_preinsert(bb, where,
-                INSTR_CREATE_add(drcontext,
-                    OPND_CREATE_MEMPTR(scratch, OFF_PAD_TRUNCATED),
-                    OPND_CREATE_INT32(1)));
+            /* fill continuation slots via clean call; advances head by N-1 */
+            dr_insert_clean_call(drcontext, bb, where,
+                (void *)compound_fill_continuations, false, 1,
+                OPND_CREATE_INT32((int)sz));
         }
 #ifdef MEMVIS_CCC_AUDIT
         if (!wide_write)
