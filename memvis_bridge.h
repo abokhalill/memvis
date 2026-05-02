@@ -155,6 +155,9 @@ static inline uint64_t memvis_make_kind_flags(uint8_t kind, uint8_t flags) {
 
 /* per-event flags (bits 8-15 of kind_flags) */
 #define MEMVIS_FLAG_TRUNCATED     0x80
+#define MEMVIS_FLAG_COMPOUND      0x40  /* header of multi-slot wide write */
+#define MEMVIS_FLAG_CONTINUATION  0x20  /* continuation slot of compound write */
+#define MEMVIS_COMPOUND_MAX_SLOTS 8     /* header + 7 continuations = 64B max */
 
 /* ring lifecycle status (ring_header.status) */
 #define MV_STATUS_ACTIVE          0
