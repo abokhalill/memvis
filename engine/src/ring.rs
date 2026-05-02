@@ -77,6 +77,24 @@ impl Event {
     }
 
     #[inline(always)]
+    pub fn is_compound(&self) -> bool {
+        self.flags() & 0x40 != 0
+    }
+
+    #[inline(always)]
+    pub fn is_continuation(&self) -> bool {
+        self.flags() & 0x20 != 0
+    }
+
+    /// total ring slots consumed by this event (1 for normal, N for compound)
+    #[inline(always)]
+    pub fn compound_slots(&self) -> usize {
+        if !self.is_compound() { return 1; }
+        let total = ((self.size as usize) + 7) / 8;
+        total.min(COMPOUND_MAX_SLOTS)
+    }
+
+    #[inline(always)]
     pub fn seq32(&self) -> u32 {
         let hi = self.kind_flags >> 16;
         (hi << 16) | (self.seq as u32)
@@ -97,6 +115,7 @@ impl Event {
 
 pub const MV_STATUS_ACTIVE: u32 = 0;
 pub const MV_STATUS_TERMINAL: u32 = 1;
+pub const COMPOUND_MAX_SLOTS: usize = 8;
 
 #[repr(C)]
 pub struct RingHeader {
@@ -275,8 +294,8 @@ impl ThreadRing {
 
     #[inline]
     pub fn consume_batch(&self, out: &mut [Event]) -> usize {
-        // kind=5 REG_SNAPSHOT opens a 7-slot atomic run; never split it across batches
-        // or the engine's per-batch iterator mistakes continuations for headers.
+        // atomic compound runs: REG_SNAPSHOT (7 slots) and COMPOUND writes
+        // (variable slots) must never be split across batch boundaries.
         const EVENT_REG_SNAPSHOT: u8 = 5;
         let hdr = self.header();
         let mask = (hdr.capacity - 1) as u64;
@@ -289,7 +308,7 @@ impl ThreadRing {
             return 0;
         }
         let mut n = 0usize;
-        let mut snap_tail: u8 = 0;
+        let mut run_tail: u8 = 0;
         while n < cap {
             #[cfg(target_arch = "x86_64")]
             if n + 8 < cap {
@@ -302,13 +321,17 @@ impl ThreadRing {
             }
             let ev: Event =
                 unsafe { ptr::read_volatile(data.add(((t + n as u64) & mask) as usize)) };
-            if snap_tail == 0 && ev.kind() == EVENT_REG_SNAPSHOT {
-                if n + 7 > cap {
-                    break;
+            if run_tail == 0 {
+                if ev.kind() == EVENT_REG_SNAPSHOT {
+                    if n + 7 > cap { break; }
+                    run_tail = 6;
+                } else if ev.is_compound() {
+                    let slots = ev.compound_slots();
+                    if n + slots > cap { break; }
+                    run_tail = (slots - 1) as u8;
                 }
-                snap_tail = 6;
-            } else if snap_tail > 0 {
-                snap_tail = snap_tail.saturating_sub(1);
+            } else {
+                run_tail = run_tail.saturating_sub(1);
             }
             out[n] = ev;
             n += 1;
