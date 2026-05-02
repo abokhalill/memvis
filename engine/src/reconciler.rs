@@ -1244,6 +1244,7 @@ mod tests {
             container_of_map: HashMap::new(),
             cfi: dwarf::CfiTable::default(),
             elf_path: String::new(),
+            name_accel: None,
         };
         let f = std::fs::File::open(path).unwrap();
         (f, info)

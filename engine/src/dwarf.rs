@@ -3,8 +3,8 @@
 // single pass over compilation units. all allocations at startup.
 
 use gimli::{
-    AttributeValue, DebuggingInformationEntry, Dwarf, EndianSlice, LittleEndian, Operation, Range,
-    Unit, UnitOffset,
+    AttributeValue, DebugInfoOffset, DebugNames, DebugStr, DebuggingInformationEntry, Dwarf,
+    EndianSlice, LittleEndian, Operation, Range, Unit, UnitOffset,
 };
 use object::{Object, ObjectSection, ObjectSegment, ObjectSymbol, SymbolKind};
 use std::collections::{BTreeMap, HashMap, HashSet};
@@ -461,6 +461,89 @@ pub struct ContainerOfEntry {
     pub field_offset: u64,
 }
 
+/// DWARF5 .debug_names accelerator: name -> (CU debug_info offset, DIE unit offset).
+/// Built at parse_elf time when the section exists. Eliminates full CU scans in
+/// resolve_deep by jumping directly to the target DIE.
+#[derive(Debug, Clone)]
+pub struct NameAccelerator {
+    /// struct/union name → list of (CU offset in .debug_info, DIE offset within CU)
+    pub type_entries: HashMap<String, Vec<(usize, usize)>>,
+}
+
+impl NameAccelerator {
+    fn build(file_data: &[u8]) -> Option<Self> {
+        let obj = object::File::parse(file_data).ok()?;
+        let names_data = obj.section_by_name(".debug_names")?.data().ok()?;
+        if names_data.is_empty() {
+            return None;
+        }
+        let str_data = obj
+            .section_by_name(".debug_str")
+            .and_then(|s| s.data().ok())
+            .unwrap_or(&[]);
+
+        let debug_names = DebugNames::new(names_data, LittleEndian);
+        let debug_str: DebugStr<R<'_>> = DebugStr::new(str_data, LittleEndian);
+
+        let mut type_entries: HashMap<String, Vec<(usize, usize)>> = HashMap::new();
+        let mut total = 0usize;
+
+        let mut headers = debug_names.headers();
+        while let Ok(Some(header)) = headers.next() {
+            let name_index = match header.index() {
+                Ok(ni) => ni,
+                Err(_) => continue,
+            };
+            let default_cu = name_index.default_compile_unit().ok().flatten();
+
+            for table_idx in name_index.names() {
+                let name_str = match name_index.name_string(table_idx, &debug_str) {
+                    Ok(s) => s,
+                    Err(_) => continue,
+                };
+                let name = name_str.to_string_lossy().to_string();
+
+                let mut entry_iter = match name_index.name_entries(table_idx) {
+                    Ok(it) => it,
+                    Err(_) => continue,
+                };
+                while let Ok(Some(entry)) = entry_iter.next() {
+                    let tag = entry.tag;
+                    if tag != gimli::DW_TAG_structure_type
+                        && tag != gimli::DW_TAG_union_type
+                        && tag != gimli::DW_TAG_class_type
+                    {
+                        continue;
+                    }
+                    let die_off = match entry.die_offset() {
+                        Ok(Some(UnitOffset(off))) => off,
+                        _ => continue,
+                    };
+                    let cu_off = match entry.compile_unit(&name_index) {
+                        Ok(Some(DebugInfoOffset(off))) => off,
+                        Ok(None) => match default_cu {
+                            Some(DebugInfoOffset(off)) => off,
+                            None => continue,
+                        },
+                        Err(_) => continue,
+                    };
+                    type_entries
+                        .entry(name.clone())
+                        .or_default()
+                        .push((cu_off, die_off));
+                    total += 1;
+                }
+            }
+        }
+
+        if total == 0 {
+            return None;
+        }
+        eprintln!("dwarf: .debug_names accelerator: {} type entries", total);
+        Some(NameAccelerator { type_entries })
+    }
+}
+
 pub struct DwarfInfo {
     pub globals: Vec<GlobalVar>,
     pub functions: BTreeMap<u64, FunctionMeta>,
@@ -469,6 +552,7 @@ pub struct DwarfInfo {
     pub cfi: CfiTable,
     pub elf_path: String,
     pub container_of_map: HashMap<String, Vec<ContainerOfEntry>>,
+    pub name_accel: Option<NameAccelerator>,
 }
 
 impl DwarfInfo {
@@ -521,6 +605,30 @@ impl DwarfInfo {
             Err(_) => return false,
         };
 
+        // accelerated path: .debug_names gives us (CU offset, DIE offset) directly
+        if let Some(ref accel) = self.name_accel {
+            if let Some(locations) = accel.type_entries.get(type_name) {
+                for &(cu_off, die_off) in locations {
+                    if let Some(result) = resolve_deep_at(
+                        &dw,
+                        DebugInfoOffset(cu_off),
+                        UnitOffset(die_off),
+                        type_name,
+                        &existing,
+                    ) {
+                        self.type_registry.insert(type_name.to_string(), result);
+                        eprintln!(
+                            "dwarf: deep-resolved {} ({} fields, accel)",
+                            type_name,
+                            self.type_registry[type_name].fields.len()
+                        );
+                        return true;
+                    }
+                }
+            }
+        }
+
+        // fallback: full CU scan (DWARF4 or .debug_names miss)
         let mut iter = dw.units();
         while let Ok(Some(header)) = iter.next() {
             let unit = match dw.unit(header) {
@@ -528,7 +636,7 @@ impl DwarfInfo {
                 Err(_) => continue,
             };
             let mut entries = unit.entries();
-            while let Ok(Some((_, entry))) = entries.next_dfs() {
+            while let Ok(Some(entry)) = entries.next_dfs() {
                 let tag = entry.tag();
                 if tag != gimli::DW_TAG_structure_type && tag != gimli::DW_TAG_union_type {
                     continue;
@@ -542,8 +650,6 @@ impl DwarfInfo {
                 }
                 let bs = entry
                     .attr_value(gimli::DW_AT_byte_size)
-                    .ok()
-                    .flatten()
                     .and_then(|v| v.udata_value())
                     .unwrap_or(0);
                 if bs != existing.byte_size {
@@ -576,12 +682,59 @@ impl DwarfInfo {
     }
 }
 
+/// Accelerated resolve_deep: given a CU offset and DIE offset from .debug_names,
+/// load that specific unit + entry and extract deep fields if it matches.
+fn resolve_deep_at<'a>(
+    dw: &Dwarf<R<'a>>,
+    cu_offset: DebugInfoOffset,
+    die_offset: UnitOffset,
+    type_name: &str,
+    existing: &TypeInfo,
+) -> Option<TypeInfo> {
+    let header = dw.unit_header(cu_offset).ok()?;
+    let unit = dw.unit(header).ok()?;
+    let entry = unit.entry(die_offset).ok()?;
+    let tag = entry.tag();
+    if tag != gimli::DW_TAG_structure_type
+        && tag != gimli::DW_TAG_union_type
+        && tag != gimli::DW_TAG_class_type
+    {
+        return None;
+    }
+    let name = attr_name(dw, &unit, &entry)?;
+    if name != type_name {
+        return None;
+    }
+    let bs = entry
+        .attr_value(gimli::DW_AT_byte_size)
+        .and_then(|v| v.udata_value())
+        .unwrap_or(0);
+    if bs != existing.byte_size {
+        return None;
+    }
+    let mut visited = HashSet::new();
+    let fields = extract_struct_fields_deep(dw, &unit, entry.offset(), 0, &mut visited);
+    if fields.len() > existing.fields.len() {
+        Some(TypeInfo {
+            name,
+            byte_size: bs,
+            is_pointer: false,
+            is_volatile: existing.is_volatile,
+            is_atomic: existing.is_atomic,
+            shallow: false,
+            fields,
+        })
+    } else {
+        None
+    }
+}
+
 fn attr_name<'a>(
     dwarf: &Dwarf<R<'a>>,
     unit: &Unit<R<'a>>,
     entry: &DebuggingInformationEntry<R<'a>>,
 ) -> Option<String> {
-    let val = entry.attr_value(gimli::DW_AT_name).ok().flatten()?;
+    let val = entry.attr_value(gimli::DW_AT_name)?;
     let r = dwarf.attr_string(unit, val).ok()?;
     Some(r.to_string_lossy().to_string())
 }
@@ -623,7 +776,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         let unit = dw.unit(header)?;
         let mut entries = unit.entries();
 
-        while let Some((_, entry)) = entries.next_dfs()? {
+        while let Ok(Some(entry)) = entries.next_dfs() {
             let tag = entry.tag();
             if tag == gimli::DW_TAG_variable {
                 if let Some(g) = try_extract_global(&dw, &unit, entry) {
@@ -765,6 +918,8 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         eprintln!("dwarf: {} container_of entries across {} embedded types", total, container_of_map.len());
     }
 
+    let name_accel = NameAccelerator::build(&file_data);
+
     Ok(DwarfInfo {
         globals,
         functions,
@@ -773,6 +928,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         cfi,
         elf_path: path.to_string(),
         container_of_map,
+        name_accel,
     })
 }
 
@@ -844,7 +1000,7 @@ fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
                 let fde = match partial.parse(|_section, _bases, offset| {
                     cies.get(&offset)
                         .cloned()
-                        .ok_or(gimli::Error::NoEntryAtGivenOffset)
+                        .ok_or(gimli::Error::NoEntryAtGivenOffset(0))
                 }) {
                     Ok(f) => f,
                     Err(_) => continue,
@@ -866,7 +1022,7 @@ fn parse_eh_frame(obj: &object::File<'_>) -> CfiTable {
                     for dwarf_reg in 0u16..17 {
                         let reg = gimli::Register(dwarf_reg);
                         match row.register(reg) {
-                            gimli::RegisterRule::Offset(_) | gimli::RegisterRule::ValOffset(_) => {
+                            Some(gimli::RegisterRule::Offset(_)) | Some(gimli::RegisterRule::ValOffset(_)) => {
                                 if let Some(idx) =
                                     DWARF_TO_REGFILE.get(dwarf_reg as usize).copied().flatten()
                                 {
@@ -1122,7 +1278,7 @@ fn try_extract_global<'a>(
 ) -> Option<GlobalVar> {
     let name = attr_name(dwarf, unit, entry)?;
 
-    let loc_attr = entry.attr_value(gimli::DW_AT_location).ok().flatten()?;
+    let loc_attr = entry.attr_value(gimli::DW_AT_location)?;
     let location = decode_location(dwarf, unit, &loc_attr);
     if location.is_empty() {
         return None;
@@ -1157,16 +1313,12 @@ fn try_extract_spec_global<'a>(
 ) -> Option<(String, TypeInfo)> {
     if entry
         .attr_value(gimli::DW_AT_location)
-        .ok()
-        .flatten()
         .is_some()
     {
         return None;
     }
     let spec_offset = match entry
-        .attr_value(gimli::DW_AT_specification)
-        .ok()
-        .flatten()?
+        .attr_value(gimli::DW_AT_specification)?
     {
         AttributeValue::UnitRef(off) => off,
         _ => return None,
@@ -1187,12 +1339,12 @@ fn try_extract_function<'a>(
 ) -> Option<FunctionMeta> {
     let name = attr_name(dwarf, unit, entry)?;
 
-    let low_pc = match entry.attr_value(gimli::DW_AT_low_pc).ok().flatten()? {
+    let low_pc = match entry.attr_value(gimli::DW_AT_low_pc)? {
         AttributeValue::Addr(a) => a,
         _ => return None,
     };
 
-    let high_pc = match entry.attr_value(gimli::DW_AT_high_pc).ok().flatten()? {
+    let high_pc = match entry.attr_value(gimli::DW_AT_high_pc)? {
         AttributeValue::Udata(len) => low_pc + len,
         AttributeValue::Addr(a) => a,
         _ => return None,
@@ -1200,8 +1352,6 @@ fn try_extract_function<'a>(
 
     let frame_base_is_cfa = entry
         .attr_value(gimli::DW_AT_frame_base)
-        .ok()
-        .flatten()
         .map(|attr| match attr {
             AttributeValue::Exprloc(expr) => {
                 let mut ops = expr.operations(unit.encoding());
@@ -1226,9 +1376,7 @@ fn try_extract_inlined<'a>(
     entry: &DebuggingInformationEntry<R<'a>>,
 ) -> Option<FunctionMeta> {
     let origin_offset = match entry
-        .attr_value(gimli::DW_AT_abstract_origin)
-        .ok()
-        .flatten()?
+        .attr_value(gimli::DW_AT_abstract_origin)?
     {
         AttributeValue::UnitRef(off) => off,
         _ => return None,
@@ -1238,8 +1386,6 @@ fn try_extract_inlined<'a>(
 
     let low_pc = entry
         .attr_value(gimli::DW_AT_low_pc)
-        .ok()
-        .flatten()
         .and_then(|v| match v {
             AttributeValue::Addr(a) => Some(a),
             _ => None,
@@ -1247,8 +1393,6 @@ fn try_extract_inlined<'a>(
         .or_else(|| {
             entry
                 .attr_value(gimli::DW_AT_entry_pc)
-                .ok()
-                .flatten()
                 .and_then(|v| match v {
                     AttributeValue::Addr(a) => Some(a),
                     _ => None,
@@ -1257,8 +1401,6 @@ fn try_extract_inlined<'a>(
 
     let high_pc = entry
         .attr_value(gimli::DW_AT_high_pc)
-        .ok()
-        .flatten()
         .and_then(|v| match v {
             AttributeValue::Udata(len) => Some(low_pc + len),
             AttributeValue::Addr(a) => Some(a),
@@ -1268,8 +1410,6 @@ fn try_extract_inlined<'a>(
 
     let frame_base_is_cfa = origin_entry
         .attr_value(gimli::DW_AT_frame_base)
-        .ok()
-        .flatten()
         .map(|attr| match attr {
             AttributeValue::Exprloc(expr) => {
                 let mut ops = expr.operations(unit.encoding());
@@ -1295,33 +1435,24 @@ fn extract_locals<'a>(
 ) -> Result<(), gimli::Error> {
     let mut entries = unit.entries();
     let mut current_fn_pc: Option<u64> = None;
-    let mut depth: isize = 0;
     let mut fn_depth: isize = 0;
 
-    while let Some((delta_depth, entry)) = entries.next_dfs()? {
-        depth += delta_depth;
+    while let Ok(Some(entry)) = entries.next_dfs() {
+        let depth = entry.depth();
         if current_fn_pc.is_some() && depth <= fn_depth {
             current_fn_pc = None;
         }
 
         let tag = entry.tag();
         if tag == gimli::DW_TAG_subprogram || tag == gimli::DW_TAG_inlined_subroutine {
-            let pc = entry
-                .attr_value(gimli::DW_AT_low_pc)?
-                .and_then(|v| match v {
-                    AttributeValue::Addr(a) => Some(a),
-                    _ => None,
-                })
-                .or_else(|| {
-                    entry
-                        .attr_value(gimli::DW_AT_entry_pc)
-                        .ok()
-                        .flatten()
-                        .and_then(|v| match v {
-                            AttributeValue::Addr(a) => Some(a),
-                            _ => None,
-                        })
-                });
+            let pc = match entry.attr_value(gimli::DW_AT_low_pc) {
+                Some(AttributeValue::Addr(a)) => Some(a),
+                _ => None,
+            }
+            .or_else(|| match entry.attr_value(gimli::DW_AT_entry_pc) {
+                Some(AttributeValue::Addr(a)) => Some(a),
+                _ => None,
+            });
             if pc.is_some() {
                 current_fn_pc = pc;
                 fn_depth = depth;
@@ -1347,7 +1478,7 @@ fn try_extract_local<'a>(
 ) -> Option<LocalVar> {
     let name = attr_name(dwarf, unit, entry)?;
 
-    let loc_attr = entry.attr_value(gimli::DW_AT_location).ok().flatten()?;
+    let loc_attr = entry.attr_value(gimli::DW_AT_location)?;
     let location = decode_location(dwarf, unit, &loc_attr);
     if location.is_empty() {
         return None;
@@ -1403,15 +1534,11 @@ fn extract_struct_fields<'a>(
 
         let byte_offset = entry
             .attr_value(gimli::DW_AT_data_member_location)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
         let type_ref = entry
             .attr_value(gimli::DW_AT_type)
-            .ok()
-            .flatten()
             .and_then(|v| match v {
                 AttributeValue::UnitRef(off) => Some(off),
                 _ => None,
@@ -1424,8 +1551,6 @@ fn extract_struct_fields<'a>(
 
         let alignment = entry
             .attr_value(gimli::DW_AT_alignment)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
@@ -1474,15 +1599,11 @@ fn extract_struct_fields_deep<'a>(
 
         let byte_offset = entry
             .attr_value(gimli::DW_AT_data_member_location)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
         let type_ref = entry
             .attr_value(gimli::DW_AT_type)
-            .ok()
-            .flatten()
             .and_then(|v| match v {
                 AttributeValue::UnitRef(off) => Some(off),
                 _ => None,
@@ -1495,8 +1616,6 @@ fn extract_struct_fields_deep<'a>(
 
         let alignment = entry
             .attr_value(gimli::DW_AT_alignment)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
@@ -1530,8 +1649,6 @@ fn resolve_type_at_deep<'a>(
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<prim>".into());
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
@@ -1548,8 +1665,6 @@ fn resolve_type_at_deep<'a>(
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<anon>".into());
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
@@ -1567,15 +1682,11 @@ fn resolve_type_at_deep<'a>(
     } else if tag == gimli::DW_TAG_pointer_type {
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(8);
 
         let pointee = entry
             .attr_value(gimli::DW_AT_type)
-            .ok()
-            .flatten()
             .and_then(|v| match v {
                 AttributeValue::UnitRef(off) => {
                     resolve_type_at_deep(dwarf, unit, off, depth + 1, visited)
@@ -1603,7 +1714,7 @@ fn resolve_type_at_deep<'a>(
         || tag == gimli::DW_TAG_atomic_type
         || tag == gimli::DW_TAG_restrict_type
     {
-        let inner_ref = match entry.attr_value(gimli::DW_AT_type).ok().flatten()? {
+        let inner_ref = match entry.attr_value(gimli::DW_AT_type)? {
             AttributeValue::UnitRef(off) => off,
             _ => return None,
         };
@@ -1618,7 +1729,7 @@ fn resolve_type<'a>(
     unit: &Unit<R<'a>>,
     entry: &DebuggingInformationEntry<R<'a>>,
 ) -> Option<TypeInfo> {
-    let type_ref = match entry.attr_value(gimli::DW_AT_type).ok().flatten()? {
+    let type_ref = match entry.attr_value(gimli::DW_AT_type)? {
         AttributeValue::UnitRef(offset) => offset,
         _ => return None,
     };
@@ -1644,8 +1755,6 @@ fn resolve_type_at<'a>(
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<anon>".into());
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
@@ -1662,8 +1771,6 @@ fn resolve_type_at<'a>(
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<anon>".into());
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
@@ -1682,15 +1789,11 @@ fn resolve_type_at<'a>(
     } else if tag == gimli::DW_TAG_pointer_type {
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(8);
 
         let pointee = entry
             .attr_value(gimli::DW_AT_type)
-            .ok()
-            .flatten()
             .and_then(|v| match v {
                 AttributeValue::UnitRef(off) => {
                     resolve_type_at(dwarf, unit, off, depth + 1, visited)
@@ -1731,7 +1834,7 @@ fn resolve_type_at<'a>(
         || tag == gimli::DW_TAG_restrict_type
     {
         let typedef_name = attr_name(dwarf, unit, &entry);
-        let inner_ref = match entry.attr_value(gimli::DW_AT_type).ok().flatten()? {
+        let inner_ref = match entry.attr_value(gimli::DW_AT_type)? {
             AttributeValue::UnitRef(off) => off,
             _ => return None,
         };
@@ -1751,15 +1854,11 @@ fn resolve_type_at<'a>(
     } else if tag == gimli::DW_TAG_array_type {
         let mut byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
-            .ok()
-            .flatten()
             .and_then(|v| v.udata_value())
             .unwrap_or(0);
 
         let elem_type = entry
             .attr_value(gimli::DW_AT_type)
-            .ok()
-            .flatten()
             .and_then(|v| match v {
                 AttributeValue::UnitRef(off) => {
                     resolve_type_at(dwarf, unit, off, depth + 1, visited)
@@ -1783,14 +1882,10 @@ fn resolve_type_at<'a>(
                             let count = child
                                 .entry()
                                 .attr_value(gimli::DW_AT_count)
-                                .ok()
-                                .flatten()
                                 .and_then(|v| v.udata_value());
                             let upper = child
                                 .entry()
                                 .attr_value(gimli::DW_AT_upper_bound)
-                                .ok()
-                                .flatten()
                                 .and_then(|v| v.udata_value());
                             let n = count.or_else(|| upper.map(|u| u + 1)).unwrap_or(0);
                             if n > 0 {
@@ -1913,6 +2008,7 @@ mod tests {
             type_registry: registry,
             cfi: CfiTable::new(),
             elf_path: String::new(),
+            name_accel: None,
         };
 
         info.patch_shallow_fields(&mut parent);

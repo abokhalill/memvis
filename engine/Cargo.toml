@@ -23,7 +23,7 @@ path = "src/lint.rs"
 
 [dependencies]
 libc = "0.2"
-gimli = "0.31"
+gimli = "0.33"
 object = { version = "0.36", default-features = false, features = ["read", "elf"] }
 ratatui = "0.29"
 crossterm = "0.28"
