@@ -177,6 +177,36 @@ impl TopologyStream {
         self.lines += 1;
     }
 
+    pub fn emit_process_fork(
+        &mut self,
+        seq: u64,
+        child_pid: u32,
+        parent_pid: u32,
+    ) {
+        let _ = writeln!(
+            self.w,
+            r#"{{"seq":{},"type":"PROCESS_FORK","child_pid":{},"parent_pid":{}}}"#,
+            seq, child_pid, parent_pid
+        );
+        self.lines += 1;
+    }
+
+    pub fn emit_cross_process_write(
+        &mut self,
+        seq: u64,
+        tid: u16,
+        addr: u64,
+        size: u32,
+        region_path: &str,
+    ) {
+        let _ = writeln!(
+            self.w,
+            r#"{{"seq":{},"tid":{},"type":"CROSS_PROCESS_WRITE","addr":"0x{:x}","size":{},"region":"{}"}}"#,
+            seq, tid, addr, size, esc(region_path)
+        );
+        self.lines += 1;
+    }
+
     pub fn emit_summary(
         &mut self,
         total_events: u64,
