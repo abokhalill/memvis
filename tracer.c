@@ -80,6 +80,8 @@ static _Atomic uint64_t g_ccc_audit_fail   = 0;
 
 static memvis_ctl_header_t *g_ctl     = NULL;
 static int                  g_ctl_fd  = -1;
+static uint32_t             g_process_pid = 0;
+static char                 g_ctl_shm_name[MEMVIS_RING_NAME_LEN];
 
 static _Atomic uint64_t g_insn_counter  = 0;
 
@@ -147,10 +149,14 @@ static inline memvis_scratch_pad_t *tls_pad(void *drcontext) {
 }
 
 static void
-map_ctl_ring(void)
+map_ctl_ring(uint32_t parent_pid)
 {
+    g_process_pid = (uint32_t)dr_get_process_id();
+    dr_snprintf(g_ctl_shm_name, sizeof(g_ctl_shm_name),
+                MEMVIS_CTL_SHM_FMT, (unsigned)g_process_pid);
+
     size_t sz = memvis_ctl_shm_size();
-    g_ctl_fd = shm_open(MEMVIS_CTL_SHM_NAME, O_CREAT | O_RDWR, 0600);
+    g_ctl_fd = shm_open(g_ctl_shm_name, O_CREAT | O_RDWR, 0600);
     DR_ASSERT(g_ctl_fd >= 0);
     if (ftruncate(g_ctl_fd, (off_t)sz) != 0)
         DR_ASSERT(false);
@@ -159,8 +165,26 @@ map_ctl_ring(void)
     DR_ASSERT(g_ctl != MAP_FAILED);
     if (g_ctl->magic != MEMVIS_CTL_MAGIC)
         memvis_ctl_init(g_ctl);
-    /* target PID for engine warm scan */
-    g_ctl->target_pid = (uint32_t)dr_get_process_id();
+    g_ctl->target_pid = g_process_pid;
+    g_ctl->parent_pid = parent_pid;
+
+    /* legacy symlink: root process also creates /memvis_ctl for v3 engines */
+    if (parent_pid == 0) {
+        shm_unlink(MEMVIS_CTL_SHM_NAME);
+        int legacy_fd = shm_open(MEMVIS_CTL_SHM_NAME, O_CREAT | O_RDWR, 0600);
+        if (legacy_fd >= 0) {
+            if (ftruncate(legacy_fd, (off_t)sz) == 0) {
+                memvis_ctl_header_t *lctl = (memvis_ctl_header_t *)mmap(
+                    NULL, sz, PROT_READ | PROT_WRITE, MAP_SHARED, legacy_fd, 0);
+                if (lctl != MAP_FAILED) {
+                    /* share same content by copying header; engine attaches here */
+                    memcpy(lctl, g_ctl, sizeof(memvis_ctl_header_t));
+                    munmap(lctl, sz);
+                }
+            }
+            close(legacy_fd);
+        }
+    }
 }
 
 /* per BB instrumentation state; reg_addr lives across the app store */
@@ -972,6 +996,8 @@ unmap_ctl_ring(void)
         close(g_ctl_fd);
         g_ctl_fd = -1;
     }
+    if (g_ctl_shm_name[0])
+        shm_unlink(g_ctl_shm_name);
     shm_unlink(MEMVIS_CTL_SHM_NAME);
 }
 
@@ -1698,6 +1724,74 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
     }
 }
 
+/* fork: child inherits parent's g_ctl mmap (stale). re-create own ctl + ring.
+ * DR guarantees this fires in the child before any instrumented code runs. */
+static void
+event_fork_init(void *drcontext)
+{
+    uint32_t parent = g_process_pid;
+    uint32_t child  = (uint32_t)dr_get_process_id();
+
+    /* detach from parent's ctl (inherited mmap) */
+    if (g_ctl && g_ctl != (void *)MAP_FAILED) {
+        munmap(g_ctl, memvis_ctl_shm_size());
+        g_ctl = NULL;
+    }
+    if (g_ctl_fd >= 0) {
+        close(g_ctl_fd);
+        g_ctl_fd = -1;
+    }
+
+    /* reset thread counter; fork child starts with one thread */
+    atomic_store_explicit(&g_next_thread_id, 0, memory_order_relaxed);
+
+    map_ctl_ring(parent);
+
+    /* re-create this thread's ring under the child's namespace */
+    uint16_t tid = atomic_fetch_add_explicit(&g_next_thread_id, 1, memory_order_relaxed);
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_THREAD_ID], (void *)(uintptr_t)tid);
+
+    /* unmap parent's ring (inherited) */
+    memvis_ring_header_t *old_ring = tls_ring(drcontext);
+    if (old_ring) {
+        munmap(old_ring, memvis_shm_size(old_ring->capacity));
+    }
+
+    char name[MEMVIS_RING_NAME_LEN];
+    dr_snprintf(name, sizeof(name), MEMVIS_RING_SHM_FMT,
+                (unsigned)g_process_pid, (unsigned)tid);
+    memvis_ring_header_t *ring = alloc_thread_ring(name);
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], (void *)ring);
+
+    /* update raw TLS and pad */
+    memvis_scratch_pad_t *pad = tls_pad(drcontext);
+    if (pad && ring) {
+        pad->ring_data = (uint64_t)(uintptr_t)memvis_ring_data(ring);
+        pad->ring_mask = ring->capacity - 1;
+    }
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_RING), (void *)ring);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_HEAD), (void *)(uintptr_t)0);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_SEQ), (void *)(uintptr_t)0);
+    raw_tls_set(drcontext, RAW_TLS(MEMVIS_RAW_SLOT_TID), (void *)(uintptr_t)tid);
+
+    int ctl_idx = -1;
+    if (ring && g_ctl)
+        ctl_idx = memvis_ctl_register_thread(g_ctl, tid, name);
+    drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_CTL_IDX], (void *)(uintptr_t)(ctl_idx + 1));
+
+    /* emit PROCESS_FORK into child's ring so engine discovers us */
+    if (ring) {
+        memvis_push_ex(ring, (uint64_t)child, 0, (uint64_t)parent,
+                       MEMVIS_EVENT_PROCESS_FORK, tid, 0);
+        atomic_store_explicit(&ring->head,
+            atomic_load_explicit(&ring->head, memory_order_relaxed),
+            memory_order_release);
+    }
+
+    dr_printf("memvis: fork child pid=%u parent=%u ring @ %p (%s)\n",
+              (unsigned)child, (unsigned)parent, (void *)ring, name);
+}
+
 static void
 event_thread_init(void *drcontext)
 {
@@ -1707,7 +1801,8 @@ event_thread_init(void *drcontext)
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_SEQ], (void *)(uintptr_t)0);
 
     char name[MEMVIS_RING_NAME_LEN];
-    dr_snprintf(name, sizeof(name), "/memvis_ring_%u", (unsigned)tid);
+    dr_snprintf(name, sizeof(name), MEMVIS_RING_SHM_FMT,
+                (unsigned)g_process_pid, (unsigned)tid);
     memvis_ring_header_t *ring = alloc_thread_ring(name);
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], (void *)ring);
 
@@ -1775,7 +1870,8 @@ event_thread_exit(void *drcontext)
         size_t sz = memvis_shm_size(ring->capacity);
         munmap(ring, sz);
         char name[MEMVIS_RING_NAME_LEN];
-        dr_snprintf(name, sizeof(name), "/memvis_ring_%u", (unsigned)tid);
+        dr_snprintf(name, sizeof(name), MEMVIS_RING_SHM_FMT,
+                    (unsigned)g_process_pid, (unsigned)tid);
         shm_unlink(name);
     }
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], NULL);
@@ -1872,20 +1968,30 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
         DR_ASSERT(g_tls_idx[i] != -1);
     }
 
+    /* stale cleanup: legacy names + pid-scoped from prior runs */
     shm_unlink(MEMVIS_CTL_SHM_NAME);
-    for (unsigned i = 0; i < MEMVIS_MAX_THREADS; i++) {
-        char stale[MEMVIS_RING_NAME_LEN];
-        dr_snprintf(stale, sizeof(stale), "/memvis_ring_%u", i);
-        shm_unlink(stale);  
+    {
+        uint32_t my_pid = (uint32_t)dr_get_process_id();
+        char stale_ctl[MEMVIS_RING_NAME_LEN];
+        dr_snprintf(stale_ctl, sizeof(stale_ctl), MEMVIS_CTL_SHM_FMT, (unsigned)my_pid);
+        shm_unlink(stale_ctl);
+        for (unsigned i = 0; i < MEMVIS_MAX_THREADS; i++) {
+            char stale[MEMVIS_RING_NAME_LEN];
+            dr_snprintf(stale, sizeof(stale), "/memvis_ring_%u", i);
+            shm_unlink(stale);
+            dr_snprintf(stale, sizeof(stale), MEMVIS_RING_SHM_FMT, (unsigned)my_pid, i);
+            shm_unlink(stale);
+        }
     }
 
-    map_ctl_ring();
+    map_ctl_ring(0);
 
     drmgr_register_module_load_event(event_module_load);
     drmgr_register_exit_event(event_exit);
     drmgr_register_thread_init_event(event_thread_init);
     drmgr_register_thread_exit_event(event_thread_exit);
     drmgr_register_pre_syscall_event(event_pre_syscall);
+    dr_register_fork_init_event(event_fork_init);
 
     drmgr_register_bb_instrumentation_event(event_bb_analysis,
                                             event_bb_insert, NULL);
