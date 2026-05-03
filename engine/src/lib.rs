@@ -2,6 +2,7 @@
 pub mod dwarf;
 pub mod heap_graph;
 pub mod index;
+pub mod proc_maps;
 pub mod reconciler;
 pub mod record;
 pub mod ring;
