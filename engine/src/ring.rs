@@ -116,6 +116,7 @@ impl Event {
 pub const MV_STATUS_ACTIVE: u32 = 0;
 pub const MV_STATUS_TERMINAL: u32 = 1;
 pub const COMPOUND_MAX_SLOTS: usize = 8;
+pub const EVENT_PROCESS_FORK: u8 = 13;
 
 #[repr(C)]
 pub struct RingHeader {
@@ -167,7 +168,7 @@ struct CtlHeader {
     max_threads: u32,
     build_hash: u32,
     target_pid: u32,
-    _pad0: u32,
+    parent_pid: u32,
     priority_bloom: [u64; BLOOM_U64S],
     threads: [ThreadEntry; MAX_THREADS],
 }
@@ -361,14 +362,7 @@ impl RingOrchestrator {
         Self::default()
     }
 
-    pub fn try_attach_ctl(&mut self) -> bool {
-        if self.ctl.is_some() {
-            return true;
-        }
-        let shm = match MappedShm::open(b"/memvis_ctl\0") {
-            Some(s) => s,
-            None => return false,
-        };
+    fn attach_ctl_shm(&mut self, shm: MappedShm) -> bool {
         let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
         if hdr.magic != MEMVIS_CTL_MAGIC {
             return false;
@@ -390,11 +384,34 @@ impl RingOrchestrator {
             return false;
         }
         eprintln!(
-            "memvis: ctl attached (proto={}, abi_hash=0x{:08x}, target_pid={})",
-            hdr.proto_version, hdr.build_hash, hdr.target_pid
+            "memvis: ctl attached (proto={}, abi_hash=0x{:08x}, target_pid={}, parent_pid={})",
+            hdr.proto_version, hdr.build_hash, hdr.target_pid, hdr.parent_pid
         );
         self.ctl = Some(shm);
         true
+    }
+
+    pub fn try_attach_ctl(&mut self) -> bool {
+        if self.ctl.is_some() {
+            return true;
+        }
+        /* try pid-scoped name first, fall back to legacy */
+        if let Some(shm) = MappedShm::open(b"/memvis_ctl\0") {
+            return self.attach_ctl_shm(shm);
+        }
+        false
+    }
+
+    /// attach to a specific process's ctl ring by pid
+    pub fn try_attach_ctl_pid(&mut self, pid: u32) -> bool {
+        if self.ctl.is_some() {
+            return true;
+        }
+        let name = format!("/memvis_ctl_{}\0", pid);
+        if let Some(shm) = MappedShm::open(name.as_bytes()) {
+            return self.attach_ctl_shm(shm);
+        }
+        false
     }
 
     pub fn target_pid(&self) -> Option<u32> {
@@ -404,6 +421,16 @@ impl RingOrchestrator {
             None
         } else {
             Some(hdr.target_pid)
+        }
+    }
+
+    pub fn parent_pid(&self) -> Option<u32> {
+        let shm = self.ctl.as_ref()?;
+        let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
+        if hdr.parent_pid == 0 {
+            None
+        } else {
+            Some(hdr.parent_pid)
         }
     }
 
