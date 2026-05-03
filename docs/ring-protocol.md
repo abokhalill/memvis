@@ -361,8 +361,10 @@ consumer's `tail` line. The default policy is `MEMVIS_FLAG_DROP_ON_FULL`
 
 ## Control ring
 
-The control ring is a single shared memory object (`/memvis_ctl`) used for
-thread discovery. It contains a fixed-size array of 256 thread entries:
+The control ring is a PID-scoped shared memory object (`/memvis_ctl_<pid>`)
+used for thread discovery. The root process also creates a legacy
+`/memvis_ctl` for backward compatibility. It contains a fixed-size array of
+256 thread entries:
 
 ```c
 typedef struct {
@@ -370,7 +372,10 @@ typedef struct {
     uint32_t proto_version;                      // MEMVIS_PROTO_VERSION (3)
     _Atomic uint32_t thread_count;               // high-water mark of allocated slots
     uint32_t max_threads;                        // 256
-    uint32_t _pad0;
+    uint32_t build_hash;                         // structural ABI hash (FNV-1a)
+    uint32_t target_pid;                         // PID of instrumented process
+    uint32_t parent_pid;                         // 0 for root process
+    uint64_t priority_bloom[MEMVIS_BLOOM_U64S];  // address-level priority filter
     memvis_thread_entry_t threads[256];
 } memvis_ctl_header_t;
 ```
@@ -382,7 +387,7 @@ typedef struct {
     _Atomic uint32_t state;       // EMPTY=0, ACTIVE=1, DEAD=2
     uint16_t thread_id;
     uint16_t _reserved;
-    char shm_name[48];            // e.g. "/memvis_ring_0"
+    char shm_name[48];            // e.g. "/memvis_ring_12345_0"
 } memvis_thread_entry_t;
 ```
 
@@ -471,14 +476,16 @@ against different versions of `memvis_bridge.h`.
 
 | Phase | Actor | Action |
 |---|---|---|
-| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` |
-| Startup | Tracer | Creates `/memvis_ctl`, inits header (magic + proto) |
-| Thread init | Tracer | Creates `/memvis_ring_N`, registers via CAS/alloc |
-| Attach | Engine | Opens `/memvis_ctl`, validates magic + proto_version |
-| Discovery | Engine | Opens `/memvis_ring_N`, validates magic + proto_version |
-| Runtime | Both | Producer writes events, consumer drains them |
-| Thread exit | Tracer | Marks DEAD, unmaps/unlinks ring SHM |
-| Shutdown | Tracer | Unmaps and unlinks `/memvis_ctl` |
+| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` (legacy + PID-scoped) |
+| Startup | Tracer | Creates `/memvis_ctl_<pid>` (+ legacy `/memvis_ctl` for root), inits header (magic + proto + abi_hash + target_pid + parent_pid) |
+| Thread init | Tracer | Creates `/memvis_ring_<pid>_<tid>`, registers via CAS reclaim or alloc |
+| Attach | Engine | Opens `/memvis_ctl_<pid>` (or legacy `/memvis_ctl`), validates magic + proto + abi_hash |
+| Discovery | Engine | Opens `/memvis_ring_<pid>_<tid>`, validates magic + proto |
+| Fork | Tracer | `event_fork_init`: detach inherited SHM, create child-scoped ctl + ring, emit PROCESS_FORK event |
+| Fork | Engine | `ChildProcessTracker`: discovers child ctl via `try_attach_ctl_pid`, drains child rings |
+| Runtime | Both | Producer writes events, consumer drains them (parent + child orchestrators) |
+| Thread exit | Tracer | Terminal flush, marks DEAD in ctl. Ring SHM persists for post-mortem drain |
+| Shutdown | Tracer | Unmaps and unlinks `/memvis_ctl_<pid>` (+ legacy) |
 | Shutdown | Engine | Unmaps all rings |
 
 All shared memory objects are created with mode 0600 (owner read/write only).

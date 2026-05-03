@@ -19,9 +19,10 @@ The tracer entry point is `dr_client_main()`. It performs the following steps:
 2. Registers 6 drmgr TLS fields via `drmgr_register_tls_field`. The returned
    indices are stored in `g_tls_idx[]`.
 3. Registers 8 raw TLS slots via `drmgr_tls_field_request_raw`.
-4. Creates the control ring shared memory (`/memvis_ctl`).
-5. Registers callbacks: module load, thread init/exit, process exit, BB
-   analysis, and BB insertion.
+4. Creates the PID-scoped control ring shared memory (`/memvis_ctl_<pid>`).
+   Root processes also create a legacy `/memvis_ctl` for backward compat.
+5. Registers callbacks: module load, thread init/exit, process exit,
+   fork init (`dr_register_fork_init_event`), BB analysis, and BB insertion.
 
 ### drmgr TLS fields
 
@@ -263,9 +264,9 @@ atomics, printed at process exit).
 2. Assigns a sequential thread ID via `atomic_fetch_add` on
    `g_next_thread_id`.
 3. Initializes the per-thread sequence counter to 0.
-4. Allocates a per-thread ring via `shm_open` (name: `/memvis_ring_<id>`).
-   Ring is initialized with `memvis_ring_init` (sets magic, capacity,
-   proto_version).
+4. Allocates a per-thread ring via `shm_open` (name:
+   `/memvis_ring_<pid>_<tid>`). Ring is initialized with `memvis_ring_init`
+   (sets magic, capacity, proto_version).
 5. Allocates a `memvis_scratch_pad_t` (128 bytes) via `dr_thread_alloc`.
    Populates `ring_data` and `ring_mask` from the ring header.
 6. Allocates a per-thread read buffer (capacity 16) via `dr_thread_alloc`.

@@ -98,11 +98,11 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 #### Engine subsystem summary
 
-1. **DWARF parsing** (`dwarf.rs`). Parses `.debug_info` via `gimli`. Extracts
-   globals, functions, locals, type information. Struct field extraction is
-   depth-capped at 8 levels via `extract_struct_fields`; type resolution
-   (`resolve_type_at`) is depth-capped at 16 levels. Types truncated by the
-   depth cap are marked `shallow: true` on `TypeInfo`.
+1. **DWARF parsing** (`dwarf.rs`). Parses `.debug_info` via `gimli` (0.33).
+   Extracts globals, functions, locals, type information. Struct field
+   extraction is depth-capped at 8 levels via `extract_struct_fields`; type
+   resolution (`resolve_type_at`) is depth-capped at 16 levels. Types
+   truncated by the depth cap are marked `shallow: true` on `TypeInfo`.
    Builds `type_registry` mapping struct names to `TypeInfo`. Supports
    location tables, `DW_OP_piece` fragments, and a stack-machine evaluator.
    Tracks `DW_TAG_volatile_type` and `DW_TAG_atomic_type` qualifiers
@@ -110,6 +110,19 @@ modules re-exported from `lib.rs`, with four binary entry points.
    struct members (`alignment` on `FieldInfo`).
    **ELF symtab fallback**: globals with `DW_AT_specification` but no
    `DW_AT_location` have addresses resolved from the ELF symbol table.
+   **DT_NEEDED library merge**: `merge_needed_libs` parses the target ELF's
+   `.dynamic` section for `DT_NEEDED` sonames, resolves them via standard
+   linker search paths (`LD_LIBRARY_PATH`, binary directory, system defaults),
+   and merges type information from libraries with `.debug_info`. Works
+   entirely from on-disk files — no live process required, immune to
+   DynamoRIO's private loader. Prefers debug-info-bearing copies when
+   multiple candidates exist for a soname.
+   **DWARF5 name acceleration**: `NameAccelerator::build()` parses the
+   `.debug_names` section at startup, building a `HashMap<String,
+   Vec<(cu_offset, die_offset)>>` for struct/union/class tags.
+   `resolve_deep` uses this for O(1) name→DIE lookup; falls back to full
+   CU scan for DWARF4 binaries. `resolve_deep_at` jumps directly to a
+   CU+DIE via `Dwarf::unit_header()`.
 
 2. **CFI table** (`dwarf.rs`). `parse_eh_frame` reads the `.eh_frame` section
    via gimli and builds a `CfiTable` — a list of `CfiEntry` structs, each
@@ -133,9 +146,17 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 4. **Event reconciler** (`reconciler.rs`). Extracted from `main.rs` for
    library consumption by `memvis-diff`. Contains `process_event` (central
-   dispatch for all 13 event types), `populate_globals`, and `warm_scan`.
-   `process_event` takes `dwarf_info: &mut Option<DwarfInfo>` to allow
-   mutable access for `resolve_deep` and `patch_shallow_fields`.
+   dispatch for all 14 event types including PROCESS_FORK),
+   `populate_globals`, and `warm_scan`. `process_event` takes
+   `dwarf_info: &mut Option<DwarfInfo>` to allow mutable access for
+   `resolve_deep` and `patch_shallow_fields`.
+
+   **Dual-domain sequence tracking**: the tracer uses two independent
+   per-thread sequence counters — raw TLS for JIT-inlined events (WRITE,
+   BB_ENTRY) and drmgr TLS for clean-call events (READ, CALL, RET, ALLOC,
+   FREE, REG_SNAPSHOT). The engine classifies events via `seq_domain()` and
+   tracks `expected_seq` per `(thread_id, domain)`, eliminating false-positive
+   gap reports that occurred when both domains' counters were conflated.
 
 5. **Warm-scan** (`reconciler.rs`). `WarmScanner`: persistent incremental BFS
    over `/proc/<pid>/mem`. `seed()` enqueues globals; `step(budget)` processes
@@ -433,7 +454,7 @@ Cached in raw TLS (`MEMVIS_RAW_SLOT_HEAD`). Flushed to ring header:
 | Tracer | drreg | (bundled) | Register reservation |
 | Tracer | drwrap | (bundled) | Function wrapping (allocator hooks) |
 | Tracer | drsyms | (bundled) | Symbol lookup (allocator resolution) |
-| Engine | gimli | 0.31 | DWARF parsing + `.eh_frame` CFI |
+| Engine | gimli | 0.33 | DWARF parsing + `.eh_frame` CFI + `.debug_names` acceleration |
 | Engine | object | 0.36 | ELF parsing (including symtab fallback) |
 | Engine | ratatui | 0.29 | Terminal UI |
 | Engine | crossterm | 0.28 | Terminal I/O |

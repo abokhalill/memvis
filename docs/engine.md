@@ -49,7 +49,8 @@ each subsystem. All claims are derived from the current `engine/src/` source.
 ## DWARF parser (`dwarf.rs`)
 
 The DWARF parser runs once at startup. It reads the target ELF binary and
-extracts four categories of information.
+extracts four categories of information, then merges type information from
+shared libraries via `DT_NEEDED` resolution.
 
 ### Globals
 
@@ -147,6 +148,37 @@ The map is stored as `DwarfInfo.container_of_map` and consumed by
 pointer to an embedded struct (e.g., `list_head*`), it also enqueues
 the container base address (`ptr - field_offset`) with the container
 type, enabling discovery of the full enclosing object.
+
+### DT_NEEDED library merge
+
+`merge_needed_libs` runs at the end of `parse_elf`. It parses the target
+ELF's `.dynamic` section for `DT_NEEDED` sonames, resolves them to on-disk
+shared libraries via standard linker search paths, and merges type
+information from any that contain `.debug_info`.
+
+**Resolution order** (first match wins, debug-info copies preferred):
+1. `LD_LIBRARY_PATH` directories
+2. Target binary's parent directory (handles libtool `.libs/` pattern)
+3. `/usr/local/lib`, `/usr/local/lib/x86_64-linux-gnu`
+4. `/usr/lib/x86_64-linux-gnu`, `/usr/lib`
+5. `/lib/x86_64-linux-gnu`, `/lib`
+
+For each candidate, the resolver checks for `.debug_info` presence and
+prefers debug-info-bearing copies. Only types are merged (no address
+relocation) — type stamps require structural layout, not absolute addresses.
+
+This approach is deterministic and works post-mortem. It is immune to
+DynamoRIO's private loader hiding target libraries from `/proc/<pid>/maps`.
+
+### DWARF5 name acceleration
+
+`NameAccelerator::build()` parses the `.debug_names` section (DWARF5) at
+`parse_elf` time. It builds a `HashMap<String, Vec<(cu_offset, die_offset)>>`
+for `DW_TAG_structure_type`, `DW_TAG_union_type`, and `DW_TAG_class_type`
+entries. `resolve_deep` uses this for O(1) name→DIE lookup instead of
+scanning all compilation units. Falls back to full CU scan for DWARF4
+binaries (no `.debug_names` section). `resolve_deep_at` jumps directly to
+a CU+DIE via `Dwarf::unit_header()`.
 
 ### CFI table
 
@@ -728,10 +760,27 @@ live engine and `memvis-diff`. Public API:
 | `ALLOC` (9) | `heap_allocs.on_alloc(ptr, size)`. Size read from `ev.size` (32-bit). |
 | `FREE` (10) | `heap_allocs.on_free(ptr)`. If matched: `stm.purge_range` + `heap_graph.on_free`. If orphan: count only, no purge. |
 | `RELOAD` (12) | `shadow_regs.on_reload(reg, value, src_addr, size, seq, rip)`. |
+| `PROCESS_FORK` (13) | Log child/parent PID. `ChildProcessTracker::register_fork(child_pid)`. |
 
 Returns `true` if the event was "interesting" (tracked write or control
 event). Untracked writes return `false` and are not journaled (~90% of
 writes in typical workloads).
+
+### Dual-domain sequence tracking
+
+The tracer uses two independent per-thread sequence counters:
+
+| Domain | Counter | Events |
+|---|---|---|
+| JIT (0) | raw TLS `MEMVIS_RAW_SLOT_SEQ` | WRITE, BB_ENTRY |
+| Clean-call (1) | drmgr TLS `TLS_SLOT_SEQ` | READ, CALL, RETURN, TAIL_CALL, ALLOC, FREE, REG_SNAPSHOT, RELOAD |
+
+The engine classifies events via `seq_domain(ev_kind)` and tracks
+`expected_seq` as a `HashMap<(thread_id, domain), u32>`. This eliminates
+false-positive gap reports that occurred when both domains' counters were
+conflated into a single per-thread tracker. Compound events (REG_SNAPSHOT,
+compound wide writes) consume multiple ring slots but increment the
+sequence counter only once.
 
 ### Warm-scan
 
