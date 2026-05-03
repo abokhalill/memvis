@@ -920,7 +920,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
 
     let name_accel = NameAccelerator::build(&file_data);
 
-    Ok(DwarfInfo {
+    let mut info = DwarfInfo {
         globals,
         functions,
         elf_base_vaddr,
@@ -929,7 +929,226 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         elf_path: path.to_string(),
         container_of_map,
         name_accel,
-    })
+    };
+
+    // merge types from DT_NEEDED shared libraries (works from disk, no live process)
+    merge_needed_libs(&mut info);
+
+    Ok(info)
+}
+
+/// Resolve DT_NEEDED sonames from the target ELF and merge DWARF type info
+/// from any that contain .debug_info. Works entirely from on-disk ELF files —
+/// no live process required, immune to DynamoRIO's private loader hiding
+/// libraries from /proc/<pid>/maps.
+pub fn merge_needed_libs(info: &mut DwarfInfo) -> usize {
+    use std::path::Path;
+
+    let file_data = match fs::read(&info.elf_path) {
+        Ok(d) => d,
+        Err(_) => return 0,
+    };
+    let obj = match object::File::parse(&*file_data) {
+        Ok(o) => o,
+        Err(_) => return 0,
+    };
+
+    // extract DT_NEEDED sonames by parsing .dynamic + .dynstr directly
+    let mut needed: Vec<String> = Vec::new();
+    if let (Some(dyn_sec), Some(dynstr_sec)) = (
+        obj.section_by_name(".dynamic"),
+        obj.section_by_name(".dynstr"),
+    ) {
+        if let (Ok(dyn_data), Ok(str_data)) = (dyn_sec.data(), dynstr_sec.data()) {
+            // each Elf64_Dyn is 16 bytes: d_tag(i64) + d_val(u64)
+            let entry_size = 16usize;
+            let mut off = 0;
+            while off + entry_size <= dyn_data.len() {
+                let tag = i64::from_le_bytes(
+                    dyn_data[off..off + 8].try_into().unwrap_or([0; 8]),
+                );
+                let val = u64::from_le_bytes(
+                    dyn_data[off + 8..off + 16].try_into().unwrap_or([0; 8]),
+                );
+                if tag == 0 { break; }
+                if tag == 1 { // DT_NEEDED
+                    let str_off = val as usize;
+                    if str_off < str_data.len() {
+                        let end = str_data[str_off..]
+                            .iter()
+                            .position(|&b| b == 0)
+                            .map(|p| str_off + p)
+                            .unwrap_or(str_data.len());
+                        if let Ok(name) = std::str::from_utf8(&str_data[str_off..end]) {
+                            if !name.is_empty() && !needed.iter().any(|n| n == name) {
+                                needed.push(name.to_string());
+                            }
+                        }
+                    }
+                }
+                off += entry_size;
+            }
+        }
+    }
+
+    if needed.is_empty() {
+        return 0;
+    }
+
+    // standard search paths: LD_LIBRARY_PATH, binary dir, system defaults
+    let mut search_paths: Vec<String> = Vec::new();
+    if let Ok(ldp) = std::env::var("LD_LIBRARY_PATH") {
+        for p in ldp.split(':') {
+            if !p.is_empty() {
+                search_paths.push(p.to_string());
+            }
+        }
+    }
+    // binary's own directory (libtool .libs/ pattern)
+    if let Some(parent) = Path::new(&info.elf_path).parent() {
+        search_paths.push(parent.to_string_lossy().to_string());
+    }
+    search_paths.extend([
+        "/usr/local/lib".to_string(),
+        "/usr/local/lib/x86_64-linux-gnu".to_string(),
+        "/usr/lib/x86_64-linux-gnu".to_string(),
+        "/usr/lib".to_string(),
+        "/lib/x86_64-linux-gnu".to_string(),
+        "/lib".to_string(),
+    ]);
+
+    // resolve sonames to absolute paths; prefer libs with debug info
+    let mut resolved: Vec<String> = Vec::new();
+    for soname in &needed {
+        let mut best: Option<String> = None;
+        let mut best_has_debug = false;
+        for dir in &search_paths {
+            let candidate = format!("{}/{}", dir, soname);
+            let path = Path::new(&candidate);
+            if !path.exists() {
+                continue;
+            }
+            // resolve symlinks to actual file
+            let real = match path.canonicalize() {
+                Ok(r) => r.to_string_lossy().to_string(),
+                Err(_) => candidate.clone(),
+            };
+            // check for debug info
+            let has_debug = fs::read(&real).ok().and_then(|data| {
+                let o = object::File::parse(&*data).ok()?;
+                Some(o.section_by_name(".debug_info").is_some())
+            }).unwrap_or(false);
+
+            if has_debug && !best_has_debug {
+                best = Some(real);
+                best_has_debug = true;
+            } else if best.is_none() {
+                best = Some(real);
+            }
+            if best_has_debug {
+                break; // prefer first debug-info match
+            }
+        }
+        if let Some(path) = best {
+            resolved.push(path);
+        }
+    }
+
+    let mut merged = 0usize;
+    for lib_path in &resolved {
+        let lib_data = match fs::read(lib_path) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+        let obj = match object::File::parse(&*lib_data) {
+            Ok(o) => o,
+            Err(_) => continue,
+        };
+        if obj.section_by_name(".debug_info").is_none() {
+            continue;
+        }
+
+        let load_section = |id: gimli::SectionId| -> Result<R<'_>, gimli::Error> {
+            let data = obj
+                .section_by_name(id.name())
+                .and_then(|s| s.data().ok())
+                .unwrap_or(&[]);
+            Ok(EndianSlice::new(data, LittleEndian))
+        };
+        let dw = match Dwarf::load(&load_section) {
+            Ok(d) => d,
+            Err(_) => continue,
+        };
+
+        // types only — no address relocation (we don't know runtime base yet;
+        // functions/globals will get wrong addresses). type stamps don't need
+        // absolute addresses, just structural layout.
+        let mut lib_types: HashMap<String, TypeInfo> = HashMap::new();
+
+        let mut iter = dw.units();
+        while let Ok(Some(header)) = iter.next() {
+            let unit = match dw.unit(header) {
+                Ok(u) => u,
+                Err(_) => continue,
+            };
+            let mut entries = unit.entries();
+            while let Ok(Some(entry)) = entries.next_dfs() {
+                let tag = entry.tag();
+                if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
+                    if let Some(ti) =
+                        resolve_type_at(&dw, &unit, entry.offset(), 0, &mut HashSet::new())
+                    {
+                        if !ti.name.is_empty()
+                            && ti.name != "<anon>"
+                            && !ti.is_pointer
+                            && ti.byte_size > 0
+                            && !ti.fields.is_empty()
+                        {
+                            let n = ti.fields.len();
+                            lib_types
+                                .entry(ti.name.clone())
+                                .and_modify(|existing| {
+                                    if n > existing.fields.len() {
+                                        *existing = ti.clone();
+                                    }
+                                })
+                                .or_insert(ti);
+                        }
+                    }
+                }
+            }
+        }
+
+        let t_count = lib_types.len();
+        if t_count == 0 {
+            continue;
+        }
+
+        for (name, ti) in lib_types {
+            let n = ti.fields.len();
+            info.type_registry
+                .entry(name)
+                .and_modify(|existing| {
+                    if n > existing.fields.len() {
+                        *existing = ti.clone();
+                    }
+                })
+                .or_insert(ti);
+        }
+
+        let lib_name = lib_path.rsplit('/').next().unwrap_or(lib_path);
+        eprintln!("dwarf: merged {} — {} types", lib_name, t_count);
+        merged += 1;
+    }
+
+    if merged > 0 {
+        info.container_of_map = build_container_of_map(&info.type_registry);
+        eprintln!(
+            "dwarf: after lib merge — {} types total",
+            info.type_registry.len()
+        );
+    }
+    merged
 }
 
 // scan type_registry for structs that embed other named structs at non-zero

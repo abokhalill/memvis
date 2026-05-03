@@ -27,6 +27,16 @@ struct RunConfig {
     no_bb: bool,
 }
 
+/// seq domain: JIT-inlined events (WRITE/BB_ENTRY) use raw TLS seq counter,
+/// clean-call events (CALL/RET/ALLOC/FREE/REG_SNAPSHOT/etc.) use drmgr TLS seq.
+#[inline(always)]
+fn seq_domain(ev_kind: u8) -> u8 {
+    match ev_kind {
+        0 | 11 => 0, // WRITE, BB_ENTRY -> JIT raw-TLS seq domain
+        _ => 1,       // READ, CALL, RET, ALLOC, FREE, REG_SNAPSHOT, etc. -> clean-call drmgr seq domain
+    }
+}
+
 /// sorted (start, end, region_index) intervals for O(log N) shared-addr lookup
 struct SharedIntervalMap {
     /// sorted by start address; non-overlapping after merge
@@ -266,7 +276,10 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     let mut journal: VecDeque<JournalEntry> = VecDeque::with_capacity(1024);
     let mut relocation_delta: Option<u64> = None;
     let mut returned_frames: VecDeque<FrameId> = VecDeque::with_capacity(64);
-    let mut expected_seq: HashMap<u16, u32> = HashMap::new();
+    // seq gap tracking: two domains per thread; JIT (WRITE/READ/BB_ENTRY)
+    // and clean-call (CALL/RET/ALLOC/FREE/REG_SNAPSHOT/etc.) use separate
+    // monotonic seq counters in the tracer (raw TLS vs drmgr TLS).
+    let mut expected_seq: HashMap<(u16, u8), u32> = HashMap::new();
     let mut seq_gaps: u64 = 0;
     let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
     let mut heap_graph = HeapGraph::new();
@@ -434,11 +447,28 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                         if let Some(ref mut rec) = recorder {
                             let _ = rec.record_reg_snapshot(&ev, &world.regs());
                         }
+                        // tracer assigns 1 seq per REG_SNAPSHOT compound, not per slot
+                        if !ev.is_continuation() {
+                            let dom = seq_domain(ev_kind);
+                            let s32 = ev.seq32();
+                            let exp = expected_seq.entry((ev.thread_id, dom)).or_insert(s32);
+                            if s32 != *exp {
+                                let gap_size = s32.wrapping_sub(*exp);
+                                seq_gaps += 1;
+                                if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
+                                    eprintln!(
+                                        "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                        seq_gaps, ev.thread_id, *exp, s32, gap_size
+                                    );
+                                }
+                                if let Some(ref mut ts) = topo {
+                                    ts.emit_seq_gap(total, ev.thread_id, *exp, s32);
+                                }
+                            }
+                            *exp = s32.wrapping_add(1);
+                        }
                         total += consumed as u64;
                         world.inc_insn_counter();
-                        let s32 = ev.seq32();
-                        let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
-                        *exp = s32.wrapping_add(1);
                         i += consumed;
                         continue;
                     }
@@ -448,8 +478,9 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
 
                     // continuation events have no meaningful seq; skip tracking
                     if !ev.is_continuation() {
+                        let dom = seq_domain(ev_kind);
                         let s32 = ev.seq32();
-                        let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
+                        let exp = expected_seq.entry((ev.thread_id, dom)).or_insert(s32);
                         if s32 != *exp {
                             let gap_size = s32.wrapping_sub(*exp);
                             seq_gaps += 1;
@@ -750,7 +781,8 @@ fn run_headless(
     let mut idle_rounds: u32 = 0;
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
     let mut child_tracker = ChildProcessTracker::new();
-    let mut expected_seq: HashMap<u16, u32> = HashMap::new();
+    // two seq domains per thread (see seq_domain())
+    let mut expected_seq: HashMap<(u16, u8), u32> = HashMap::new();
     let mut seq_gaps: u64 = 0;
 
     loop {
@@ -801,6 +833,26 @@ fn run_headless(
                     if let Some(ref mut rec) = recorder {
                         let _ = rec.record_reg_snapshot(&ev, &world.regs());
                     }
+                    // tracer assigns 1 seq per REG_SNAPSHOT compound, not per slot
+                    if !ev.is_continuation() {
+                        let dom = seq_domain(ev_kind);
+                        let s32 = ev.seq32();
+                        let exp = expected_seq.entry((ev.thread_id, dom)).or_insert(s32);
+                        if s32 != *exp {
+                            let gap_size = s32.wrapping_sub(*exp);
+                            seq_gaps += 1;
+                            if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
+                                eprintln!(
+                                    "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                    seq_gaps, ev.thread_id, *exp, s32, gap_size
+                                );
+                            }
+                            if let Some(ref mut ts) = recorder_topo {
+                                ts.emit_seq_gap(*total, ev.thread_id, *exp, s32);
+                            }
+                        }
+                        *exp = s32.wrapping_add(1);
+                    }
                     *total += consumed as u64;
                     world.inc_insn_counter();
                     i += consumed;
@@ -811,8 +863,9 @@ fn run_headless(
                 world.inc_insn_counter();
 
                 if !ev.is_continuation() {
+                    let dom = seq_domain(ev_kind);
                     let s32 = ev.seq32();
-                    let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
+                    let exp = expected_seq.entry((ev.thread_id, dom)).or_insert(s32);
                     if s32 != *exp {
                         let gap_size = s32.wrapping_sub(*exp);
                         seq_gaps += 1;
@@ -1993,6 +2046,7 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig) {
     let child_pid = child.id() as i32;
     TRACER_PID.store(child_pid, AtomicOrdering::SeqCst);
     eprintln!("memvis: tracer pid={}", child_pid);
+
 
     let _reaper = thread::Builder::new()
         .name("tracer-reaper".into())
