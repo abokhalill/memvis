@@ -2,7 +2,7 @@
 // world state: variables, pointer edges, register file, cache miss tracking.
 // arc-wrapped inner for cow snapshotting - mutation clones only when shared.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 
 /// Key for per-thread, per-field write heatmap.
@@ -416,14 +416,31 @@ pub struct TypeProjection {
     pub stamp_seq: u64,
 }
 
+/// Result of a stamp_type call. Carries schism info for the caller to act on
+pub enum StampResult {
+    /// new stamp applied, no prior projection
+    Stamped,
+    /// stamp applied, prior projection had the same type (re-stamp, not a schism)
+    Restamped,
+    /// stamp applied, prior projection had a DIFFERENT type; type schism
+    Schism {
+        old_type: String,
+        old_source: String,
+    },
+    /// stamp rejected (null addr or zero-size type)
+    Rejected,
+}
+
 pub struct ShadowTypeMap {
     map: HashMap<u64, TypeProjection>,
+    pub schism_count: u64,
 }
 
 impl Default for ShadowTypeMap {
     fn default() -> Self {
         Self {
             map: HashMap::with_capacity(256),
+            schism_count: 0,
         }
     }
 }
@@ -439,10 +456,23 @@ impl ShadowTypeMap {
         pointee_type: &TypeInfo,
         source_name: &str,
         seq: u64,
-    ) -> bool {
+    ) -> StampResult {
         if target_addr == 0 || pointee_type.byte_size == 0 {
-            return false;
+            return StampResult::Rejected;
         }
+        let result = if let Some(existing) = self.map.get(&target_addr) {
+            if existing.type_info.name != pointee_type.name {
+                self.schism_count += 1;
+                StampResult::Schism {
+                    old_type: existing.type_info.name.clone(),
+                    old_source: existing.source_name.clone(),
+                }
+            } else {
+                StampResult::Restamped
+            }
+        } else {
+            StampResult::Stamped
+        };
         let proj = TypeProjection {
             base_addr: target_addr,
             type_info: pointee_type.clone(),
@@ -450,10 +480,12 @@ impl ShadowTypeMap {
             stamp_seq: seq,
         };
         self.map.insert(target_addr, proj);
-        true
+        result
     }
 
-    /// resolve *T→T on pointer field writes within stamped regions
+    /// resolve *T->T on pointer field writes within stamped regions.
+    /// Freshness guard: skip propagation if the covering projection predates
+    /// the current allocation at write_value (stale stamp from freed+reused object).
     pub fn propagate_field_write(
         &mut self,
         write_addr: u64,
@@ -461,6 +493,7 @@ impl ShadowTypeMap {
         write_size: u32,
         seq: u64,
         type_registry: &HashMap<String, TypeInfo>,
+        alloc_tracker: &HeapAllocTracker,
     ) {
         if write_size != 8 || write_value == 0 {
             return;
@@ -471,12 +504,20 @@ impl ShadowTypeMap {
             .find(|(_, p)| {
                 write_addr >= p.base_addr && write_addr < p.base_addr + p.type_info.byte_size
             })
-            .map(|(_, p)| (p.base_addr, p.type_info.clone()));
+            .map(|(_, p)| (p.base_addr, p.stamp_seq, p.type_info.clone()));
 
-        let (base, ti) = match covering {
+        let (base, stamp_seq, ti) = match covering {
             Some(x) => x,
             None => return,
         };
+
+        // freshness guard: if the covering object's stamp predates the
+        // current allocation epoch at base, the projection is stale
+        if let Some(alloc_seq) = alloc_tracker.alloc_seq(base) {
+            if stamp_seq < alloc_seq {
+                return;
+            }
+        }
 
         let offset = write_addr - base;
         if let Some(field) = ti
@@ -535,7 +576,9 @@ impl ShadowTypeMap {
     ) -> usize {
         const FUEL: usize = 64;
         let mut queue: VecDeque<u64> = VecDeque::with_capacity(16);
+        let mut visited: HashSet<u64> = HashSet::with_capacity(FUEL);
         queue.push_back(seed_addr);
+        visited.insert(seed_addr);
         let mut stamped = 0usize;
 
         while let Some(base) = queue.pop_front() {
@@ -583,6 +626,9 @@ impl ShadowTypeMap {
             }
             candidates.sort_by_key(|(name, _, _)| *name);
             for (name, field_val, pointee_ti) in &candidates {
+                if !visited.insert(*field_val) {
+                    continue;
+                }
                 self.stamp_type(*field_val, pointee_ti, name, seq);
                 stamped += 1;
                 queue.push_back(*field_val);
@@ -614,7 +660,7 @@ pub struct HeapHazard {
 
 #[derive(Default)]
 pub struct HeapAllocTracker {
-    allocs: BTreeMap<u64, u64>,
+    allocs: BTreeMap<u64, (u64, u64)>, // addr -> (size, alloc_seq)
     pub total_allocs: u64,
     pub total_frees: u64,
     pub orphan_frees: u64,
@@ -636,9 +682,10 @@ impl HeapAllocTracker {
 
     /// returns Some(old_size) if the address was already tracked (allocator reuse)
     pub fn on_alloc(&mut self, addr: u64, size: u64) -> Option<u64> {
-        let old = self.allocs.insert(addr, size);
+        let seq = self.total_allocs;
+        let old = self.allocs.insert(addr, (size, seq));
         self.total_allocs += 1;
-        old
+        old.map(|(sz, _)| sz)
     }
 
     pub fn on_free(&mut self, addr: u64) -> Option<u64> {
@@ -647,15 +694,20 @@ impl HeapAllocTracker {
         if r.is_none() {
             self.orphan_frees += 1;
         }
-        r
+        r.map(|(sz, _)| sz)
     }
 
     pub fn alloc_size(&self, addr: u64) -> Option<u64> {
-        self.allocs.get(&addr).copied()
+        self.allocs.get(&addr).map(|&(sz, _)| sz)
     }
 
-    pub fn allocs_iter(&self) -> impl Iterator<Item = (&u64, &u64)> {
-        self.allocs.iter()
+    /// returns the alloc_seq for the allocation at addr, if tracked
+    pub fn alloc_seq(&self, addr: u64) -> Option<u64> {
+        self.allocs.get(&addr).map(|&(_, seq)| seq)
+    }
+
+    pub fn allocs_iter(&self) -> impl Iterator<Item = (&u64, &u64)> + '_ {
+        self.allocs.iter().map(|(k, (sz, _))| (k, sz))
     }
 
     pub fn live_count(&self) -> usize {
@@ -668,8 +720,8 @@ impl HeapAllocTracker {
         self.allocs
             .range((Bound::Unbounded, Bound::Included(&addr)))
             .next_back()
-            .filter(|(&base, &sz)| addr < base.saturating_add(sz))
-            .map(|(&base, &sz)| (base, sz))
+            .filter(|(&base, &(sz, _))| addr < base.saturating_add(sz))
+            .map(|(&base, &(sz, _))| (base, sz))
     }
 
     /// check if a write at [addr, addr+write_size) stays within a live allocation.
@@ -717,7 +769,7 @@ impl HeapAllocTracker {
             .allocs
             .iter()
             .next_back()
-            .map(|(&b, &s)| b + s)
+            .map(|(&b, &(s, _))| b + s)
             .unwrap_or(0);
         if addr >= lo && addr < hi {
             return Some(HeapHazard {
@@ -737,7 +789,7 @@ impl HeapAllocTracker {
     }
 
     pub fn check_size(&mut self, addr: u64, type_info: &TypeInfo) -> bool {
-        if let Some(&alloc_sz) = self.allocs.get(&addr) {
+        if let Some(&(alloc_sz, _)) = self.allocs.get(&addr) {
             if type_info.byte_size > alloc_sz {
                 self.size_mismatches.push(SizeMismatch {
                     addr,
