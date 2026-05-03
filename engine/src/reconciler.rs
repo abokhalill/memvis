@@ -26,6 +26,7 @@ pub const EVENT_ALLOC: u8 = 9;
 pub const EVENT_FREE: u8 = 10;
 pub const EVENT_BB_ENTRY: u8 = 11;
 pub const EVENT_RELOAD: u8 = 12;
+pub const EVENT_PROCESS_FORK: u8 = 13;
 
 /// REG_SNAPSHOT is 7 contiguous ring slots (header + 6 continuations carrying
 /// regs[0..18] packed 3/slot). returns slots consumed: 7 on success, 1 on
@@ -475,6 +476,15 @@ pub fn process_event(
                     populate_globals(info, delta, addr_index, world);
                 }
             }
+            true
+        }
+        EVENT_PROCESS_FORK => {
+            let child_pid = ev.addr as u32;
+            let parent_pid = ev.value as u32;
+            eprintln!(
+                "memvis: PROCESS_FORK child_pid={} parent_pid={}",
+                child_pid, parent_pid
+            );
             true
         }
         _ => false,
@@ -1095,6 +1105,10 @@ mod tests {
             "EVENT_BB_ENTRY != MEMVIS_EVENT_BB_ENTRY"
         );
         assert_eq!(EVENT_RELOAD, 12, "EVENT_RELOAD != MEMVIS_EVENT_RELOAD");
+        assert_eq!(
+            EVENT_PROCESS_FORK, 13,
+            "EVENT_PROCESS_FORK != MEMVIS_EVENT_PROCESS_FORK"
+        );
     }
 
     #[test]
