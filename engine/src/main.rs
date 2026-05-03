@@ -1046,8 +1046,37 @@ fn run_headless(
                 return;
             }
 
-            // zero events and tracer is already gone -> nothing will ever arrive
+            // zero events and tracer is already gone -> attempt one final sweep
             if *total == 0 && tracer_gone {
+                // the tracer may have produced events before exiting;
+                // attempt a final poll + drain before declaring failure
+                orch.poll_new_rings();
+                let mut rescue_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(4096);
+                loop {
+                    rescue_buf.clear();
+                    let got = orch.batch_drain(4096, &mut rescue_buf);
+                    if got == 0 { break; }
+                    for &(ri, ref ev) in &rescue_buf {
+                        let ev_kind = ev.kind();
+                        if no_bb && ev_kind == EVENT_BB_ENTRY { continue; }
+                        *total += 1;
+                        world.inc_insn_counter();
+                        reconciler::process_event(
+                            ev, ri, orch, world, addr_index,
+                            &mut *dwarf_info, stacks, next_frame_id,
+                            relocation_delta, returned_frames, shadow_regs,
+                            heap_graph, heap_oracle, recorder_topo,
+                        );
+                        if let Some(ref mut rec) = recorder {
+                            let _ = rec.record(ev);
+                        }
+                    }
+                }
+                if *total > 0 {
+                    // rescued events; fall through to the normal exit path
+                    idle_rounds = 50;
+                    continue;
+                }
                 let status = TRACER_EXIT_STATUS.load(AtomicOrdering::Relaxed);
                 eprintln!("memvis: error: tracer exited before any events were received.");
                 if libc::WIFEXITED(status) {
@@ -1858,9 +1887,11 @@ fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
             return;
         }
         if TRACER_EXITED.load(AtomicOrdering::Relaxed) {
-            // tracer died before we could attach — give it one last chance
-            // to have created the shm (race: tracer creates shm then exits)
-            if orch.try_attach_ctl() {
+            // tracer died before we could drain; retry a few times to
+            // let the SHM contents become visible (kernel page flush).
+            let tpid = TRACER_PID.load(AtomicOrdering::Relaxed) as u32;
+            for _retry in 0..5 {
+                if tpid > 0 { orch.try_attach_ctl_for_pid(tpid); } else { orch.try_attach_ctl(); }
                 orch.poll_new_rings();
                 if orch.ring_count() > 0 {
                     eprintln!(
@@ -1870,6 +1901,7 @@ fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
                     run(orch, dwarf_info, cfg);
                     return;
                 }
+                thread::sleep(time::Duration::from_millis(50));
             }
             let status = TRACER_EXIT_STATUS.load(AtomicOrdering::Relaxed);
             eprintln!("memvis: error: tracer process exited before shared memory was created.");
@@ -1895,7 +1927,13 @@ fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
             eprintln!("  - tracer initialization is blocked or hung");
             std::process::exit(1);
         }
-        if orch.try_attach_ctl() {
+        let tpid_normal = TRACER_PID.load(AtomicOrdering::Relaxed) as u32;
+        let attached = if tpid_normal > 0 {
+            orch.try_attach_ctl_for_pid(tpid_normal)
+        } else {
+            orch.try_attach_ctl()
+        };
+        if attached {
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
                 eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
