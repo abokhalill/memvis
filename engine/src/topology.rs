@@ -207,6 +207,38 @@ impl TopologyStream {
         self.lines += 1;
     }
 
+    pub fn emit_seq_gap(
+        &mut self,
+        seq: u64,
+        tid: u16,
+        expected: u32,
+        actual: u32,
+    ) {
+        let _ = writeln!(
+            self.w,
+            r#"{{"seq":{},"tid":{},"type":"SEQ_GAP","expected":{},"actual":{},"dropped":{}}}"#,
+            seq, tid, expected, actual, actual.wrapping_sub(expected)
+        );
+        self.lines += 1;
+    }
+
+    pub fn emit_type_schism(
+        &mut self,
+        seq: u64,
+        addr: u64,
+        old_type: &str,
+        new_type: &str,
+        old_source: &str,
+        new_source: &str,
+    ) {
+        let _ = writeln!(
+            self.w,
+            r#"{{"seq":{},"type":"TYPE_SCHISM","addr":"0x{:x}","old_type":"{}","new_type":"{}","old_source":"{}","new_source":"{}"}}"#,
+            seq, addr, esc(old_type), esc(new_type), esc(old_source), esc(new_source)
+        );
+        self.lines += 1;
+    }
+
     pub fn emit_summary(
         &mut self,
         total_events: u64,
