@@ -996,6 +996,10 @@ unmap_ctl_ring(void)
         close(g_ctl_fd);
         g_ctl_fd = -1;
     }
+    /* Unlink ctl names: the engine already has the ctl mapped by the time
+     * we exit. Ring names are NOT unlinked here; the engine needs them
+     * to discover and mmap thread rings (short-lived process race).
+     * The engine's cleanup_shm_for_pid() unlinks rings after draining. */
     if (g_ctl_shm_name[0])
         shm_unlink(g_ctl_shm_name);
     shm_unlink(MEMVIS_CTL_SHM_NAME);
@@ -1864,15 +1868,13 @@ event_thread_exit(void *drcontext)
     if (ctl_idx >= 0 && g_ctl)
         memvis_ctl_mark_dead(g_ctl, (uint32_t)ctl_idx);
 
-    uint16_t tid = tls_thread_id(drcontext);
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (ring) {
         size_t sz = memvis_shm_size(ring->capacity);
         munmap(ring, sz);
-        char name[MEMVIS_RING_NAME_LEN];
-        dr_snprintf(name, sizeof(name), MEMVIS_RING_SHM_FMT,
-                    (unsigned)g_process_pid, (unsigned)tid);
-        shm_unlink(name);
+        /* Do NOT shm_unlink here. The engine needs the name to discover
+         * and mmap the ring after the tracer exits. The engine's
+         * cleanup_shm_for_pid() will unlink after draining. */
     }
     drmgr_set_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING], NULL);
 
