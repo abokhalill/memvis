@@ -27,21 +27,67 @@ struct RunConfig {
     no_bb: bool,
 }
 
+/// sorted (start, end, region_index) intervals for O(log N) shared-addr lookup
+struct SharedIntervalMap {
+    /// sorted by start address; non-overlapping after merge
+    intervals: Vec<(u64, u64, usize)>,
+}
+
+impl SharedIntervalMap {
+    fn new() -> Self {
+        Self { intervals: Vec::new() }
+    }
+
+    fn rebuild(&mut self, regions: &[SharedRegion]) {
+        self.intervals.clear();
+        for (ri, r) in regions.iter().enumerate() {
+            for &(_pid, start, end) in &r.mappings {
+                self.intervals.push((start, end, ri));
+            }
+        }
+        self.intervals.sort_unstable_by_key(|&(s, _, _)| s);
+    }
+
+    /// O(log N) lookup: binary search for the interval containing addr
+    #[inline]
+    fn lookup(&self, addr: u64) -> Option<usize> {
+        let idx = self.intervals.partition_point(|&(s, _, _)| s <= addr);
+        if idx == 0 {
+            return None;
+        }
+        let (start, end, ri) = self.intervals[idx - 1];
+        if addr >= start && addr < end {
+            Some(ri)
+        } else {
+            None
+        }
+    }
+}
+
 /// tracks child processes discovered via PROCESS_FORK events
 struct ChildProcessTracker {
     pending_pids: Vec<u32>,
+    pending_since: Vec<std::time::Instant>,
     child_orchs: Vec<RingOrchestrator>,
+    child_empty_ticks: Vec<u32>,
     shared_regions: Vec<SharedRegion>,
+    shared_interval_map: SharedIntervalMap,
     shared_regions_stale: bool,
     root_pid: Option<u32>,
 }
+
+const PENDING_PID_TTL_SECS: u64 = 30;
+const CHILD_EMPTY_TICK_RETIRE: u32 = 150; // ~30s at 200ms ticks
 
 impl ChildProcessTracker {
     fn new() -> Self {
         Self {
             pending_pids: Vec::new(),
+            pending_since: Vec::new(),
             child_orchs: Vec::new(),
+            child_empty_ticks: Vec::new(),
             shared_regions: Vec::new(),
+            shared_interval_map: SharedIntervalMap::new(),
             shared_regions_stale: false,
             root_pid: None,
         }
@@ -54,27 +100,71 @@ impl ChildProcessTracker {
     fn register_fork(&mut self, child_pid: u32) {
         if !self.pending_pids.contains(&child_pid) {
             self.pending_pids.push(child_pid);
+            self.pending_since.push(std::time::Instant::now());
             self.shared_regions_stale = true;
         }
     }
 
     fn discover(&mut self) {
         let had_pending = !self.pending_pids.is_empty();
-        self.pending_pids.retain(|&pid| {
+        let now = std::time::Instant::now();
+        let ttl = std::time::Duration::from_secs(PENDING_PID_TTL_SECS);
+        // expire stale pending PIDs (TIER 3.1)
+        let mut i = 0;
+        while i < self.pending_pids.len() {
+            if now.duration_since(self.pending_since[i]) > ttl {
+                eprintln!(
+                    "memvis: pending child pid {} expired after {}s (ctl never appeared)",
+                    self.pending_pids[i], PENDING_PID_TTL_SECS
+                );
+                self.pending_pids.swap_remove(i);
+                self.pending_since.swap_remove(i);
+            } else {
+                i += 1;
+            }
+        }
+        // try to attach remaining pending PIDs
+        let mut attached_new = false;
+        let mut j = 0;
+        while j < self.pending_pids.len() {
+            let pid = self.pending_pids[j];
             let mut orch = RingOrchestrator::new();
             if orch.try_attach_ctl_pid(pid) {
                 eprintln!("memvis: child process {} ctl attached", pid);
                 self.child_orchs.push(orch);
-                false
+                self.child_empty_ticks.push(0);
+                self.pending_pids.swap_remove(j);
+                self.pending_since.swap_remove(j);
+                attached_new = true;
             } else {
-                true
+                j += 1;
             }
-        });
+        }
+        // retire dead child orchestrators (TIER 3.2)
+        let mut k = 0;
+        while k < self.child_orchs.len() {
+            let pid_gone = self.child_orchs[k]
+                .target_pid()
+                .map(|p| !std::path::Path::new(&format!("/proc/{}", p)).exists())
+                .unwrap_or(false);
+            if pid_gone && self.child_empty_ticks[k] >= CHILD_EMPTY_TICK_RETIRE {
+                let pid = self.child_orchs[k].target_pid().unwrap_or(0);
+                eprintln!(
+                    "memvis: retiring dead child orchestrator pid={} after {} empty ticks",
+                    pid, self.child_empty_ticks[k]
+                );
+                self.child_orchs.swap_remove(k);
+                self.child_empty_ticks.swap_remove(k);
+                self.shared_regions_stale = true;
+            } else {
+                k += 1;
+            }
+        }
         for co in &mut self.child_orchs {
             co.poll_new_rings();
         }
-        // refresh shared regions after new child attached
-        if had_pending && self.shared_regions_stale {
+        // refresh shared regions after new child attached or child retired
+        if (had_pending || attached_new) && self.shared_regions_stale {
             self.refresh_shared_regions();
         }
     }
@@ -90,6 +180,9 @@ impl ChildProcessTracker {
             }
         }
         if all_pids.len() < 2 {
+            self.shared_regions.clear();
+            self.shared_interval_map.rebuild(&[]);
+            self.shared_regions_stale = false;
             return;
         }
         match proc_maps::detect_shared_regions(&all_pids) {
@@ -109,6 +202,7 @@ impl ChildProcessTracker {
                         );
                     }
                 }
+                self.shared_interval_map.rebuild(&regions);
                 self.shared_regions = regions;
             }
             Err(e) => {
@@ -118,25 +212,29 @@ impl ChildProcessTracker {
         self.shared_regions_stale = false;
     }
 
-    /// check if addr falls in a shared region; returns the region path if so
+    /// O(log N) check if addr falls in a shared region; returns the region path if so
+    #[inline]
     fn is_shared_addr(&self, addr: u64) -> Option<&str> {
-        for r in &self.shared_regions {
-            for &(_pid, start, end) in &r.mappings {
-                if addr >= start && addr < end {
-                    return Some(&r.path);
-                }
-            }
-        }
-        None
+        self.shared_interval_map
+            .lookup(addr)
+            .map(|ri| self.shared_regions[ri].path.as_str())
     }
 
     fn batch_drain(&mut self, limit: usize, buf: &mut Vec<(usize, Event)>) -> usize {
         let mut total = 0;
-        for co in &mut self.child_orchs {
+        for (ci, co) in self.child_orchs.iter_mut().enumerate() {
             if total >= limit {
                 break;
             }
-            total += co.batch_drain(limit - total, buf);
+            let got = co.batch_drain(limit - total, buf);
+            if got == 0 {
+                if ci < self.child_empty_ticks.len() {
+                    self.child_empty_ticks[ci] = self.child_empty_ticks[ci].saturating_add(1);
+                }
+            } else if ci < self.child_empty_ticks.len() {
+                self.child_empty_ticks[ci] = 0;
+            }
+            total += got;
         }
         total
     }
@@ -353,7 +451,17 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                         let s32 = ev.seq32();
                         let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
                         if s32 != *exp {
+                            let gap_size = s32.wrapping_sub(*exp);
                             seq_gaps += 1;
+                            if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
+                                eprintln!(
+                                    "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                    seq_gaps, ev.thread_id, *exp, s32, gap_size
+                                );
+                            }
+                            if let Some(ref mut ts) = topo {
+                                ts.emit_seq_gap(total, ev.thread_id, *exp, s32);
+                            }
                         }
                         *exp = s32.wrapping_add(1);
                     }
@@ -409,20 +517,91 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     i += 1;
                 }
 
-                // drain child process events into same batch
+                // drain child process events; full reconciler dispatch
                 batch_buf.clear();
                 let child_got = child_tracker.batch_drain(4096, &mut batch_buf);
                 if child_got > 0 {
                     tick_events += child_got;
-                    for j in 0..batch_buf.len() {
-                        let (_ri, ev) = batch_buf[j];
-                        let ek = ev.kind();
-                        if no_bb && ek == EVENT_BB_ENTRY { continue; }
+                    let mut j = 0;
+                    while j < batch_buf.len() {
+                        let (cri, cev) = batch_buf[j];
+                        let ck = cev.kind();
+                        if no_bb && ck == EVENT_BB_ENTRY { j += 1; continue; }
+
+                        if ck == EVENT_REG_SNAPSHOT {
+                            let cslice_end = (j + 7).min(batch_buf.len());
+                            let mut cev7: [memvis::ring::Event; 7] =
+                                [memvis::ring::Event::zero(); 7];
+                            let ctake = cslice_end - j;
+                            for s in 0..ctake {
+                                cev7[s] = batch_buf[j + s].1;
+                            }
+                            let cconsumed = reconciler::apply_reg_snapshot(
+                                &cev7[..ctake],
+                                &mut world,
+                                &mut shadow_regs,
+                            ).max(1);
+                            if let Some(ref mut rec) = recorder {
+                                let _ = rec.record_reg_snapshot(&cev, &world.regs());
+                            }
+                            total += cconsumed as u64;
+                            world.inc_insn_counter();
+                            j += cconsumed;
+                            continue;
+                        }
+
                         total += 1;
                         world.inc_insn_counter();
-                        if ek == EVENT_PROCESS_FORK {
-                            child_tracker.register_fork(ev.addr as u32);
+
+                        let cinteresting = reconciler::process_event(
+                            &cev,
+                            cri,
+                            &orch,
+                            &mut world,
+                            &mut addr_index,
+                            &mut dwarf_info,
+                            &mut stacks,
+                            &mut next_frame_id,
+                            &mut relocation_delta,
+                            &mut returned_frames,
+                            &mut shadow_regs,
+                            &mut heap_graph,
+                            &mut heap_oracle,
+                            &mut topo,
+                        );
+                        if ck == EVENT_PROCESS_FORK {
+                            child_tracker.register_fork(cev.addr as u32);
+                            if let Some(ref mut ts) = topo {
+                                ts.emit_process_fork(total, cev.addr as u32, cev.value as u32);
+                            }
                         }
+                        if ck == reconciler::EVENT_WRITE && child_tracker.child_count() > 0 {
+                            if let Some(region) = child_tracker.is_shared_addr(cev.addr) {
+                                if let Some(ref mut ts) = topo {
+                                    ts.emit_cross_process_write(total, cev.thread_id, cev.addr, cev.size, region);
+                                }
+                            }
+                        }
+                        if let Some(ref mut rec) = recorder {
+                            let _ = rec.record(&cev);
+                        }
+                        if cinteresting && !cev.is_continuation() {
+                            journal.push_back(JournalEntry {
+                                seq: total,
+                                kind: ck,
+                                thread_id: cev.thread_id,
+                                addr: cev.addr,
+                                size: cev.size,
+                                value: cev.value,
+                            });
+                            if journal.len() > 1000 {
+                                journal.pop_front();
+                            }
+                        }
+                        if ck == EVENT_CALL {
+                            need_finalize = true;
+                        }
+                        j += 1;
                     }
                 }
             } // while tick_events < TICK_BUDGET
@@ -571,6 +750,8 @@ fn run_headless(
     let mut idle_rounds: u32 = 0;
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
     let mut child_tracker = ChildProcessTracker::new();
+    let mut expected_seq: HashMap<u16, u32> = HashMap::new();
+    let mut seq_gaps: u64 = 0;
 
     loop {
         let now_disc = time::Instant::now();
@@ -629,6 +810,25 @@ fn run_headless(
                 *total += 1;
                 world.inc_insn_counter();
 
+                if !ev.is_continuation() {
+                    let s32 = ev.seq32();
+                    let exp = expected_seq.entry(ev.thread_id).or_insert(s32);
+                    if s32 != *exp {
+                        let gap_size = s32.wrapping_sub(*exp);
+                        seq_gaps += 1;
+                        if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
+                            eprintln!(
+                                "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                seq_gaps, ev.thread_id, *exp, s32, gap_size
+                            );
+                        }
+                        if let Some(ref mut ts) = recorder_topo {
+                            ts.emit_seq_gap(*total, ev.thread_id, *exp, s32);
+                        }
+                    }
+                    *exp = s32.wrapping_add(1);
+                }
+
                 let interesting = reconciler::process_event(
                     &ev,
                     ri,
@@ -680,24 +880,92 @@ fn run_headless(
                 i += 1;
             }
 
-            // drain child process events
+            // drain child process events; full reconciler dispatch
             batch_buf.clear();
             let child_got = child_tracker.batch_drain(4096, &mut batch_buf);
             if child_got > 0 {
                 tick_events += child_got;
                 drained += child_got;
-                for j in 0..batch_buf.len() {
-                    let (_ri, ev) = batch_buf[j];
-                    let ek = ev.kind();
-                    if no_bb && ek == EVENT_BB_ENTRY { continue; }
+                let mut j = 0;
+                while j < batch_buf.len() {
+                    let (cri, cev) = batch_buf[j];
+                    let ck = cev.kind();
+                    if no_bb && ck == EVENT_BB_ENTRY { j += 1; continue; }
+
+                    if ck == EVENT_REG_SNAPSHOT {
+                        let cslice_end = (j + 7).min(batch_buf.len());
+                        let mut cev7: [memvis::ring::Event; 7] =
+                            [memvis::ring::Event::zero(); 7];
+                        let ctake = cslice_end - j;
+                        for s in 0..ctake {
+                            cev7[s] = batch_buf[j + s].1;
+                        }
+                        let cconsumed = reconciler::apply_reg_snapshot(
+                            &cev7[..ctake],
+                            world,
+                            shadow_regs,
+                        ).max(1);
+                        if let Some(ref mut rec) = recorder {
+                            let _ = rec.record_reg_snapshot(&cev, &world.regs());
+                        }
+                        *total += cconsumed as u64;
+                        world.inc_insn_counter();
+                        j += cconsumed;
+                        continue;
+                    }
+
                     *total += 1;
                     world.inc_insn_counter();
-                    if ek == EVENT_PROCESS_FORK {
-                        child_tracker.register_fork(ev.addr as u32);
+
+                    let cinteresting = reconciler::process_event(
+                        &cev,
+                        cri,
+                        orch,
+                        world,
+                        addr_index,
+                        &mut *dwarf_info,
+                        stacks,
+                        next_frame_id,
+                        relocation_delta,
+                        returned_frames,
+                        shadow_regs,
+                        heap_graph,
+                        heap_oracle,
+                        recorder_topo,
+                    );
+                    if ck == EVENT_PROCESS_FORK {
+                        child_tracker.register_fork(cev.addr as u32);
                         if let Some(ref mut ts) = recorder_topo {
-                            ts.emit_process_fork(*total, ev.addr as u32, ev.value as u32);
+                            ts.emit_process_fork(*total, cev.addr as u32, cev.value as u32);
                         }
                     }
+                    if ck == reconciler::EVENT_WRITE && child_tracker.child_count() > 0 {
+                        if let Some(region) = child_tracker.is_shared_addr(cev.addr) {
+                            if let Some(ref mut ts) = recorder_topo {
+                                ts.emit_cross_process_write(*total, cev.thread_id, cev.addr, cev.size, region);
+                            }
+                        }
+                    }
+                    if let Some(ref mut rec) = recorder {
+                        let _ = rec.record(&cev);
+                    }
+                    if cinteresting && !cev.is_continuation() {
+                        journal.push_back(JournalEntry {
+                            seq: *total,
+                            kind: ck,
+                            thread_id: cev.thread_id,
+                            addr: cev.addr,
+                            size: cev.size,
+                            value: cev.value,
+                        });
+                        if journal.len() > 1000 {
+                            journal.pop_front();
+                        }
+                    }
+                    if ck == EVENT_CALL {
+                        need_finalize = true;
+                    }
+                    j += 1;
                 }
             }
         }
@@ -751,6 +1019,12 @@ fn run_headless(
                             let _ = rec.record(ev);
                         }
                     }
+                }
+                if seq_gaps > 0 {
+                    eprintln!(
+                        "memvis: WARNING: {} sequence gaps detected — ring overflow or event loss occurred",
+                        seq_gaps
+                    );
                 }
                 eprintln!("memvis: {} events processed, rendering snapshot", total);
                 let snap = world.snapshot();
