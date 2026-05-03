@@ -121,6 +121,12 @@ docker run --rm \
 - **Post-exit ring sweep.** On tracer exit or idle timeout, a final
   `poll_new_rings()` + drain captures events from short-lived pthreads that
   spawned and died between normal poll intervals.
+- **Cross-process topology.** Transparent fork tracking via `PROCESS_FORK`
+  events. Child processes get PID-scoped SHM rings (`/memvis_ctl_<pid>`,
+  `/memvis_ring_<pid>_<tid>`). The engine's `ChildProcessTracker` discovers
+  child ctl rings, drains their events, and detects shared memory regions
+  via `/proc/<pid>/maps` inode matching. Writes to shared regions emit
+  `CROSS_PROCESS_WRITE` topology events. No target source changes required.
 
 See [docs/engine.md](docs/engine.md) for implementation details.
 
@@ -155,14 +161,15 @@ See [USAGE.md](docs/USAGE.md) for the full flag reference and TUI keybindings.
  ┌───────────────────────────┐  /dev/shm/     ┌───────────────────────────┐
  │         TRACER            │ =============> │         ENGINE            │
  │  (DynamoRIO client, C)    │  SPSC rings    │  (Rust, 4 binaries)       │
- │                           │  control ring  │                           │
+ │                           │  ctl per PID   │                           │
  │  tracer.c                 │                │  memvis      (headless)   │
  │  memvis_bridge.h          │                │  memvis-lint (static)     │
  │                           │                │  memvis-diff (offline)    │
- │                           │                │  memvis-check (CI/CD)     │
+ │  fork → child gets own    │                │  memvis-check (CI/CD)     │
+ │  PID-scoped ctl + rings   │                │  ChildProcessTracker      │
  └───────────────────────────┘                └───────────────────────────┘
-      runs inside                                  separate process
-   target's address space
+      runs inside target's                         separate process
+      address space (+ forks)
 ```
 
 - [**Architecture**](docs/architecture.md) — system overview, data flow,

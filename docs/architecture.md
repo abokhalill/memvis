@@ -58,9 +58,12 @@ Summary of instrumented event types:
 | Tail calls | Heuristic (JMP >4KB) | TAIL_CALL event |
 | Reloads | Selective (callee-saved) | RELOAD event |
 | Allocations | `drwrap` hooks | ALLOC/FREE events for malloc/free/realloc/calloc |
+| Fork | `dr_register_fork_init_event` | PROCESS_FORK event (kind 13) |
 
 Each thread gets its own SPSC ring buffer via `shm_open(3)`. Thread metadata
-is published to a control ring (`/memvis_ctl`). See [Ring Protocol](ring-protocol.md).
+is published to a PID-scoped control ring (`/memvis_ctl_<pid>`). The root
+process also creates a legacy `/memvis_ctl` for backward compatibility.
+See [Ring Protocol](ring-protocol.md).
 
 ### Engine (`engine/`)
 
@@ -79,7 +82,8 @@ modules re-exported from `lib.rs`, with four binary entry points.
 | `shadow_regs.rs` | `shadow_regs` | Shadow Register File, 7 confidence tiers (incl. `CfiVerified`), piece assembler |
 | `heap_graph.rs` | `heap_graph` | Heap object discovery, field value storage, pointer edges, type inference |
 | `record.rs` | `record` | EventRecorder (write), EventPlayer (read), compound REG_SNAPSHOT I/O |
-| `topology.rs` | `topology` | JSONL topology streamer: STAMP, LINK, HAZARD, COLD_*, SUMMARY |
+| `topology.rs` | `topology` | JSONL topology streamer: STAMP, LINK, HAZARD, COLD_*, PROCESS_FORK, CROSS_PROCESS_WRITE, SUMMARY |
+| `proc_maps.rs` | `proc_maps` | `/proc/<pid>/maps` parser, shared region detection via `(dev, inode)` matching |
 | `tui.rs` | `tui` | ratatui TUI: 6 panels, keybindings, event filters, time-travel |
 | `lib.rs` | — | Crate root. Re-exports all modules |
 
@@ -129,7 +133,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 4. **Event reconciler** (`reconciler.rs`). Extracted from `main.rs` for
    library consumption by `memvis-diff`. Contains `process_event` (central
-   dispatch for all 12 event types), `populate_globals`, and `warm_scan`.
+   dispatch for all 13 event types), `populate_globals`, and `warm_scan`.
    `process_event` takes `dwarf_info: &mut Option<DwarfInfo>` to allow
    mutable access for `resolve_deep` and `patch_shallow_fields`.
 
@@ -188,7 +192,24 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 12. **Topology streaming** (`topology.rs`). JSONL emitter for structural graph
     deltas: ALLOC, FREE, STAMP, LINK, COLD_STAMP, COLD_LINK, HAZARD,
-    FALSE_SHARE, SUMMARY. Consumed by `memvis-check`.
+    FALSE_SHARE, PROCESS_FORK, CROSS_PROCESS_WRITE, SUMMARY. Consumed by
+    `memvis-check`.
+
+16. **Cross-process topology** (`main.rs`, `proc_maps.rs`).
+    `ChildProcessTracker` manages fork-discovered child processes:
+    - `register_fork(pid)`: queues child PID from PROCESS_FORK event.
+    - `discover()`: attempts `try_attach_ctl_pid` for pending PIDs,
+      creates child `RingOrchestrator`s, refreshes shared region map.
+    - `refresh_shared_regions()`: calls `proc_maps::detect_shared_regions`
+      across all PIDs to find file-backed mappings sharing `(dev, inode)`.
+    - `is_shared_addr(addr)`: O(regions × mappings) lookup for cross-process
+      write detection; returns region path on hit.
+    - `batch_drain()`: drains child orchestrators into the parent's event
+      buffer for unified processing.
+
+    `proc_maps` module parses `/proc/<pid>/maps` lines into `MapEntry`
+    structs with `DevInode` keys. `detect_shared_regions` returns regions
+    mapped by 2+ distinct PIDs (anonymous mappings filtered by inode == 0).
 
 13. **Differential topology** (`diff.rs`). Replays two `.bin` recordings
     through `reconciler::process_event` with `RingOrchestrator::new_offline()`.
@@ -334,11 +355,18 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 ## Address space layout
 
 ```
-/dev/shm/memvis_ctl       Control ring (thread discovery, ~14 KB)
-/dev/shm/memvis_ring_0    Thread 0 data ring (1M entries, ~32 MB)
-/dev/shm/memvis_ring_1    Thread 1 data ring
+# Root process (PID-scoped + legacy for backward compat)
+/dev/shm/memvis_ctl           Legacy control ring (root process only)
+/dev/shm/memvis_ctl_<pid>     PID-scoped control ring (~14 KB)
+/dev/shm/memvis_ring_<pid>_0  Thread 0 data ring (1M entries, ~32 MB)
+/dev/shm/memvis_ring_<pid>_1  Thread 1 data ring
 ...
-/dev/shm/memvis_ring_N    Thread N data ring (max N = 255)
+/dev/shm/memvis_ring_<pid>_N  Thread N data ring (max N = 255)
+
+# Forked child process (PID-scoped only, no legacy)
+/dev/shm/memvis_ctl_<child_pid>
+/dev/shm/memvis_ring_<child_pid>_0
+...
 ```
 
 Each data ring is `sizeof(memvis_ring_header_t) + capacity * 32` bytes.
@@ -348,12 +376,14 @@ Default capacity: 2^20 (1,048,576 entries), ~32 MB per ring.
 
 | Phase | Actor | Action |
 |---|---|---|
-| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` |
-| Startup | Tracer | Creates `/memvis_ctl`, inits header (magic + proto + abi_hash) |
-| Thread init | Tracer | Creates `/memvis_ring_N`, registers via CAS reclaim or alloc |
-| Attach | Engine | Opens `/memvis_ctl`, validates magic + proto + abi_hash |
-| Discovery | Engine | Opens `/memvis_ring_N`, validates magic + proto |
-| Runtime | Both | Producer writes events, consumer drains them |
+| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` (legacy + PID-scoped) |
+| Startup | Tracer | Creates `/memvis_ctl_<pid>` (+ legacy `/memvis_ctl` for root), inits header (magic + proto + abi_hash + parent_pid) |
+| Thread init | Tracer | Creates `/memvis_ring_<pid>_<tid>`, registers via CAS reclaim or alloc |
+| Attach | Engine | Opens `/memvis_ctl` (legacy) or `/memvis_ctl_<pid>`, validates magic + proto + abi_hash |
+| Discovery | Engine | Opens `/memvis_ring_<pid>_<tid>`, validates magic + proto |
+| Fork | Tracer | `event_fork_init`: detach inherited SHM, create child-scoped ctl + ring, emit PROCESS_FORK event |
+| Fork | Engine | `ChildProcessTracker`: discovers child ctl via `try_attach_ctl_pid`, polls child rings, detects shared regions |
+| Runtime | Both | Producer writes events, consumer drains them (parent + child orchestrators) |
 | Pre-syscall | Tracer | Flushes cached head; marks terminal on exit/exit_group |
 | Thread exit | Tracer | Terminal flush: sets `status = MV_STATUS_TERMINAL`, marks DEAD, unmaps/unlinks |
 | Ring drain | Engine | `batch_drain`: consumes events, retires terminal rings when `head == tail` |
