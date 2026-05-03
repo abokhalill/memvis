@@ -395,7 +395,22 @@ impl RingOrchestrator {
         if self.ctl.is_some() {
             return true;
         }
-        /* try pid-scoped name first, fall back to legacy */
+        if let Some(shm) = MappedShm::open(b"/memvis_ctl\0") {
+            return self.attach_ctl_shm(shm);
+        }
+        false
+    }
+
+    /// prefer the pid-scoped ctl (/memvis_ctl_<pid>) which receives live
+    /// thread registrations, falling back to the legacy name
+    pub fn try_attach_ctl_for_pid(&mut self, pid: u32) -> bool {
+        if self.ctl.is_some() {
+            return true;
+        }
+        let pid_name = format!("/memvis_ctl_{}\0", pid);
+        if let Some(shm) = MappedShm::open(pid_name.as_bytes()) {
+            return self.attach_ctl_shm(shm);
+        }
         if let Some(shm) = MappedShm::open(b"/memvis_ctl\0") {
             return self.attach_ctl_shm(shm);
         }
