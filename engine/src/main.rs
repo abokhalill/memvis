@@ -8,7 +8,8 @@ use std::{env, thread, time};
 use memvis::dwarf::{self, DwarfInfo};
 use memvis::heap_graph::{HeapGraph, HeapOracle};
 use memvis::index::{AddressIndex, FrameId, NodeId};
-use memvis::reconciler::{self, EVENT_BB_ENTRY, EVENT_CALL, EVENT_REG_SNAPSHOT};
+use memvis::proc_maps::{self, SharedRegion};
+use memvis::reconciler::{self, EVENT_BB_ENTRY, EVENT_CALL, EVENT_PROCESS_FORK, EVENT_REG_SNAPSHOT};
 use memvis::record::{EventPlayer, EventRecorder};
 use memvis::ring::{Event, RingOrchestrator};
 use memvis::shadow_regs::ShadowRegisterFile;
@@ -24,6 +25,131 @@ struct RunConfig {
     heatmap_path: Option<String>,
     coverage_path: Option<String>,
     no_bb: bool,
+}
+
+/// tracks child processes discovered via PROCESS_FORK events
+struct ChildProcessTracker {
+    pending_pids: Vec<u32>,
+    child_orchs: Vec<RingOrchestrator>,
+    shared_regions: Vec<SharedRegion>,
+    shared_regions_stale: bool,
+    root_pid: Option<u32>,
+}
+
+impl ChildProcessTracker {
+    fn new() -> Self {
+        Self {
+            pending_pids: Vec::new(),
+            child_orchs: Vec::new(),
+            shared_regions: Vec::new(),
+            shared_regions_stale: false,
+            root_pid: None,
+        }
+    }
+
+    fn set_root_pid(&mut self, pid: u32) {
+        self.root_pid = Some(pid);
+    }
+
+    fn register_fork(&mut self, child_pid: u32) {
+        if !self.pending_pids.contains(&child_pid) {
+            self.pending_pids.push(child_pid);
+            self.shared_regions_stale = true;
+        }
+    }
+
+    fn discover(&mut self) {
+        let had_pending = !self.pending_pids.is_empty();
+        self.pending_pids.retain(|&pid| {
+            let mut orch = RingOrchestrator::new();
+            if orch.try_attach_ctl_pid(pid) {
+                eprintln!("memvis: child process {} ctl attached", pid);
+                self.child_orchs.push(orch);
+                false
+            } else {
+                true
+            }
+        });
+        for co in &mut self.child_orchs {
+            co.poll_new_rings();
+        }
+        // refresh shared regions after new child attached
+        if had_pending && self.shared_regions_stale {
+            self.refresh_shared_regions();
+        }
+    }
+
+    fn refresh_shared_regions(&mut self) {
+        let mut all_pids: Vec<u32> = Vec::new();
+        if let Some(root) = self.root_pid {
+            all_pids.push(root);
+        }
+        for co in &self.child_orchs {
+            if let Some(pid) = co.target_pid() {
+                all_pids.push(pid);
+            }
+        }
+        if all_pids.len() < 2 {
+            return;
+        }
+        match proc_maps::detect_shared_regions(&all_pids) {
+            Ok(regions) => {
+                if !regions.is_empty() {
+                    eprintln!(
+                        "memvis: detected {} shared regions across {} processes",
+                        regions.len(),
+                        all_pids.len()
+                    );
+                    for r in &regions {
+                        eprintln!(
+                            "memvis:   inode={} path='{}' mappings={}",
+                            r.dev_inode.inode,
+                            r.path,
+                            r.mappings.len()
+                        );
+                    }
+                }
+                self.shared_regions = regions;
+            }
+            Err(e) => {
+                eprintln!("memvis: shared region detection failed: {}", e);
+            }
+        }
+        self.shared_regions_stale = false;
+    }
+
+    /// check if addr falls in a shared region; returns the region path if so
+    fn is_shared_addr(&self, addr: u64) -> Option<&str> {
+        for r in &self.shared_regions {
+            for &(_pid, start, end) in &r.mappings {
+                if addr >= start && addr < end {
+                    return Some(&r.path);
+                }
+            }
+        }
+        None
+    }
+
+    fn batch_drain(&mut self, limit: usize, buf: &mut Vec<(usize, Event)>) -> usize {
+        let mut total = 0;
+        for co in &mut self.child_orchs {
+            if total >= limit {
+                break;
+            }
+            total += co.batch_drain(limit - total, buf);
+        }
+        total
+    }
+
+    fn update_backpressure(&mut self) {
+        for co in &mut self.child_orchs {
+            co.update_backpressure();
+        }
+    }
+
+    fn child_count(&self) -> usize {
+        self.child_orchs.len()
+    }
 }
 
 fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunConfig) {
@@ -151,6 +277,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
     let mut warm_idle_rounds: u32 = 0;
+    let mut child_tracker = ChildProcessTracker::new();
 
     loop {
         tui::handle_input(&mut app);
@@ -161,6 +288,12 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
         let now_disc = time::Instant::now();
         if now_disc.duration_since(last_discovery) >= time::Duration::from_millis(200) {
             orch.poll_new_rings();
+            if child_tracker.root_pid.is_none() {
+                if let Some(pid) = orch.target_pid() {
+                    child_tracker.set_root_pid(pid);
+                }
+            }
+            child_tracker.discover();
             last_discovery = now_disc;
         }
 
@@ -241,6 +374,19 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                         &mut heap_oracle,
                         &mut topo,
                     );
+                    if ev_kind == EVENT_PROCESS_FORK {
+                        child_tracker.register_fork(ev.addr as u32);
+                        if let Some(ref mut ts) = topo {
+                            ts.emit_process_fork(total, ev.addr as u32, ev.value as u32);
+                        }
+                    }
+                    if ev_kind == reconciler::EVENT_WRITE && child_tracker.child_count() > 0 {
+                        if let Some(region) = child_tracker.is_shared_addr(ev.addr) {
+                            if let Some(ref mut ts) = topo {
+                                ts.emit_cross_process_write(total, ev.thread_id, ev.addr, ev.size, region);
+                            }
+                        }
+                    }
                     if let Some(ref mut rec) = recorder {
                         let _ = rec.record(&ev);
                     }
@@ -262,6 +408,23 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     }
                     i += 1;
                 }
+
+                // drain child process events into same batch
+                batch_buf.clear();
+                let child_got = child_tracker.batch_drain(4096, &mut batch_buf);
+                if child_got > 0 {
+                    tick_events += child_got;
+                    for j in 0..batch_buf.len() {
+                        let (_ri, ev) = batch_buf[j];
+                        let ek = ev.kind();
+                        if no_bb && ek == EVENT_BB_ENTRY { continue; }
+                        total += 1;
+                        world.inc_insn_counter();
+                        if ek == EVENT_PROCESS_FORK {
+                            child_tracker.register_fork(ev.addr as u32);
+                        }
+                    }
+                }
             } // while tick_events < TICK_BUDGET
 
             if need_finalize {
@@ -275,6 +438,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                 heap_graph.gc_stale(total, 500_000);
             }
             orch.update_backpressure();
+            child_tracker.update_backpressure();
 
             if tick_events == 0 {
                 warm_idle_rounds += 1;
@@ -406,11 +570,18 @@ fn run_headless(
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
     let mut idle_rounds: u32 = 0;
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
+    let mut child_tracker = ChildProcessTracker::new();
 
     loop {
         let now_disc = time::Instant::now();
         if now_disc.duration_since(last_discovery) >= time::Duration::from_millis(200) {
             orch.poll_new_rings();
+            if child_tracker.root_pid.is_none() {
+                if let Some(pid) = orch.target_pid() {
+                    child_tracker.set_root_pid(pid);
+                }
+            }
+            child_tracker.discover();
             last_discovery = now_disc;
         }
 
@@ -474,6 +645,19 @@ fn run_headless(
                     heap_oracle,
                     recorder_topo,
                 );
+                if ev_kind == EVENT_PROCESS_FORK {
+                    child_tracker.register_fork(ev.addr as u32);
+                    if let Some(ref mut ts) = recorder_topo {
+                        ts.emit_process_fork(*total, ev.addr as u32, ev.value as u32);
+                    }
+                }
+                if ev_kind == reconciler::EVENT_WRITE && child_tracker.child_count() > 0 {
+                    if let Some(region) = child_tracker.is_shared_addr(ev.addr) {
+                        if let Some(ref mut ts) = recorder_topo {
+                            ts.emit_cross_process_write(*total, ev.thread_id, ev.addr, ev.size, region);
+                        }
+                    }
+                }
                 if let Some(ref mut rec) = recorder {
                     let _ = rec.record(&ev);
                 }
@@ -494,6 +678,27 @@ fn run_headless(
                     need_finalize = true;
                 }
                 i += 1;
+            }
+
+            // drain child process events
+            batch_buf.clear();
+            let child_got = child_tracker.batch_drain(4096, &mut batch_buf);
+            if child_got > 0 {
+                tick_events += child_got;
+                drained += child_got;
+                for j in 0..batch_buf.len() {
+                    let (_ri, ev) = batch_buf[j];
+                    let ek = ev.kind();
+                    if no_bb && ek == EVENT_BB_ENTRY { continue; }
+                    *total += 1;
+                    world.inc_insn_counter();
+                    if ek == EVENT_PROCESS_FORK {
+                        child_tracker.register_fork(ev.addr as u32);
+                        if let Some(ref mut ts) = recorder_topo {
+                            ts.emit_process_fork(*total, ev.addr as u32, ev.value as u32);
+                        }
+                    }
+                }
             }
         }
 
@@ -603,6 +808,7 @@ fn run_headless(
         }
 
         orch.update_backpressure();
+        child_tracker.update_backpressure();
 
         if *total & 0xFFF == 0 {
             world.cache_heat_tick();
@@ -1247,12 +1453,23 @@ fn run_replay(
     let _ = out.flush();
 }
 
+fn cleanup_shm_for_pid(pid: u32) {
+    let ctl_name = format!("/memvis_ctl_{}\0", pid);
+    unsafe {
+        libc::shm_unlink(ctl_name.as_ptr() as *const libc::c_char);
+    }
+    for i in 0..256u32 {
+        let name = format!("/memvis_ring_{}_{}\0", pid, i);
+        unsafe {
+            libc::shm_unlink(name.as_ptr() as *const libc::c_char);
+        }
+    }
+}
+
 fn cleanup_shm() {
-    // remove ctl ring
     unsafe {
         libc::shm_unlink(c"/memvis_ctl".as_ptr());
     }
-    // remove per-thread rings (best effort, up to 256)
     for i in 0..256u32 {
         let name = format!("/memvis_ring_{}\0", i);
         unsafe {
@@ -1501,6 +1718,8 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig) {
         }
     }
     cleanup_shm();
+    /* pid-scoped cleanup: target pid may differ from drrun pid */
+    cleanup_shm_for_pid(child_pid as u32);
     eprintln!("memvis: done.");
 }
 
