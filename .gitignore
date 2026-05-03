@@ -18,3 +18,4 @@ examples/heap_chain
 Thumbs.db
 gimli-api
 /analysis
+/tests
