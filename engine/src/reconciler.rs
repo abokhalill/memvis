@@ -13,7 +13,7 @@ use crate::index::{AddressIndex, FrameId, NodeId};
 use crate::ring::{Event, RingOrchestrator};
 use crate::shadow_regs::ShadowRegisterFile;
 use crate::topology::TopologyStream;
-use crate::world::{HazardKind, ShadowStack, WorldState, REG_COUNT};
+use crate::world::{HazardKind, ShadowStack, StampResult, WorldState, REG_COUNT};
 
 pub const EVENT_WRITE: u8 = 0;
 pub const EVENT_READ: u8 = 1;
@@ -171,6 +171,7 @@ pub fn process_event(
                         ev.size,
                         ev.seq32() as u64,
                         &info.type_registry,
+                        &world.heap_allocs,
                     );
                     let after = world.stm.len();
                     if after > before {
@@ -264,12 +265,32 @@ pub fn process_event(
                                     let mut patched = pointee_ti;
                                     info.patch_shallow_fields(&mut patched);
                                     world.heap_allocs.check_size(ev.value, &patched);
-                                    if world.stm.stamp_type(
+                                    let stamp_res = world.stm.stamp_type(
                                         ev.value,
                                         &patched,
                                         &h_name,
                                         ev.seq32() as u64,
-                                    ) {
+                                    );
+                                    match &stamp_res {
+                                        StampResult::Schism { old_type, old_source } => {
+                                            eprintln!(
+                                                "memvis: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                                                ev.value, patched.name, h_name, old_type, old_source
+                                            );
+                                            if let Some(ref mut ts) = topo {
+                                                ts.emit_type_schism(
+                                                    ev.seq32() as u64,
+                                                    ev.value,
+                                                    old_type,
+                                                    &patched.name,
+                                                    old_source,
+                                                    &h_name,
+                                                );
+                                            }
+                                        }
+                                        _ => {}
+                                    }
+                                    if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
                                         orch.bloom_insert(ev.value);
                                         world.stm.retrospective_scan(
                                             ev.value,
@@ -694,10 +715,21 @@ impl WarmScanner {
             } else {
                 self.stats.not_heap += 1;
             }
-            if world
+            let stamp_res = world
                 .stm
-                .stamp_type(target_addr, &pointee_ti, &source_name, 0)
-            {
+                .stamp_type(target_addr, &pointee_ti, &source_name, 0);
+            if matches!(stamp_res, StampResult::Schism { .. }) {
+                if let StampResult::Schism { ref old_type, ref old_source } = stamp_res {
+                    eprintln!(
+                        "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                        target_addr, pointee_ti.name, source_name, old_type, old_source
+                    );
+                    if let Some(ref mut ts) = topo {
+                        ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
+                    }
+                }
+            }
+            if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
                 self.stats.stamps_applied += 1;
                 stamps_this_step += 1;
                 if let Some(ref mut ts) = topo {
@@ -789,10 +821,21 @@ pub fn warm_scan(
         } else {
             stats.not_heap += 1;
         }
-        if world
+        let stamp_res = world
             .stm
-            .stamp_type(target_addr, &pointee_ti, &source_name, 0)
-        {
+            .stamp_type(target_addr, &pointee_ti, &source_name, 0);
+        if matches!(stamp_res, StampResult::Schism { .. }) {
+            if let StampResult::Schism { ref old_type, ref old_source } = stamp_res {
+                eprintln!(
+                    "memvis: TYPE_SCHISM (legacy warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                    target_addr, pointee_ti.name, source_name, old_type, old_source
+                );
+                if let Some(ref mut ts) = topo {
+                    ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
+                }
+            }
+        }
+        if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
             stats.stamps_applied += 1;
             if let Some(ref mut ts) = topo {
                 ts.emit_cold_stamp(
