@@ -41,6 +41,7 @@
 #define MEMVIS_EVENT_FREE        10
 #define MEMVIS_EVENT_BB_ENTRY    11
 #define MEMVIS_EVENT_RELOAD      12
+#define MEMVIS_EVENT_PROCESS_FORK 13
 
 #define MEMVIS_REG_SNAPSHOT_SLOTS 7
 
@@ -358,6 +359,8 @@ static inline void memvis_push_overflow(memvis_ring_header_t *ring,
 /* ctl ring: thread discovery */
 
 #define MEMVIS_CTL_SHM_NAME     "/memvis_ctl"
+#define MEMVIS_CTL_SHM_FMT      "/memvis_ctl_%u"
+#define MEMVIS_RING_SHM_FMT     "/memvis_ring_%u_%u"  /* pid, tid */
 #define MEMVIS_CTL_MAGIC        0x4D56435430303032ULL  /* "MVCTL002" */
 #define MEMVIS_MAX_THREADS      256
 #define MEMVIS_RING_NAME_LEN    48
@@ -386,7 +389,7 @@ typedef struct {
     uint32_t max_threads;
     uint32_t build_hash;
     uint32_t target_pid;
-    uint32_t _pad0;
+    uint32_t parent_pid;        /* 0 for root process */
     uint64_t priority_bloom[MEMVIS_BLOOM_U64S];
     memvis_thread_entry_t threads[MEMVIS_MAX_THREADS];
 } memvis_ctl_header_t;
