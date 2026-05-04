@@ -1864,6 +1864,11 @@ fn resolve_type_at_deep<'a>(
     let entry = unit.entry(offset).ok()?;
     let tag = entry.tag();
 
+    let is_aggregate = tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type;
+    if !is_aggregate {
+        visited.remove(&offset);
+    }
+
     if tag == gimli::DW_TAG_base_type || tag == gimli::DW_TAG_enumeration_type {
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<prim>".into());
         let byte_size = entry
@@ -1880,7 +1885,7 @@ fn resolve_type_at_deep<'a>(
             shallow: false,
             fields: Vec::new(),
         })
-    } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
+    } else if is_aggregate {
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<anon>".into());
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
@@ -1970,7 +1975,15 @@ fn resolve_type_at<'a>(
     let entry = unit.entry(offset).ok()?;
     let tag = entry.tag();
 
-    if tag == gimli::DW_TAG_base_type {
+    // non-aggregate types are safe to revisit: remove from visited so sibling
+    // fields sharing the same type DIE (e.g. two `int` members) each resolve.
+    // only struct/union stay in visited to break self-referential cycles.
+    let is_aggregate = tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type;
+    if !is_aggregate {
+        visited.remove(&offset);
+    }
+
+    if tag == gimli::DW_TAG_base_type || tag == gimli::DW_TAG_enumeration_type {
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<anon>".into());
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
@@ -1986,7 +1999,7 @@ fn resolve_type_at<'a>(
             shallow: false,
             fields: Vec::new(),
         })
-    } else if tag == gimli::DW_TAG_structure_type || tag == gimli::DW_TAG_union_type {
+    } else if is_aggregate {
         let name = attr_name(dwarf, unit, &entry).unwrap_or_else(|| "<anon>".into());
         let byte_size = entry
             .attr_value(gimli::DW_AT_byte_size)
