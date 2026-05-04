@@ -239,6 +239,28 @@ impl TopologyStream {
         self.lines += 1;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_type_violation(
+        &mut self,
+        seq: u64,
+        kind: &str,
+        write_addr: u64,
+        write_size: u32,
+        base_addr: u64,
+        offset: u64,
+        type_name: &str,
+        field_name: Option<&str>,
+        pc: u64,
+    ) {
+        let fn_ = field_name.unwrap_or("");
+        let _ = writeln!(
+            self.w,
+            r#"{{"seq":{},"type":"TYPE_VIOLATION","kind":"{}","write_addr":"0x{:x}","write_size":{},"base_addr":"0x{:x}","offset":{},"type_name":"{}","field":"{}","pc":"0x{:x}"}}"#,
+            seq, kind, write_addr, write_size, base_addr, offset, esc(type_name), esc(fn_), pc
+        );
+        self.lines += 1;
+    }
+
     pub fn emit_summary(
         &mut self,
         total_events: u64,

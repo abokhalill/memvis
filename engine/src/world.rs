@@ -658,6 +658,143 @@ pub struct HeapHazard {
     pub reg_snapshot: Option<[u64; REG_COUNT]>,
 }
 
+// type stability monitor: detects writes to STM-stamped regions that violate
+// the projected type's field boundaries. two violation classes:
+// - interstitial: write offset matches no field (lands in padding or beyond)
+// - spanning: write straddles a field boundary or undershoots field size
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViolationKind {
+    Interstitial, // offset hits no field
+    Spanning,     // offset within a field but size mismatches
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeViolation {
+    pub kind: ViolationKind,
+    pub write_addr: u64,
+    pub write_size: u32,
+    pub base_addr: u64,
+    pub offset: u64,
+    pub type_name: String,
+    pub expected_field: Option<String>, // populated for Spanning
+    pub expected_size: Option<u64>,     // populated for Spanning
+    pub pc: u64,
+}
+
+pub struct TypeStabilityMonitor {
+    // per-type tally: avoids allocating per-event. keyed by type name index
+    // in a dense vec to keep the hot path branch-free after the covering() call.
+    tally: HashMap<String, TypeStabilityTally>,
+    pub violations: Vec<TypeViolation>, // capped, for headless report
+    pub total_checked: u64,
+    pub total_violations: u64,
+}
+
+pub struct TypeStabilityTally {
+    pub interstitial: u64,
+    pub spanning: u64,
+    pub aligned: u64,
+}
+
+impl TypeStabilityMonitor {
+    pub fn new() -> Self {
+        Self {
+            tally: HashMap::with_capacity(64),
+            violations: Vec::new(),
+            total_checked: 0,
+            total_violations: 0,
+        }
+    }
+
+    // hot path: classify a write against a type projection's field layout.
+    // fields must be sorted by byte_offset (DWARF guarantees this for structs).
+    // returns true if the write is a violation.
+    #[inline]
+    pub fn check_write(
+        &mut self,
+        write_addr: u64,
+        write_size: u32,
+        proj: &TypeProjection,
+        pc: u64,
+    ) -> bool {
+        self.total_checked += 1;
+        let offset = write_addr - proj.base_addr;
+        let fields = &proj.type_info.fields;
+
+        // empty field list: type is opaque (e.g. primitive typedef). no violation.
+        if fields.is_empty() {
+            return false;
+        }
+
+        // find the field that contains this offset
+        let field = fields.iter().find(|f| {
+            offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
+        });
+
+        let tally = self.tally.entry(proj.type_info.name.clone())
+            .or_insert(TypeStabilityTally { interstitial: 0, spanning: 0, aligned: 0 });
+
+        match field {
+            Some(f) => {
+                // write starts within this field. check if it stays within bounds.
+                let field_end = f.byte_offset + f.byte_size;
+                let write_end = offset + write_size as u64;
+                if write_end > field_end {
+                    // spans past this field into the next field or padding
+                    tally.spanning += 1;
+                    self.total_violations += 1;
+                    self.record_violation(TypeViolation {
+                        kind: ViolationKind::Spanning,
+                        write_addr,
+                        write_size,
+                        base_addr: proj.base_addr,
+                        offset,
+                        type_name: proj.type_info.name.clone(),
+                        expected_field: Some(f.name.clone()),
+                        expected_size: Some(f.byte_size),
+                        pc,
+                    });
+                    return true;
+                }
+                tally.aligned += 1;
+                false
+            }
+            None => {
+                // no field covers this offset: padding, tail, or corruption
+                tally.interstitial += 1;
+                self.total_violations += 1;
+                self.record_violation(TypeViolation {
+                    kind: ViolationKind::Interstitial,
+                    write_addr,
+                    write_size,
+                    base_addr: proj.base_addr,
+                    offset,
+                    type_name: proj.type_info.name.clone(),
+                    expected_field: None,
+                    expected_size: None,
+                    pc,
+                });
+                true
+            }
+        }
+    }
+
+    fn record_violation(&mut self, v: TypeViolation) {
+        // cap stored violations to avoid unbounded growth; tally is always accurate
+        if self.violations.len() < 128 {
+            self.violations.push(v);
+        }
+    }
+
+    pub fn tally_iter(&self) -> impl Iterator<Item = (&str, &TypeStabilityTally)> {
+        self.tally.iter().map(|(k, v)| (k.as_str(), v))
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.total_violations == 0
+    }
+}
+
 #[derive(Default)]
 pub struct HeapAllocTracker {
     allocs: BTreeMap<u64, (u64, u64)>, // addr -> (size, alloc_seq)
@@ -812,6 +949,7 @@ pub struct WorldState {
     pub hazards: Vec<HeapHazard>,
     pub field_heatmap: FieldHeatmap,
     pub bb_hits: HashMap<u32, u64>,
+    pub type_stability: TypeStabilityMonitor,
 }
 
 impl WorldState {
@@ -825,6 +963,7 @@ impl WorldState {
             hazards: Vec::new(),
             field_heatmap: FieldHeatmap::new(),
             bb_hits: HashMap::new(),
+            type_stability: TypeStabilityMonitor::new(),
         }
     }
 

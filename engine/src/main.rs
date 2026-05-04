@@ -1089,6 +1089,7 @@ fn run_headless(
                     &world.heap_allocs,
                     &world.hazards,
                     &world.field_heatmap,
+                    &world.type_stability,
                     journal,
                     *total,
                     orch,
@@ -1218,6 +1219,7 @@ fn headless_render(
     heap_allocs: &memvis::world::HeapAllocTracker,
     hazards: &[memvis::world::HeapHazard],
     field_heatmap: &memvis::world::FieldHeatmap,
+    type_stability: &memvis::world::TypeStabilityMonitor,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -1453,6 +1455,50 @@ fn headless_render(
                 }
             }
         }
+    }
+
+    // type stability: per-type tally of field boundary violations
+    if !type_stability.is_empty() {
+        use memvis::world::ViolationKind;
+        let _ = writeln!(
+            out,
+            "\n\u{26a0}\u{fe0f}  TYPE STABILITY ({} violations across {} checked writes)",
+            type_stability.total_violations,
+            type_stability.total_checked,
+        );
+        let mut tallies: Vec<_> = type_stability.tally_iter().collect();
+        tallies.sort_by(|a, b| {
+            (b.1.interstitial + b.1.spanning).cmp(&(a.1.interstitial + a.1.spanning))
+        });
+        for (tn, t) in tallies.iter().take(20) {
+            if t.interstitial + t.spanning == 0 {
+                continue;
+            }
+            let _ = writeln!(
+                out,
+                "  {:<30} aligned={:<8} interstitial={:<8} spanning={}",
+                tn, t.aligned, t.interstitial, t.spanning
+            );
+        }
+        let _ = writeln!(out, "  Top violations (capped at 128):");
+        for v in type_stability.violations.iter().take(20) {
+            let kind_str = match v.kind {
+                ViolationKind::Interstitial => "INTERSTICE",
+                ViolationKind::Spanning => "SPANNING  ",
+            };
+            let field_str = v.expected_field.as_deref().unwrap_or("<none>");
+            let _ = writeln!(
+                out,
+                "    {} 0x{:x} +{}B  {} +0x{:x}  field={}  pc=0x{:x}",
+                kind_str, v.write_addr, v.write_size, v.type_name, v.offset, field_str, v.pc
+            );
+        }
+    } else if type_stability.total_checked > 0 {
+        let _ = writeln!(
+            out,
+            "\n\u{2705} TYPE STABILITY: {} writes checked, 0 violations",
+            type_stability.total_checked,
+        );
     }
 
     // field heatmap: top writes + contention report
@@ -1800,6 +1846,7 @@ fn run_replay(
         &world.heap_allocs,
         &world.hazards,
         &world.field_heatmap,
+        &world.type_stability,
         &journal,
         total,
         &orch,

@@ -507,6 +507,58 @@ by the delta.
 list, RTR discovers and types every reachable node in the chain — even if
 the list was built before tracing began.
 
+## Type Stability Monitor (`world.rs`)
+
+`TypeStabilityMonitor` validates every write to an STM-stamped heap region
+against the projected type's field layout. On the WRITE hot path, the
+reconciler reuses the `covering()` result already computed for the field
+heatmap — no additional O(N) scan.
+
+### Violation classes
+
+| Kind | Condition | Signal |
+|---|---|---|
+| **Interstitial** | Write offset matches no field (padding, tail, or corruption) | Structural violation: write to a byte the type doesn't declare |
+| **Spanning** | Write starts within a field but extends past its boundary | Type confusion: wrong-size access or cross-field overwrite |
+
+Aligned writes (offset and size match a field exactly) are tallied but
+not flagged.
+
+### Hot-path contract
+
+```
+check_write(write_addr, write_size, projection, pc) → bool
+  offset = write_addr - projection.base_addr
+  if fields is empty → false (opaque type)
+  field = fields.find(offset ∈ [f.byte_offset, f.byte_offset + f.byte_size))
+  if field is None → Interstitial violation
+  if offset + write_size > field.byte_offset + field.byte_size → Spanning violation
+  else → aligned, no violation
+```
+
+Per-type tallies (`TypeStabilityTally`) are keyed by type name in a
+`HashMap`. Violation details are stored in a capped `Vec<TypeViolation>`
+(max 128) for the headless summary; the tally is always accurate
+regardless of cap.
+
+### Output
+
+- **Headless summary**: per-type tally table (aligned/interstitial/spanning)
+  + top 20 violation details with write address, offset, type, field, and PC.
+- **Topology stream**: `TYPE_VIOLATION` JSONL events emitted on each
+  violation with kind, write geometry, type name, field name, and PC.
+- **Clean bill**: if checked > 0 and violations == 0, prints confirmation.
+
+### Design rationale
+
+The monitor detects the class of bug that survives for decades: a struct
+field written at the wrong offset due to slab reuse, union aliasing, or
+stale type casts. These writes are spatially valid (within allocation
+bounds) and temporally valid (allocation is live), but semantically wrong.
+ASan and Valgrind cannot detect them because they operate below the type
+layer. Static analyzers cannot detect them because the aliasing depends
+on runtime allocator behavior.
+
 ## Allocator lifecycle (`world.rs`)
 
 `HeapAllocTracker` tracks live allocations in a `BTreeMap<u64, u64>` (addr

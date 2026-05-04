@@ -115,12 +115,14 @@ pub fn process_event(
                     ev.seq32() as u64,
                     heap_oracle,
                 );
-                // field heatmap: attribute this write to a typed field if STM covers it
-                if let Some(covering) = world.stm.covering(ev.addr) {
-                    let offset = ev.addr - covering.base_addr;
-                    let tn = &covering.type_info.name;
+                // field heatmap + type stability: attribute write to typed field if STM covers it
+                let covering_snap = world.stm.covering(ev.addr).map(|c| {
+                    (c.base_addr, c.type_info.name.clone(), c.type_info.fields.clone(), c.type_info.byte_size, c.source_name.clone(), c.stamp_seq, c.type_info.clone())
+                });
+                if let Some((base, ref tn, ref fields, _byte_size, ref source, stamp_seq, ref ti_full)) = covering_snap {
+                    let offset = ev.addr - base;
                     if let Some(field) =
-                        covering.type_info.fields.iter().find(|f| {
+                        fields.iter().find(|f| {
                             offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
                         })
                     {
@@ -134,6 +136,34 @@ pub fn process_event(
                         world
                             .field_heatmap
                             .record(ev.thread_id, tn, "<unresolved>", offset);
+                    }
+                    // type stability check: reuse the extracted projection
+                    let proj = crate::world::TypeProjection {
+                        base_addr: base,
+                        type_info: ti_full.clone(),
+                        source_name: source.clone(),
+                        stamp_seq,
+                    };
+                    let pc = ev.rip_lo as u64;
+                    if world.type_stability.check_write(ev.addr, ev.size, &proj, pc) {
+                        if let Some(ref mut ts) = topo {
+                            let v = world.type_stability.violations.last().unwrap();
+                            let kind_str = match v.kind {
+                                crate::world::ViolationKind::Interstitial => "INTERSTICE",
+                                crate::world::ViolationKind::Spanning => "SPANNING",
+                            };
+                            ts.emit_type_violation(
+                                ev.seq32() as u64,
+                                kind_str,
+                                v.write_addr,
+                                v.write_size,
+                                v.base_addr,
+                                v.offset,
+                                &v.type_name,
+                                v.expected_field.as_deref(),
+                                v.pc,
+                            );
+                        }
                     }
                 }
                 if ev.size == 8 && val != 0 {
