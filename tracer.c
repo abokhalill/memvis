@@ -115,6 +115,12 @@ static uint64_t g_module_base = 0;
 static uint64_t g_module_end  = 0;
 static _Atomic int g_module_base_phase = 0;
 
+/* sidecar module table: written to /dev/shm/memvis_modules_<pid> */
+#define MODTAB_MAX 64
+static struct { uint64_t base; char path[256]; } g_modtab[MODTAB_MAX];
+static int g_modtab_count = 0;
+static void *g_modtab_lock = NULL;
+
 #define TLS_SLOT_GUARD     0
 #define TLS_SLOT_THREAD_ID 1
 #define TLS_SLOT_SEQ       2
@@ -1020,6 +1026,8 @@ static inline memvis_ring_header_t *tls_ring(void *drcontext) {
     return (memvis_ring_header_t *)drmgr_get_tls_field(drcontext, g_tls_idx[TLS_SLOT_RING]);
 }
 
+static void flush_modtab(void);
+
 static inline void maybe_emit_module_load(void *drcontext, memvis_ring_header_t *ring) {
     int phase = atomic_load_explicit(&g_module_base_phase, memory_order_acquire);
     if (phase != 1) return;
@@ -1696,6 +1704,34 @@ wrap_alloc_funcs_foreign(const module_data_t *mod, const char *tag)
     dr_printf("memvis: scanned foreign allocator module '%s'\n", tag);
 }
 
+/* flush module table to /dev/shm sidecar; engine reads after ctl attach */
+static void
+flush_modtab(void)
+{
+    char path[128];
+    dr_snprintf(path, sizeof(path), "/dev/shm/memvis_modules_%u", g_process_pid);
+    file_t f = dr_open_file(path, DR_FILE_WRITE_OVERWRITE);
+    if (f == INVALID_FILE) return;
+    for (int i = 0; i < g_modtab_count; i++) {
+        char line[320];
+        dr_snprintf(line, sizeof(line), "%llx %s\n",
+                    (unsigned long long)g_modtab[i].base, g_modtab[i].path);
+        dr_write_file(f, line, strlen(line));
+    }
+    dr_close_file(f);
+}
+
+static int
+is_system_module(const char *name)
+{
+    return (strstr(name, "vdso") != NULL ||
+            strstr(name, "ld-linux") != NULL ||
+            strstr(name, "libpthread") != NULL ||
+            strstr(name, "libmemvis") != NULL ||
+            strstr(name, "libdynamorio") != NULL ||
+            strstr(name, "libdr") != NULL);
+}
+
 static void
 event_module_load(void *drcontext, const module_data_t *info, bool loaded)
 {
@@ -1710,15 +1746,23 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
         wrap_alloc_funcs_foreign(info, name);
     }
 
+    /* record all non-system modules in sidecar table */
+    if (name && info->full_path[0] != '\0' && !is_system_module(name) &&
+        strstr(name, "libc") == NULL) {
+        dr_mutex_lock(g_modtab_lock);
+        if (g_modtab_count < MODTAB_MAX) {
+            g_modtab[g_modtab_count].base = (uint64_t)(uintptr_t)info->start;
+            strncpy(g_modtab[g_modtab_count].path, info->full_path, 255);
+            g_modtab[g_modtab_count].path[255] = '\0';
+            g_modtab_count++;
+            flush_modtab();
+        }
+        dr_mutex_unlock(g_modtab_lock);
+    }
+
     if (atomic_load_explicit(&g_module_base_phase, memory_order_relaxed) == 0 &&
         info->full_path[0] != '\0') {
-        if (name && strstr(name, "vdso") == NULL &&
-            strstr(name, "ld-linux") == NULL &&
-            strstr(name, "libc") == NULL &&
-            strstr(name, "libpthread") == NULL &&
-            strstr(name, "libmemvis") == NULL &&
-            strstr(name, "libdynamorio") == NULL &&
-            strstr(name, "libdr") == NULL) {
+        if (name && !is_system_module(name) && strstr(name, "libc") == NULL) {
             g_module_base = (uint64_t)(uintptr_t)info->start;
             g_module_end  = (uint64_t)(uintptr_t)info->end;
             atomic_store_explicit(&g_module_base_phase, 1, memory_order_release);
@@ -1935,6 +1979,9 @@ event_exit(void)
     dr_printf("memvis:   rt_clean:    %llu\n", (unsigned long long)atomic_load(&g_stat_clean_reads));
 #endif
 
+    /* sidecar module table left for engine to read + clean up */
+    dr_mutex_destroy(g_modtab_lock);
+
     unmap_ctl_ring();
     drmgr_unregister_bb_insertion_event(event_bb_insert);
     for (int i = 0; i < TLS_SLOT_COUNT; i++)
@@ -1985,6 +2032,8 @@ dr_client_main(client_id_t id, int argc, const char *argv[])
             shm_unlink(stale);
         }
     }
+
+    g_modtab_lock = dr_mutex_create();
 
     map_ctl_ring(0);
 
