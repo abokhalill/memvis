@@ -554,6 +554,10 @@ pub fn populate_globals(
         addr_index.insert_global(base, g.size, g.name.clone(), g.type_info.clone(), gi);
         world.remove_node(NodeId::Global(gi));
         world.ensure_node(NodeId::Global(gi), &g.name, &g.type_info, base, g.size);
+        // globals with struct fields are statically typed; seed STM directly
+        if !g.type_info.fields.is_empty() && g.type_info.byte_size > 0 {
+            world.stm.stamp_type(base, &g.type_info, &g.name, 0);
+        }
         if g.type_info.is_pointer {
             continue;
         }
@@ -570,6 +574,115 @@ pub fn populate_globals(
         );
     }
     addr_index.finalize();
+}
+
+/// read the tracer's sidecar module table from /dev/shm/memvis_modules_<pid>.
+/// retries briefly since the tracer may still be writing it.
+/// returns vec of (runtime_base, full_path). cleans up the sidecar after reading.
+fn read_module_table(pid: u32) -> Vec<(u64, String)> {
+    let path = format!("/dev/shm/memvis_modules_{}", pid);
+    let content = match std::fs::read_to_string(&path) {
+        Ok(c) if !c.is_empty() => c,
+        _ => return Vec::new(),
+    };
+    content.lines().filter_map(|line| {
+        let mut parts = line.splitn(2, ' ');
+        let base = u64::from_str_radix(parts.next()?, 16).ok()?;
+        let path = parts.next()?.to_string();
+        if path.is_empty() { None } else { Some((base, path)) }
+    }).collect()
+}
+
+pub fn cleanup_module_table(pid: u32) {
+    let path = format!("/dev/shm/memvis_modules_{}", pid);
+    let _ = std::fs::remove_file(&path);
+}
+
+/// relocate library globals + functions into addr_index and DwarfInfo.functions
+/// using the tracer's sidecar module table (immune to DR's private loader).
+/// returns (0,0) silently if sidecar is missing or incomplete; caller retries.
+pub fn populate_lib_globals(
+    info: &mut DwarfInfo,
+    pid: u32,
+    addr_index: &mut AddressIndex,
+    world: &mut WorldState,
+) -> (usize, usize) {
+    let modtab = read_module_table(pid);
+    if modtab.is_empty() {
+        return (0, 0);
+    }
+
+    // pre-check: all libraries must be resolvable before we commit any changes
+    let mut deltas: Vec<u64> = Vec::with_capacity(info.lib_globals.len());
+    for lg in &info.lib_globals {
+        let lib_basename = lg.lib_path.rsplit('/').next().unwrap_or(&lg.lib_path);
+        let found = modtab.iter().find_map(|(base, path)| {
+            if path == &lg.lib_path
+                || path.rsplit('/').next() == Some(lib_basename)
+            {
+                Some(*base)
+            } else {
+                None
+            }
+        });
+        match found {
+            Some(load_addr) => deltas.push(load_addr.wrapping_sub(lg.elf_base_vaddr)),
+            None => return (0, 0), // sidecar incomplete, retry later
+        }
+    }
+
+    let base_gi = info.globals.len() as u32;
+    let mut total_g = 0u32;
+    let mut total_f = 0usize;
+
+    let libs = std::mem::take(&mut info.lib_globals);
+
+    for (i, lg) in libs.iter().enumerate() {
+        let delta = deltas[i];
+        let lib_basename = lg.lib_path.rsplit('/').next().unwrap_or(&lg.lib_path);
+
+        for g in &lg.globals {
+            let addr = g.addr.wrapping_add(delta);
+            let gi = base_gi + total_g;
+            total_g += 1;
+            addr_index.insert_global(addr, g.size, g.name.clone(), g.type_info.clone(), gi);
+            world.ensure_node(NodeId::Global(gi), &g.name, &g.type_info, addr, g.size);
+            if !g.type_info.fields.is_empty() && g.type_info.byte_size > 0 {
+                world.stm.stamp_type(addr, &g.type_info, &g.name, 0);
+            }
+            if g.type_info.is_pointer {
+                continue;
+            }
+            let mut fi_counter: u16 = 0;
+            register_fields_recursive(
+                &g.name, addr, &g.type_info, gi,
+                &mut fi_counter, addr_index, world, 0,
+            );
+        }
+
+        // relocate function PCs and merge into info.functions
+        for (elf_pc, func) in &lg.functions {
+            let runtime_pc = elf_pc.wrapping_add(delta);
+            let mut relocated = func.clone();
+            relocated.low_pc = runtime_pc;
+            relocated.high_pc = func.high_pc.wrapping_add(delta);
+            info.functions.insert(runtime_pc, relocated);
+            total_f += 1;
+        }
+
+        eprintln!(
+            "memvis: lib dwarf: {} — {} globals, {} functions at delta=0x{:x}",
+            lib_basename, lg.globals.len(), lg.functions.len(), delta
+        );
+    }
+
+    // restore (now empty, but keeps the field valid)
+    info.lib_globals = libs;
+
+    if total_g > 0 {
+        addr_index.finalize();
+    }
+    (total_g as usize, total_f)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1332,6 +1445,7 @@ mod tests {
             cfi: dwarf::CfiTable::default(),
             elf_path: String::new(),
             name_accel: None,
+            lib_globals: Vec::new(),
         };
         let f = std::fs::File::open(path).unwrap();
         (f, info)
