@@ -284,6 +284,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
     let mut heap_graph = HeapGraph::new();
     let mut heap_oracle = HeapOracle::new();
+    let mut lib_globals_done = false;
 
     if let Some(ref info) = dwarf_info {
         reconciler::populate_globals(info, 0, &mut addr_index, &mut world);
@@ -650,6 +651,43 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
             orch.update_backpressure();
             child_tracker.update_backpressure();
 
+            // deferred: relocate library globals once sidecar is populated
+            if !lib_globals_done && relocation_delta.is_some() {
+                if let (Some(ref mut info), Some(pid)) = (&mut dwarf_info, orch.target_pid()) {
+                    if info.lib_globals.is_empty() {
+                        lib_globals_done = true;
+                    } else {
+                        let (ng, nf) = reconciler::populate_lib_globals(info, pid, &mut addr_index, &mut world);
+                        if ng > 0 || nf > 0 {
+                            eprintln!("memvis: {} library globals, {} functions relocated", ng, nf);
+                            lib_globals_done = true;
+                        }
+                    }
+                }
+            }
+            // initial warm scan: after 100K events, globals are initialized
+            if lib_globals_done && warm_scanner.is_none() && total > 100_000 {
+                if let (Some(ref mut info), Some(pid), Some(delta)) =
+                    (&mut dwarf_info, orch.target_pid(), relocation_delta)
+                {
+                    let scanner = warm_scanner.get_or_insert_with(|| {
+                        match reconciler::WarmScanner::new(pid, 12) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                eprintln!("memvis: warm-scan init failed: {}", e);
+                                std::process::exit(1);
+                            }
+                        }
+                    });
+                    scanner.seed(info, delta, &heap_oracle, &mut topo);
+                    let _ = scanner.step(2000, info, &mut world, &heap_oracle, &mut topo);
+                    eprintln!(
+                        "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
+                        scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
+                    );
+                }
+            }
+
             if tick_events == 0 {
                 warm_idle_rounds += 1;
             } else {
@@ -784,6 +822,7 @@ fn run_headless(
     // two seq domains per thread (see seq_domain())
     let mut expected_seq: HashMap<(u16, u8), u32> = HashMap::new();
     let mut seq_gaps: u64 = 0;
+    let mut lib_globals_done = false;
 
     loop {
         let now_disc = time::Instant::now();
@@ -1166,6 +1205,42 @@ fn run_headless(
 
         orch.update_backpressure();
         child_tracker.update_backpressure();
+
+        if !lib_globals_done && relocation_delta.is_some() {
+            if let (Some(ref mut info), Some(pid)) = (&mut *dwarf_info, orch.target_pid()) {
+                if info.lib_globals.is_empty() {
+                    lib_globals_done = true;
+                } else {
+                    let (ng, nf) = reconciler::populate_lib_globals(info, pid, addr_index, world);
+                    if ng > 0 || nf > 0 {
+                        eprintln!("memvis: {} library globals, {} functions relocated", ng, nf);
+                        lib_globals_done = true;
+                    }
+                }
+            }
+        }
+        // initial warm scan: after 100K events, globals are initialized
+        if lib_globals_done && warm_scanner.is_none() && *total > 100_000 {
+            if let (Some(ref mut info), Some(pid), Some(delta)) =
+                (&mut *dwarf_info, orch.target_pid(), *relocation_delta)
+            {
+                let scanner = warm_scanner.get_or_insert_with(|| {
+                    match reconciler::WarmScanner::new(pid, 12) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            eprintln!("memvis: warm-scan init failed: {}", e);
+                            std::process::exit(1);
+                        }
+                    }
+                });
+                scanner.seed(info, delta, heap_oracle, recorder_topo);
+                let _ = scanner.step(2000, info, world, heap_oracle, recorder_topo);
+                eprintln!(
+                    "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
+                    scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
+                );
+            }
+        }
 
         if *total & 0xFFF == 0 {
             world.cache_heat_tick();
