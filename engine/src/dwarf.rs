@@ -544,6 +544,15 @@ impl NameAccelerator {
     }
 }
 
+/// globals + functions from a DT_NEEDED library, with ELF-relative addresses.
+/// relocation happens at runtime once we know the library's load base.
+pub struct LibDwarf {
+    pub lib_path: String,
+    pub elf_base_vaddr: u64,
+    pub globals: Vec<GlobalVar>,
+    pub functions: BTreeMap<u64, FunctionMeta>,
+}
+
 pub struct DwarfInfo {
     pub globals: Vec<GlobalVar>,
     pub functions: BTreeMap<u64, FunctionMeta>,
@@ -553,6 +562,7 @@ pub struct DwarfInfo {
     pub elf_path: String,
     pub container_of_map: HashMap<String, Vec<ContainerOfEntry>>,
     pub name_accel: Option<NameAccelerator>,
+    pub lib_globals: Vec<LibDwarf>,
 }
 
 impl DwarfInfo {
@@ -885,7 +895,9 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
     );
 
     fn register_recursive(ti: &TypeInfo, reg: &mut HashMap<String, TypeInfo>) {
-        if !ti.fields.is_empty() && ti.byte_size > 0 && !ti.name.is_empty() && !ti.is_pointer {
+        // register named struct/union types; even shallow ones (byte_size>0 but
+        // no fields) so the warm scanner can stamp heap allocs by size.
+        if ti.byte_size > 0 && !ti.name.is_empty() && !ti.is_pointer {
             reg.entry(ti.name.clone())
                 .and_modify(|existing| {
                     if ti.fields.len() > existing.fields.len() {
@@ -896,6 +908,16 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         }
         for f in &ti.fields {
             register_recursive(&f.type_info, reg);
+        }
+        // pointer fields: extract pointee name and register it if not already present
+        if ti.is_pointer && ti.byte_size > 0 {
+            let pointee_name = ti.name.strip_prefix('*').unwrap_or("");
+            if !pointee_name.is_empty() && pointee_name != "void" {
+                // the <pointee> synthetic field carries the full type if available
+                if let Some(pf) = ti.fields.iter().find(|f| f.name == "<pointee>") {
+                    register_recursive(&pf.type_info, reg);
+                }
+            }
         }
     }
     for g in &globals {
@@ -929,9 +951,10 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         elf_path: path.to_string(),
         container_of_map,
         name_accel,
+        lib_globals: Vec::new(),
     };
 
-    // merge types from DT_NEEDED shared libraries (works from disk, no live process)
+    // merge types + globals + functions from DT_NEEDED shared libraries (works from disk, no live process)
     merge_needed_libs(&mut info);
 
     Ok(info)
@@ -1080,10 +1103,22 @@ pub fn merge_needed_libs(info: &mut DwarfInfo) -> usize {
             Err(_) => continue,
         };
 
-        // types only — no address relocation (we don't know runtime base yet;
-        // functions/globals will get wrong addresses). type stamps don't need
-        // absolute addresses, just structural layout.
+        // Harvest types AND globals from the library.
+        // Globals carry ELF-relative addresses; relocation deferred to runtime
+        // when we learn the library's load base from /proc/<pid>/maps.
         let mut lib_types: HashMap<String, TypeInfo> = HashMap::new();
+        let mut lib_globs: Vec<GlobalVar> = Vec::new();
+        let mut lib_funcs: BTreeMap<u64, FunctionMeta> = BTreeMap::new();
+
+        // library's ELF base vaddr — same logic as main binary in parse_elf
+        let lib_elf_base = obj
+            .segments()
+            .filter_map(|s| {
+                let addr = s.address();
+                if addr < u64::MAX { Some(addr) } else { None }
+            })
+            .min()
+            .unwrap_or(0);
 
         let mut iter = dw.units();
         while let Ok(Some(header)) = iter.next() {
@@ -1115,14 +1150,25 @@ pub fn merge_needed_libs(info: &mut DwarfInfo) -> usize {
                                 .or_insert(ti);
                         }
                     }
+                } else if tag == gimli::DW_TAG_variable {
+                    if let Some(g) = try_extract_global(&dw, &unit, entry) {
+                        lib_globs.push(g);
+                    }
+                } else if tag == gimli::DW_TAG_subprogram {
+                    if let Some(f) = try_extract_function(&dw, &unit, entry) {
+                        lib_funcs.insert(f.low_pc, f);
+                    }
                 }
+            }
+            // harvest locals for functions in this CU
+            if let Err(_) = extract_locals(&dw, &unit, &mut lib_funcs) {
+                // non-fatal: some CUs may lack local variable info
             }
         }
 
         let t_count = lib_types.len();
-        if t_count == 0 {
-            continue;
-        }
+        let g_count = lib_globs.len();
+        let f_count = lib_funcs.len();
 
         for (name, ti) in lib_types {
             let n = ti.fields.len();
@@ -1136,8 +1182,17 @@ pub fn merge_needed_libs(info: &mut DwarfInfo) -> usize {
                 .or_insert(ti);
         }
 
+        if !lib_globs.is_empty() || !lib_funcs.is_empty() {
+            info.lib_globals.push(LibDwarf {
+                lib_path: lib_path.clone(),
+                elf_base_vaddr: lib_elf_base,
+                globals: lib_globs,
+                functions: lib_funcs,
+            });
+        }
+
         let lib_name = lib_path.rsplit('/').next().unwrap_or(lib_path);
-        eprintln!("dwarf: merged {} — {} types", lib_name, t_count);
+        eprintln!("dwarf: merged {} — {} types, {} globals, {} functions", lib_name, t_count, g_count, f_count);
         merged += 1;
     }
 
@@ -2241,6 +2296,7 @@ mod tests {
             cfi: CfiTable::new(),
             elf_path: String::new(),
             name_accel: None,
+            lib_globals: Vec::new(),
         };
 
         info.patch_shallow_fields(&mut parent);
