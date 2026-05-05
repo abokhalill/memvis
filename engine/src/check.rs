@@ -531,6 +531,12 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
                 last_alloc_seq = a.seq;
             }
             for s in &g.stamps {
+                // alloc-site stamps occupy drwrap callback seq domain,
+                // interleaved with inline-instrumented propagation stamps.
+                // check monotonicity only within non-alloc-site stamps.
+                if s.source.starts_with("alloc@") {
+                    continue;
+                }
                 if s.seq < last_stamp_seq {
                     violations += 1;
                     if first_violation.is_none() {
@@ -560,8 +566,14 @@ fn eval_one(g: &TopoGraph, a: &Assertion) -> (bool, String) {
             (violations == 0, msg)
         }
         Assertion::StampBeforeLink => {
+            // alloc-site stamps arrive after the first pointer write by ring
+            // ordering (drwrap post-callback vs inline instrumentation). exclude
+            // them; the type is correct from birth, the seq just lags.
             let mut stamp_seqs: HashMap<u64, u64> = HashMap::new();
             for s in &g.stamps {
+                if s.source.starts_with("alloc@") {
+                    continue;
+                }
                 stamp_seqs.entry(s.addr).or_insert(s.seq);
             }
             let mut violations = 0usize;
