@@ -253,6 +253,40 @@ static inline int memvis_push_ex(memvis_ring_header_t *ring,
     return memvis_push_ex_flags(ring, addr, size, value, kind, 0, thread_id, seq);
 }
 
+/* alloc/free with caller RIP for alloc-site type oracle */
+static inline int memvis_push_alloc(memvis_ring_header_t *ring,
+                                     uint64_t ptr, uint32_t size_lo,
+                                     uint64_t size_full, uint8_t kind,
+                                     uint16_t thread_id, uint32_t seq,
+                                     uint32_t caller_rip_lo)
+{
+    const uint32_t mask = ring->capacity - 1;
+    memvis_event_v3_t *data = memvis_ring_data_v3(ring);
+    uint64_t h = atomic_load_explicit(&ring->head, memory_order_relaxed);
+    uint64_t t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+
+    if (h - t >= ring->capacity) {
+        if (!(ring->flags & MEMVIS_FLAG_SPIN_ON_FULL))
+            return -1;
+        while (h - t >= ring->capacity) {
+            __builtin_ia32_pause();
+            t = atomic_load_explicit(&ring->tail, memory_order_acquire);
+        }
+    }
+
+    uint64_t idx = h & mask;
+    data[idx].addr       = ptr;
+    data[idx].size       = size_lo;
+    data[idx].thread_id  = thread_id;
+    data[idx].seq_lo     = (uint16_t)(seq & 0xFFFF);
+    data[idx].value      = size_full;
+    data[idx].kind_flags = memvis_v3_make_kf(kind, 0, (uint16_t)(seq >> 16));
+    data[idx].rip_lo     = caller_rip_lo;
+
+    atomic_store_explicit(&ring->head, h + 1, memory_order_release);
+    return 0;
+}
+
 static inline int memvis_push(memvis_ring_header_t *ring,
                                uint64_t addr, uint32_t size, uint64_t value,
                                uint16_t thread_id, uint32_t seq)
