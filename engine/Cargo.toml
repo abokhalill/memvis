@@ -27,6 +27,7 @@ gimli = "0.33"
 object = { version = "0.36", default-features = false, features = ["read", "elf"] }
 ratatui = "0.29"
 crossterm = "0.28"
+arrayvec = "0.7.6"
 
 [profile.release]
 opt-level = 3
