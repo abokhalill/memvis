@@ -1575,14 +1575,15 @@ wrap_malloc_post(void *wrapctx, void *user_data)
     if (ret == NULL) return;
     uint64_t ptr  = (uint64_t)(uintptr_t)ret;
     uint64_t size = (uint64_t)(uintptr_t)user_data;
+    uint32_t caller = (uint32_t)(uintptr_t)drwrap_get_retaddr(wrapctx);
 
     void *drcontext = drwrap_get_drcontext(wrapctx);
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
-    memvis_push_ex(ring, ptr, (uint32_t)size, size,
-                   MEMVIS_EVENT_ALLOC, tid, seq);
+    memvis_push_alloc(ring, ptr, (uint32_t)size, size,
+                      MEMVIS_EVENT_ALLOC, tid, seq, caller);
     sync_head_cache(drcontext);
     atomic_fetch_add_explicit(&g_stat_allocs, 1, memory_order_relaxed);
 }
@@ -1624,14 +1625,15 @@ wrap_realloc_post(void *wrapctx, void *user_data)
     if (ret == NULL) return;
     uint64_t ptr  = (uint64_t)(uintptr_t)ret;
     uint64_t size = (uint64_t)(uintptr_t)user_data;
+    uint32_t caller = (uint32_t)(uintptr_t)drwrap_get_retaddr(wrapctx);
 
     void *drcontext = drwrap_get_drcontext(wrapctx);
     memvis_ring_header_t *ring = tls_ring(drcontext);
     if (!ring) return;
     uint16_t tid = tls_thread_id(drcontext);
     uint32_t seq = tls_next_seq(drcontext);
-    memvis_push_ex(ring, ptr, (uint32_t)size, size,
-                   MEMVIS_EVENT_ALLOC, tid, seq);
+    memvis_push_alloc(ring, ptr, (uint32_t)size, size,
+                      MEMVIS_EVENT_ALLOC, tid, seq, caller);
     sync_head_cache(drcontext);
     atomic_fetch_add_explicit(&g_stat_allocs, 1, memory_order_relaxed);
 }
@@ -1670,6 +1672,28 @@ try_wrap_one(const module_data_t *mod, const char *sym, int kind)
     case 3: drwrap_wrap(func_pc, wrap_realloc_pre, wrap_realloc_post); break;
     }
     dr_printf("memvis: wrapped %s @ %p\n", sym, (void *)func_pc);
+}
+
+/* Known application-level allocator wrappers (same ABI as libc).
+ * wrapping these in addition to libc gives us the outermost caller RIP;
+ * e.g. dictAddRaw instead of zmalloc internals. drwrap fires
+ * inner-to-outer for nested wrappers, so the outermost event's rip_lo
+ * wins in the engine (last-write-wins on same ptr). */
+static const char *g_app_alloc_prefixes[] = {
+    "zmalloc", "zfree", "zcalloc", "zrealloc",
+    "ztrymalloc", "ztryrealloc",
+    "g_malloc", "g_free", "g_realloc",
+    "xmalloc", "xfree", "xrealloc", "xcalloc",
+    NULL
+};
+
+static int
+alloc_kind_from_name(const char *sym)
+{
+    if (strstr(sym, "realloc")) return 3;
+    if (strstr(sym, "calloc"))  return 2;
+    if (strstr(sym, "free"))    return 1;
+    return 0; /* malloc / alloc */
 }
 
 static void
@@ -1744,6 +1768,24 @@ event_module_load(void *drcontext, const module_data_t *info, bool loaded)
                         strstr(name, "tcmalloc") != NULL ||
                         strstr(name, "mimalloc") != NULL)) {
         wrap_alloc_funcs_foreign(info, name);
+    } else if (name && !is_system_module(name)) {
+        /* scan non-system modules for application-level allocator wrappers */
+        for (const char **p = g_app_alloc_prefixes; *p; p++) {
+            size_t offset;
+            drsym_error_t err = drsym_lookup_symbol(
+                info->full_path, *p, &offset, DRSYM_DEFAULT_FLAGS);
+            if (err != DRSYM_SUCCESS) continue;
+            app_pc func_pc = info->start + offset;
+            int kind = alloc_kind_from_name(*p);
+            switch (kind) {
+            case 0: drwrap_wrap(func_pc, wrap_malloc_pre, wrap_malloc_post); break;
+            case 1: drwrap_wrap(func_pc, wrap_free_pre, NULL); break;
+            case 2: drwrap_wrap(func_pc, wrap_calloc_pre, wrap_malloc_post); break;
+            case 3: drwrap_wrap(func_pc, wrap_realloc_pre, wrap_realloc_post); break;
+            }
+            dr_printf("memvis: wrapped app allocator %s @ %p (kind=%d) in %s\n",
+                      *p, (void *)func_pc, kind, name);
+        }
     }
 
     /* record all non-system modules in sidecar table */
