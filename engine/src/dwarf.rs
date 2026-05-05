@@ -465,7 +465,7 @@ pub struct ContainerOfEntry {
 /// resolve_deep by jumping directly to the target DIE.
 #[derive(Debug, Clone)]
 pub struct NameAccelerator {
-    /// struct/union name → list of (CU offset in .debug_info, DIE offset within CU)
+    /// struct/union name -> list of (CU offset in .debug_info, DIE offset within CU)
     pub type_entries: HashMap<String, Vec<(usize, usize)>>,
 }
 
