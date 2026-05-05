@@ -1,6 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// dwarf parser. extracts globals, subprograms, locals from elf.
-// single pass over compilation units. all allocations at startup.
+// Dwarf parser. Extracts globals, subprograms, locals from elf.
 
 use gimli::{
     AttributeValue, DebugInfoOffset, DebugNames, DebugStr, DebuggingInformationEntry, Dwarf,
@@ -553,6 +552,118 @@ pub struct LibDwarf {
     pub functions: BTreeMap<u64, FunctionMeta>,
 }
 
+/// alloc-site type oracle: stamp heap allocations at birth.
+/// two-tier lookup: unique-size types are O(1), ambiguous sizes
+/// fall back to caller-RIP function-scope pointer-local disambiguation.
+pub struct AllocSiteOracle {
+    /// size -> type for sizes that map to exactly one struct
+    unique: HashMap<u64, TypeInfo>,
+    /// size -> candidate types for ambiguous sizes
+    ambiguous: HashMap<u64, Vec<TypeInfo>>,
+    /// (func_low_pc, func_high_pc, alloc_size) → type, built from
+    /// function locals that are pointers to structs
+    callsite: Vec<(u64, u64, u64, TypeInfo)>,
+}
+
+impl AllocSiteOracle {
+    pub fn build(
+        registry: &HashMap<String, TypeInfo>,
+        functions: &BTreeMap<u64, FunctionMeta>,
+    ) -> Self {
+        // group struct types by byte_size. only include types with fields —
+        // bare arrays (char[6]) and opaque typedefs have no structure worth stamping.
+        let mut by_size: HashMap<u64, Vec<&TypeInfo>> = HashMap::new();
+        for ti in registry.values() {
+            if ti.is_pointer || ti.byte_size == 0 || ti.name.is_empty() || ti.fields.is_empty() {
+                continue;
+            }
+            by_size.entry(ti.byte_size).or_default().push(ti);
+        }
+
+        let mut unique = HashMap::new();
+        let mut ambiguous = HashMap::new();
+        for (size, types) in &by_size {
+            if types.len() == 1 {
+                unique.insert(*size, types[0].clone());
+            } else {
+                ambiguous.insert(*size, types.iter().map(|t| (*t).clone()).collect());
+            }
+        }
+
+        // callsite disambiguation: for each function, collect pointer-to-struct
+        // locals/params. handles *T and **T (allocator out-params).
+        let mut callsite = Vec::new();
+        for func in functions.values() {
+            let mut local_types: HashMap<u64, Vec<&TypeInfo>> = HashMap::new();
+            for local in &func.locals {
+                if !local.type_info.is_pointer {
+                    continue;
+                }
+                // strip one or two levels of pointer indirection: *T or **T → T
+                let raw = local.type_info.name.strip_prefix('*').unwrap_or("");
+                let pointee_name = raw.strip_prefix('*').unwrap_or(raw);
+                if pointee_name.is_empty() { continue; }
+                if let Some(ti) = registry.get(pointee_name) {
+                    if ti.byte_size > 0 && !ti.is_pointer {
+                        local_types.entry(ti.byte_size).or_default().push(ti);
+                    }
+                }
+            }
+            for (size, types) in local_types {
+                // only useful for ambiguous sizes where this function narrows to one
+                if !ambiguous.contains_key(&size) {
+                    continue;
+                }
+                // deduplicate by type name
+                let mut seen = HashSet::new();
+                let deduped: Vec<_> = types.into_iter().filter(|t| seen.insert(&t.name)).collect();
+                if deduped.len() == 1 {
+                    callsite.push((func.low_pc, func.high_pc, size, deduped[0].clone()));
+                }
+            }
+        }
+
+        let unique_count = unique.len();
+        let ambig_count = ambiguous.len();
+        let callsite_count = callsite.len();
+        eprintln!(
+            "dwarf: alloc-site oracle: {} unique-size types, {} ambiguous sizes, {} callsite disambiguations",
+            unique_count, ambig_count, callsite_count
+        );
+        Self { unique, ambiguous, callsite }
+    }
+
+    /// Resolve alloc to type.
+    /// Tries unique size first (O(1)), then callsite disambiguation
+    /// using each provided ELF-relative caller RIP (walk up the stack
+    /// past allocator wrappers like zmalloc->malloc).
+    #[inline]
+    pub fn resolve(&self, alloc_size: u64, caller_pcs: &[u64]) -> Option<&TypeInfo> {
+        if let Some(ti) = self.unique.get(&alloc_size) {
+            return Some(ti);
+        }
+        if !self.ambiguous.contains_key(&alloc_size) {
+            return None;
+        }
+        for &pc in caller_pcs {
+            for &(lo, hi, sz, ref ti) in &self.callsite {
+                if sz == alloc_size && pc >= lo && pc < hi {
+                    return Some(ti);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn empty() -> Self {
+        Self { unique: HashMap::new(), ambiguous: HashMap::new(), callsite: Vec::new() }
+    }
+
+    pub fn unique_count(&self) -> usize { self.unique.len() }
+    pub fn ambiguous_count(&self) -> usize { self.ambiguous.len() }
+    pub fn callsite_count(&self) -> usize { self.callsite.len() }
+}
+
 pub struct DwarfInfo {
     pub globals: Vec<GlobalVar>,
     pub functions: BTreeMap<u64, FunctionMeta>,
@@ -563,6 +674,7 @@ pub struct DwarfInfo {
     pub container_of_map: HashMap<String, Vec<ContainerOfEntry>>,
     pub name_accel: Option<NameAccelerator>,
     pub lib_globals: Vec<LibDwarf>,
+    pub alloc_oracle: AllocSiteOracle,
 }
 
 impl DwarfInfo {
@@ -942,6 +1054,9 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
 
     let name_accel = NameAccelerator::build(&file_data);
 
+    // placeholder oracle; rebuilt after lib merge enriches the registry
+    let alloc_oracle = AllocSiteOracle { unique: HashMap::new(), ambiguous: HashMap::new(), callsite: Vec::new() };
+
     let mut info = DwarfInfo {
         globals,
         functions,
@@ -952,10 +1067,14 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         container_of_map,
         name_accel,
         lib_globals: Vec::new(),
+        alloc_oracle,
     };
 
     // merge types + globals + functions from DT_NEEDED shared libraries (works from disk, no live process)
     merge_needed_libs(&mut info);
+
+    // build oracle after lib merge so all types are available
+    info.alloc_oracle = AllocSiteOracle::build(&info.type_registry, &info.functions);
 
     Ok(info)
 }
@@ -2297,6 +2416,7 @@ mod tests {
             elf_path: String::new(),
             name_accel: None,
             lib_globals: Vec::new(),
+            alloc_oracle: AllocSiteOracle::empty(),
         };
 
         info.patch_shallow_fields(&mut parent);
