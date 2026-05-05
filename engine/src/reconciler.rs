@@ -7,6 +7,8 @@ use std::fs::File;
 use std::io;
 use std::os::unix::fs::FileExt;
 
+use arrayvec::ArrayVec;
+
 use crate::dwarf::{self, DwarfInfo, TypeInfo};
 use crate::heap_graph::{HeapGraph, HeapOracle};
 use crate::index::{AddressIndex, FrameId, NodeId};
@@ -465,12 +467,56 @@ pub fn process_event(
         EVENT_ALLOC => {
             let ptr = ev.addr;
             let size = ev.size as u64;
-            if let Some(old_size) = world.heap_allocs.on_alloc(ptr, size) {
-                world.stm.purge_range(ptr, old_size);
-                heap_graph.on_free(ptr, old_size);
+            let is_duplicate = match world.heap_allocs.on_alloc(ptr, size) {
+                Some(old_size) if old_size == size => true,  // nested wrapper (zmalloc→malloc)
+                Some(old_size) => {
+                    world.stm.purge_range(ptr, old_size);
+                    heap_graph.on_free(ptr, old_size);
+                    false
+                }
+                None => false,
+            };
+            if !is_duplicate {
+                if let Some(ref mut ts) = topo {
+                    ts.emit_alloc(ev.seq32() as u64, ev.thread_id, ptr, size);
+                }
             }
-            if let Some(ref mut ts) = topo {
-                ts.emit_alloc(ev.seq32() as u64, ev.thread_id, ptr, size);
+            // alloc-site type oracle: stamp at birth.
+            // build caller PC stack: rip_lo (malloc's caller, e.g. zmalloc) +
+            // shadow stack frames (application callers above allocator wrappers).
+            if let (Some(ref mut info), Some(delta)) = (dwarf_info, *relocation_delta) {
+                let delta_lo = delta & 0xFFFF_FFFF;
+                let mut caller_pcs = ArrayVec::<u64, 8>::new();
+                if ev.rip_lo != 0 {
+                    caller_pcs.push((ev.rip_lo as u64).wrapping_sub(delta_lo));
+                }
+                if let Some(stack) = stacks.get(&ev.thread_id) {
+                    for frame in stack.frames.iter().rev().take(6) {
+                        if caller_pcs.is_full() { break; }
+                        let elf_pc = frame.callee_pc.wrapping_sub(delta);
+                        if !caller_pcs.contains(&elf_pc) {
+                            caller_pcs.push(elf_pc);
+                        }
+                    }
+                }
+                if let Some(ti) = info.alloc_oracle.resolve(size, &caller_pcs).cloned() {
+                    let source_pc = caller_pcs.first().copied().unwrap_or(0);
+                    let source = format!("alloc@{:#x}", source_pc);
+                    let stamp_res = world.stm.stamp_type(ptr, &ti, &source, ev.seq32() as u64);
+                    if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
+                        orch.bloom_insert(ptr);
+                        world.stm.retrospective_scan(
+                            ptr, heap_graph, &world.heap_allocs,
+                            &info.type_registry, ev.seq32() as u64,
+                        );
+                        if let Some(ref mut ts) = topo {
+                            ts.emit_stamp(
+                                ev.seq32() as u64, ptr, &ti.name,
+                                ti.byte_size, &source, ti.fields.len(),
+                            );
+                        }
+                    }
+                }
             }
             true
         }
@@ -1446,6 +1492,7 @@ mod tests {
             elf_path: String::new(),
             name_accel: None,
             lib_globals: Vec::new(),
+            alloc_oracle: dwarf::AllocSiteOracle::empty(),
         };
         let f = std::fs::File::open(path).unwrap();
         (f, info)
