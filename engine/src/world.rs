@@ -426,6 +426,7 @@ pub enum StampResult {
     Schism {
         old_type: String,
         old_source: String,
+        old_stamp_seq: u64,
     },
     /// stamp rejected (null addr or zero-size type)
     Rejected,
@@ -466,6 +467,7 @@ impl ShadowTypeMap {
                 StampResult::Schism {
                     old_type: existing.type_info.name.clone(),
                     old_source: existing.source_name.clone(),
+                    old_stamp_seq: existing.stamp_seq,
                 }
             } else {
                 StampResult::Restamped
@@ -636,6 +638,123 @@ impl ShadowTypeMap {
         }
         stamped
     }
+}
+
+// Type epoch log: captures the full lifecycle of typed heap regions.
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpochClose {
+    Free,
+    Realloc,
+    Schism,
+}
+
+#[derive(Debug, Clone)]
+pub struct TypeEpoch {
+    pub addr: u64,
+    pub size: u64,
+    pub type_name: String,
+    pub source: String,
+    pub open_seq: u64,
+    pub close_seq: u64,
+    pub close_reason: EpochClose,
+}
+
+pub struct TypeEpochLog {
+    buf: Vec<TypeEpoch>,
+    cap: usize,
+    head: usize, // next write position
+    len: usize,
+    pub total_closed: u64,
+}
+
+impl TypeEpochLog {
+    pub fn new(cap: usize) -> Self {
+        Self {
+            buf: Vec::with_capacity(cap.min(1024)),
+            cap,
+            head: 0,
+            len: 0,
+            total_closed: 0,
+        }
+    }
+
+    #[inline]
+    pub fn close_epoch(
+        &mut self,
+        addr: u64,
+        size: u64,
+        proj: &TypeProjection,
+        close_seq: u64,
+        reason: EpochClose,
+    ) {
+        let epoch = TypeEpoch {
+            addr,
+            size,
+            type_name: proj.type_info.name.clone(),
+            source: proj.source_name.clone(),
+            open_seq: proj.stamp_seq,
+            close_seq,
+            close_reason: reason,
+        };
+        if self.buf.len() < self.cap {
+            self.buf.push(epoch);
+        } else {
+            self.buf[self.head] = epoch;
+        }
+        self.head = (self.head + 1) % self.cap;
+        self.len = (self.len + 1).min(self.cap);
+        self.total_closed += 1;
+    }
+
+    pub fn query(&self, addr: u64, seq: u64) -> Option<&TypeEpoch> {
+        self.iter().find(|e| e.addr == addr && seq >= e.open_seq && seq < e.close_seq)
+    }
+
+    pub fn history(&self, addr: u64) -> Vec<&TypeEpoch> {
+        self.iter().filter(|e| e.addr == addr).collect()
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = &TypeEpoch> {
+        // ring buffer iteration: oldest to newest
+        let (a, b) = if self.buf.len() < self.cap {
+            (self.buf.as_slice(), &[] as &[TypeEpoch])
+        } else {
+            let (tail, head) = self.buf.split_at(self.head);
+            (head, tail)
+        };
+        a.iter().chain(b.iter())
+    }
+
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    pub fn summary(&self) -> BTreeMap<String, EpochStats> {
+        let mut out: BTreeMap<String, EpochStats> = BTreeMap::new();
+        for e in self.iter() {
+            let s = out.entry(e.type_name.clone()).or_insert(EpochStats {
+                count: 0,
+                total_lifetime: 0,
+                by_reason: [0; 3],
+            });
+            s.count += 1;
+            s.total_lifetime += e.close_seq.saturating_sub(e.open_seq);
+            s.by_reason[e.close_reason as usize] += 1;
+        }
+        out
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EpochStats {
+    pub count: u64,
+    pub total_lifetime: u64,
+    pub by_reason: [u64; 3], // [Free, Realloc, Schism]
 }
 
 #[derive(Debug, Clone)]
@@ -950,6 +1069,7 @@ pub struct WorldState {
     pub field_heatmap: FieldHeatmap,
     pub bb_hits: HashMap<u32, u64>,
     pub type_stability: TypeStabilityMonitor,
+    pub type_epochs: TypeEpochLog,
 }
 
 impl WorldState {
@@ -964,6 +1084,7 @@ impl WorldState {
             field_heatmap: FieldHeatmap::new(),
             bb_hits: HashMap::new(),
             type_stability: TypeStabilityMonitor::new(),
+            type_epochs: TypeEpochLog::new(65536),
         }
     }
 
@@ -1779,5 +1900,129 @@ mod tests {
         assert_eq!(ss.depth(), 0);
         assert_eq!(ss.non_local_jumps, 1);
         assert_eq!(ss.mismatches, 0);
+    }
+
+    // -- type epoch log tests --
+
+    fn make_proj(addr: u64, name: &str, source: &str, seq: u64) -> TypeProjection {
+        TypeProjection {
+            base_addr: addr,
+            type_info: ti(name, 24, false),
+            source_name: source.into(),
+            stamp_seq: seq,
+        }
+    }
+
+    #[test]
+    fn test_epoch_free_lifecycle() {
+        let mut log = TypeEpochLog::new(64);
+        let proj = make_proj(0x1000, "dictEntry", "alloc@0x42", 100);
+        log.close_epoch(0x1000, 24, &proj, 500, EpochClose::Free);
+
+        assert_eq!(log.len(), 1);
+        assert_eq!(log.total_closed, 1);
+
+        let e = log.iter().next().unwrap();
+        assert_eq!(e.addr, 0x1000);
+        assert_eq!(e.type_name, "dictEntry");
+        assert_eq!(e.open_seq, 100);
+        assert_eq!(e.close_seq, 500);
+        assert_eq!(e.close_reason, EpochClose::Free);
+    }
+
+    #[test]
+    fn test_epoch_realloc_lifecycle() {
+        let mut log = TypeEpochLog::new(64);
+        let proj = make_proj(0x2000, "sds", "alloc@0x10", 50);
+        log.close_epoch(0x2000, 32, &proj, 200, EpochClose::Realloc);
+
+        let e = log.iter().next().unwrap();
+        assert_eq!(e.close_reason, EpochClose::Realloc);
+        assert_eq!(e.size, 32);
+    }
+
+    #[test]
+    fn test_epoch_schism_lifecycle() {
+        let mut log = TypeEpochLog::new(64);
+        let proj = make_proj(0x3000, "listNode", "server.db", 10);
+        log.close_epoch(0x3000, 24, &proj, 80, EpochClose::Schism);
+
+        let e = log.iter().next().unwrap();
+        assert_eq!(e.close_reason, EpochClose::Schism);
+        assert_eq!(e.type_name, "listNode");
+    }
+
+    #[test]
+    fn test_epoch_query() {
+        let mut log = TypeEpochLog::new(64);
+        let p1 = make_proj(0x1000, "A", "s1", 100);
+        log.close_epoch(0x1000, 24, &p1, 200, EpochClose::Free);
+        let p2 = make_proj(0x1000, "B", "s2", 300);
+        log.close_epoch(0x1000, 24, &p2, 500, EpochClose::Free);
+
+        // seq 150 falls in first epoch [100, 200)
+        let r = log.query(0x1000, 150).unwrap();
+        assert_eq!(r.type_name, "A");
+
+        // seq 400 falls in second epoch [300, 500)
+        let r = log.query(0x1000, 400).unwrap();
+        assert_eq!(r.type_name, "B");
+
+        // seq 250 falls between epochs — no match
+        assert!(log.query(0x1000, 250).is_none());
+
+        // wrong address — no match
+        assert!(log.query(0x2000, 150).is_none());
+    }
+
+    #[test]
+    fn test_epoch_history() {
+        let mut log = TypeEpochLog::new(64);
+        let p1 = make_proj(0x1000, "A", "s1", 10);
+        log.close_epoch(0x1000, 24, &p1, 20, EpochClose::Free);
+        let p2 = make_proj(0x1000, "B", "s2", 30);
+        log.close_epoch(0x1000, 24, &p2, 40, EpochClose::Free);
+        let p3 = make_proj(0x2000, "C", "s3", 50);
+        log.close_epoch(0x2000, 24, &p3, 60, EpochClose::Free);
+
+        let h = log.history(0x1000);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0].type_name, "A");
+        assert_eq!(h[1].type_name, "B");
+    }
+
+    #[test]
+    fn test_epoch_ring_overflow() {
+        let cap = 4;
+        let mut log = TypeEpochLog::new(cap);
+        for i in 0..6u64 {
+            let p = make_proj(0x1000 + i * 0x100, &format!("T{}", i), "src", i * 10);
+            log.close_epoch(0x1000 + i * 0x100, 24, &p, i * 10 + 5, EpochClose::Free);
+        }
+
+        // ring holds last 4
+        assert_eq!(log.len(), 4);
+        assert_eq!(log.total_closed, 6);
+
+        let names: Vec<&str> = log.iter().map(|e| e.type_name.as_str()).collect();
+        assert_eq!(names, vec!["T2", "T3", "T4", "T5"]);
+    }
+
+    #[test]
+    fn test_epoch_summary() {
+        let mut log = TypeEpochLog::new(64);
+        for i in 0..3u64 {
+            let p = make_proj(0x1000 * (i + 1), "dictEntry", "alloc", i * 100);
+            log.close_epoch(0x1000 * (i + 1), 24, &p, i * 100 + 50, EpochClose::Free);
+        }
+        let p = make_proj(0x5000, "dictEntry", "alloc", 400);
+        log.close_epoch(0x5000, 24, &p, 500, EpochClose::Realloc);
+
+        let s = log.summary();
+        let stats = s.get("dictEntry").unwrap();
+        assert_eq!(stats.count, 4);
+        assert_eq!(stats.by_reason[EpochClose::Free as usize], 3);
+        assert_eq!(stats.by_reason[EpochClose::Realloc as usize], 1);
+        assert_eq!(stats.total_lifetime, 50 * 3 + 100); // 3×50 + 1×100
     }
 }
