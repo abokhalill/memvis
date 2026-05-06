@@ -18,8 +18,8 @@ MEMORY MAP
   ── cacheline 0x7b6201bfe000 ──
   7b6201bfe018     8B      g_head               *node           val= 7b6201c00320  → 0x7b6201c00320
   7b6201bfe020     8B      g_tail               *node           val= 7b6201c00380  → 0x7b6201c00380
-                   ▲          ▲                ▲                         ▲
-                   │          │                │                         │
+                   ▲          ▲                   ▲                      ▲
+                   │          │                   │                      │
                  size    DWARF variable     DWARF type          heap address this
                          name from debug   resolved from       pointer targets ──┐
                          info              struct definition                     │
