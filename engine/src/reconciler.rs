@@ -15,7 +15,7 @@ use crate::index::{AddressIndex, FrameId, NodeId};
 use crate::ring::{Event, RingOrchestrator};
 use crate::shadow_regs::ShadowRegisterFile;
 use crate::topology::TopologyStream;
-use crate::world::{HazardKind, ShadowStack, StampResult, WorldState, REG_COUNT};
+use crate::world::{EpochClose, HazardKind, ShadowStack, StampResult, WorldState, REG_COUNT};
 
 pub const EVENT_WRITE: u8 = 0;
 pub const EVENT_READ: u8 = 1;
@@ -304,7 +304,17 @@ pub fn process_event(
                                         ev.seq32() as u64,
                                     );
                                     match &stamp_res {
-                                        StampResult::Schism { old_type, old_source } => {
+                                        StampResult::Schism { old_type, old_source, old_stamp_seq } => {
+                                            // close prior epoch before the new type takes over
+                                            if let Some(alloc_size) = world.heap_allocs.alloc_size(ev.value) {
+                                                let fake_proj = crate::world::TypeProjection {
+                                                    base_addr: ev.value,
+                                                    type_info: TypeInfo { name: old_type.clone(), byte_size: alloc_size, fields: vec![], is_pointer: false, is_volatile: false, is_atomic: false, shallow: false },
+                                                    source_name: old_source.clone(),
+                                                    stamp_seq: *old_stamp_seq,
+                                                };
+                                                world.type_epochs.close_epoch(ev.value, alloc_size, &fake_proj, ev.seq32() as u64, EpochClose::Schism);
+                                            }
                                             eprintln!(
                                                 "memvis: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
                                                 ev.value, patched.name, h_name, old_type, old_source
@@ -318,6 +328,7 @@ pub fn process_event(
                                                     old_source,
                                                     &h_name,
                                                 );
+                                                ts.emit_type_epoch_close(ev.seq32() as u64, ev.value, old_type, old_source, *old_stamp_seq, ev.seq32() as u64, "schism");
                                             }
                                         }
                                         _ => {}
@@ -470,6 +481,14 @@ pub fn process_event(
             let is_duplicate = match world.heap_allocs.on_alloc(ptr, size) {
                 Some(old_size) if old_size == size => true,  // nested wrapper (zmalloc→malloc)
                 Some(old_size) => {
+                    // realloc at same address with different size; close prior epoch
+                    if let Some(proj) = world.stm.lookup(ptr).cloned() {
+                        let seq = ev.seq32() as u64;
+                        world.type_epochs.close_epoch(ptr, old_size, &proj, seq, EpochClose::Realloc);
+                        if let Some(ref mut ts) = topo {
+                            ts.emit_type_epoch_close(seq, ptr, &proj.type_info.name, &proj.source_name, proj.stamp_seq, seq, "realloc");
+                        }
+                    }
                     world.stm.purge_range(ptr, old_size);
                     heap_graph.on_free(ptr, old_size);
                     false
@@ -524,6 +543,14 @@ pub fn process_event(
             let ptr = ev.addr;
             let freed_size = world.heap_allocs.on_free(ptr);
             if let Some(old_size) = freed_size {
+                // close type epoch before purge destroys the projection
+                if let Some(proj) = world.stm.lookup(ptr).cloned() {
+                    let seq = ev.seq32() as u64;
+                    world.type_epochs.close_epoch(ptr, old_size, &proj, seq, EpochClose::Free);
+                    if let Some(ref mut ts) = topo {
+                        ts.emit_type_epoch_close(seq, ptr, &proj.type_info.name, &proj.source_name, proj.stamp_seq, seq, "free");
+                    }
+                }
                 world.stm.purge_range(ptr, old_size);
                 heap_graph.on_free(ptr, old_size);
                 if let Some(ref mut ts) = topo {
@@ -907,15 +934,23 @@ impl WarmScanner {
             let stamp_res = world
                 .stm
                 .stamp_type(target_addr, &pointee_ti, &source_name, 0);
-            if matches!(stamp_res, StampResult::Schism { .. }) {
-                if let StampResult::Schism { ref old_type, ref old_source } = stamp_res {
-                    eprintln!(
-                        "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
-                        target_addr, pointee_ti.name, source_name, old_type, old_source
-                    );
-                    if let Some(ref mut ts) = topo {
-                        ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
-                    }
+            if let StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } = stamp_res {
+                eprintln!(
+                    "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                    target_addr, pointee_ti.name, source_name, old_type, old_source
+                );
+                if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
+                    let fake_proj = crate::world::TypeProjection {
+                        base_addr: target_addr,
+                        type_info: TypeInfo { name: old_type.clone(), byte_size: alloc_size, fields: vec![], is_pointer: false, is_volatile: false, is_atomic: false, shallow: false },
+                        source_name: old_source.clone(),
+                        stamp_seq: old_stamp_seq,
+                    };
+                    world.type_epochs.close_epoch(target_addr, alloc_size, &fake_proj, 0, EpochClose::Schism);
+                }
+                if let Some(ref mut ts) = topo {
+                    ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
+                    ts.emit_type_epoch_close(0, target_addr, old_type, old_source, old_stamp_seq, 0, "schism");
                 }
             }
             if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
@@ -1013,15 +1048,23 @@ pub fn warm_scan(
         let stamp_res = world
             .stm
             .stamp_type(target_addr, &pointee_ti, &source_name, 0);
-        if matches!(stamp_res, StampResult::Schism { .. }) {
-            if let StampResult::Schism { ref old_type, ref old_source } = stamp_res {
-                eprintln!(
-                    "memvis: TYPE_SCHISM (legacy warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
-                    target_addr, pointee_ti.name, source_name, old_type, old_source
-                );
-                if let Some(ref mut ts) = topo {
-                    ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
-                }
+        if let StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } = stamp_res {
+            eprintln!(
+                "memvis: TYPE_SCHISM (legacy warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                target_addr, pointee_ti.name, source_name, old_type, old_source
+            );
+            if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
+                let fake_proj = crate::world::TypeProjection {
+                    base_addr: target_addr,
+                    type_info: TypeInfo { name: old_type.clone(), byte_size: alloc_size, fields: vec![], is_pointer: false, is_volatile: false, is_atomic: false, shallow: false },
+                    source_name: old_source.clone(),
+                    stamp_seq: old_stamp_seq,
+                };
+                world.type_epochs.close_epoch(target_addr, alloc_size, &fake_proj, 0, EpochClose::Schism);
+            }
+            if let Some(ref mut ts) = topo {
+                ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
+                ts.emit_type_epoch_close(0, target_addr, old_type, old_source, old_stamp_seq, 0, "schism");
             }
         }
         if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
