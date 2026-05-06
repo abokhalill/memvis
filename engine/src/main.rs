@@ -1129,6 +1129,7 @@ fn run_headless(
                     &world.hazards,
                     &world.field_heatmap,
                     &world.type_stability,
+                    &world.type_epochs,
                     journal,
                     *total,
                     orch,
@@ -1295,6 +1296,7 @@ fn headless_render(
     hazards: &[memvis::world::HeapHazard],
     field_heatmap: &memvis::world::FieldHeatmap,
     type_stability: &memvis::world::TypeStabilityMonitor,
+    type_epochs: &memvis::world::TypeEpochLog,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -1574,6 +1576,28 @@ fn headless_render(
             "\n\u{2705} TYPE STABILITY: {} writes checked, 0 violations",
             type_stability.total_checked,
         );
+    }
+
+    // type epoch summary
+    if !type_epochs.is_empty() {
+        let _ = writeln!(
+            out,
+            "\nTYPE EPOCHS ({} closed, {} in log)",
+            type_epochs.total_closed,
+            type_epochs.len(),
+        );
+        let summary = type_epochs.summary();
+        let mut sorted: Vec<_> = summary.iter().collect();
+        sorted.sort_by(|a, b| b.1.count.cmp(&a.1.count));
+        for (tn, s) in sorted.iter().take(20) {
+            let avg = if s.count > 0 { s.total_lifetime / s.count } else { 0 };
+            let _ = writeln!(
+                out,
+                "  {:<30} epochs={:<6} avg_life={:<8} free={} realloc={} schism={}",
+                tn, s.count, avg,
+                s.by_reason[0], s.by_reason[1], s.by_reason[2],
+            );
+        }
     }
 
     // field heatmap: top writes + contention report
@@ -1922,6 +1946,7 @@ fn run_replay(
         &world.hazards,
         &world.field_heatmap,
         &world.type_stability,
+        &world.type_epochs,
         &journal,
         total,
         &orch,
