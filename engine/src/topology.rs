@@ -261,6 +261,25 @@ impl TopologyStream {
         self.lines += 1;
     }
 
+    #[allow(clippy::too_many_arguments)]
+    pub fn emit_type_epoch_close(
+        &mut self,
+        seq: u64,
+        addr: u64,
+        type_name: &str,
+        source: &str,
+        open_seq: u64,
+        close_seq: u64,
+        reason: &str,
+    ) {
+        let _ = writeln!(
+            self.w,
+            r#"{{"seq":{},"type":"TYPE_EPOCH_CLOSE","addr":"0x{:x}","type_name":"{}","source":"{}","open_seq":{},"close_seq":{},"reason":"{}"}}"#,
+            seq, addr, esc(type_name), esc(source), open_seq, close_seq, reason
+        );
+        self.lines += 1;
+    }
+
     pub fn emit_summary(
         &mut self,
         total_events: u64,
