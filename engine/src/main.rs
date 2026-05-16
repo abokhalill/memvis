@@ -339,6 +339,8 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
             &mut topo,
             no_bb,
         );
+        eprintln!("memvis: indirect registrations={} stamps={} map_size={}",
+            world.stm.indirect_registrations, world.stm.indirect_stamps, world.stm.indirect_len());
         if let Some(ref mut ts) = topo {
             ts.emit_summary(
                 total,
@@ -388,7 +390,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     let mut last_discovery = time::Instant::now();
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
-    let mut warm_idle_rounds: u32 = 0;
+    let mut last_reseed_total: u64 = 0;
     let mut child_tracker = ChildProcessTracker::new();
 
     loop {
@@ -403,6 +405,13 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
             if child_tracker.root_pid.is_none() {
                 if let Some(pid) = orch.target_pid() {
                     child_tracker.set_root_pid(pid);
+                }
+            }
+            if world.proc_mem.is_none() {
+                if let Some(pid) = orch.target_pid() {
+                    if let Ok(f) = std::fs::File::open(format!("/proc/{}/mem", pid)) {
+                        world.proc_mem = Some(f);
+                    }
                 }
             }
             child_tracker.discover();
@@ -679,44 +688,38 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                             }
                         }
                     });
-                    scanner.seed(info, delta, &heap_oracle, &mut topo);
+                    scanner.seed(info, delta, &heap_oracle, &mut topo, &mut world.stm, &world.heap_allocs);
                     let _ = scanner.step(2000, info, &mut world, &heap_oracle, &mut topo);
                     eprintln!(
                         "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
                         scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
                     );
+                    last_reseed_total = total;
                 }
             }
 
-            if tick_events == 0 {
-                warm_idle_rounds += 1;
-            } else {
-                warm_idle_rounds = 0;
-            }
-            if relocation_delta.is_some() && total > 2_000_000 && warm_idle_rounds >= 5 {
-                if let (Some(ref info), Some(pid), Some(delta)) =
-                    (&dwarf_info, orch.target_pid(), relocation_delta)
+            // periodic warm-scan re-seed: every 200K events, re-read globals
+            // from /proc/pid/mem. target process may have initialized globals
+            // (e.g. server.db) after the initial seed at 100K events.
+            // event-count based, not wall-clock, so it works in both TUI and
+            // headless modes regardless of processing speed.
+            if warm_scanner.is_some()
+                && relocation_delta.is_some()
+                && total >= last_reseed_total + 200_000
+            {
+                last_reseed_total = total;
+                if let (Some(ref mut info), Some(_pid), Some(delta)) =
+                    (&mut dwarf_info, orch.target_pid(), relocation_delta)
                 {
-                    let scanner = warm_scanner.get_or_insert_with(|| {
-                        match reconciler::WarmScanner::new(pid, 12) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("memvis: warm-scan init failed: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    });
-                    if !scanner.seeded || scanner.is_idle() {
-                        scanner.seed(info, delta, &heap_oracle, &mut topo);
-                    }
-                    let stamps = scanner.step(500, info, &mut world, &heap_oracle, &mut topo);
-                    if stamps > 0 {
+                    let scanner = warm_scanner.as_mut().unwrap();
+                    let prev_stamps = scanner.stats.stamps_applied;
+                    scanner.seed(info, delta, &heap_oracle, &mut topo, &mut world.stm, &world.heap_allocs);
+                    let _ = scanner.step(2000, info, &mut world, &heap_oracle, &mut topo);
+                    let new_stamps = scanner.stats.stamps_applied - prev_stamps;
+                    if new_stamps > 0 {
                         eprintln!(
-                            "memvis: warm-scan pass={} stamps={} reads={} queue={}",
-                            scanner.passes,
-                            scanner.stats.stamps_applied,
-                            scanner.stats.reads,
-                            scanner.queue_len()
+                            "memvis: warm-scan reseed @{}: +{} stamps, {} total reads",
+                            total, new_stamps, scanner.stats.reads,
                         );
                     }
                 }
@@ -818,6 +821,7 @@ fn run_headless(
     let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
     let mut idle_rounds: u32 = 0;
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
+    let mut last_reseed_total: u64 = 0;
     let mut child_tracker = ChildProcessTracker::new();
     // two seq domains per thread (see seq_domain())
     let mut expected_seq: HashMap<(u16, u8), u32> = HashMap::new();
@@ -831,6 +835,13 @@ fn run_headless(
             if child_tracker.root_pid.is_none() {
                 if let Some(pid) = orch.target_pid() {
                     child_tracker.set_root_pid(pid);
+                }
+            }
+            if world.proc_mem.is_none() {
+                if let Some(pid) = orch.target_pid() {
+                    if let Ok(f) = std::fs::File::open(format!("/proc/{}/mem", pid)) {
+                        world.proc_mem = Some(f);
+                    }
                 }
             }
             child_tracker.discover();
@@ -1234,12 +1245,13 @@ fn run_headless(
                         }
                     }
                 });
-                scanner.seed(info, delta, heap_oracle, recorder_topo);
+                scanner.seed(info, delta, heap_oracle, recorder_topo, &mut world.stm, &world.heap_allocs);
                 let _ = scanner.step(2000, info, world, heap_oracle, recorder_topo);
                 eprintln!(
                     "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
                     scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
                 );
+                last_reseed_total = *total;
             }
         }
 
@@ -1248,31 +1260,26 @@ fn run_headless(
             world.cl_tracker_tick();
         }
 
-        if relocation_delta.is_some() && *total > 2_000_000 && drained == 0 && idle_rounds >= 5 {
-            if let (Some(ref info), Some(pid), Some(delta)) =
-                (&*dwarf_info, orch.target_pid(), *relocation_delta)
+        // periodic warm-scan re-seed: every 200K events, re-read globals
+        // from /proc/pid/mem. target process may have initialized globals
+        // (e.g. server.db) after the initial seed at 100K events.
+        if warm_scanner.is_some()
+            && relocation_delta.is_some()
+            && *total >= last_reseed_total + 200_000
+        {
+            last_reseed_total = *total;
+            if let (Some(ref mut info), Some(_pid), Some(delta)) =
+                (&mut *dwarf_info, orch.target_pid(), *relocation_delta)
             {
-                let scanner =
-                    warm_scanner.get_or_insert_with(|| {
-                        match reconciler::WarmScanner::new(pid, 12) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                eprintln!("memvis: warm-scan init failed: {}", e);
-                                std::process::exit(1);
-                            }
-                        }
-                    });
-                if !scanner.seeded || scanner.is_idle() {
-                    scanner.seed(info, delta, heap_oracle, recorder_topo);
-                }
-                let stamps = scanner.step(500, info, world, heap_oracle, recorder_topo);
-                if stamps > 0 {
+                let scanner = warm_scanner.as_mut().unwrap();
+                let prev_stamps = scanner.stats.stamps_applied;
+                scanner.seed(info, delta, heap_oracle, recorder_topo, &mut world.stm, &world.heap_allocs);
+                let _ = scanner.step(2000, info, world, heap_oracle, recorder_topo);
+                let new_stamps = scanner.stats.stamps_applied - prev_stamps;
+                if new_stamps > 0 {
                     eprintln!(
-                        "memvis: warm-scan pass={} stamps={} reads={} queue={}",
-                        scanner.passes,
-                        scanner.stats.stamps_applied,
-                        scanner.stats.reads,
-                        scanner.queue_len()
+                        "memvis: warm-scan reseed: +{} stamps, {} reads, {} queued",
+                        new_stamps, scanner.stats.reads, scanner.queue_len(),
                     );
                 }
             }
