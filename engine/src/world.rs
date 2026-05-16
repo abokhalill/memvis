@@ -434,14 +434,23 @@ pub enum StampResult {
 
 pub struct ShadowTypeMap {
     map: HashMap<u64, TypeProjection>,
+    // indirect element map: alloc base -> element TypeInfo.
+    // populated when a **T field write stores a pointer to an allocation;
+    // that allocation is known to hold *T values (e.g. dict.ht_table -> dictEntry*[]).
+    indirect: HashMap<u64, TypeInfo>,
     pub schism_count: u64,
+    pub indirect_stamps: u64,
+    pub indirect_registrations: u64,
 }
 
 impl Default for ShadowTypeMap {
     fn default() -> Self {
         Self {
             map: HashMap::with_capacity(256),
+            indirect: HashMap::with_capacity(64),
             schism_count: 0,
+            indirect_stamps: 0,
+            indirect_registrations: 0,
         }
     }
 }
@@ -486,8 +495,8 @@ impl ShadowTypeMap {
     }
 
     /// resolve *T->T on pointer field writes within stamped regions.
-    /// Freshness guard: skip propagation if the covering projection predates
-    /// the current allocation at write_value (stale stamp from freed+reused object).
+    /// also handles **T->register indirect element type on target alloc.
+    /// freshness guard: skip if covering projection predates alloc epoch.
     pub fn propagate_field_write(
         &mut self,
         write_addr: u64,
@@ -496,10 +505,23 @@ impl ShadowTypeMap {
         seq: u64,
         type_registry: &HashMap<String, TypeInfo>,
         alloc_tracker: &HeapAllocTracker,
-    ) {
+    ) -> bool {
         if write_size != 8 || write_value == 0 {
-            return;
+            return false;
         }
+
+        // path 1: write into a region with known indirect element type (e.g. bucket array)
+        // the written pointer value is *T; stamp it as T.
+        if let Some(element_ti) = self.indirect_lookup(write_addr, alloc_tracker) {
+            let res = self.stamp_type(write_value, &element_ti, "<indirect>", seq);
+            if matches!(res, StampResult::Stamped | StampResult::Schism { .. }) {
+                self.indirect_stamps += 1;
+                return true;
+            }
+            return false;
+        }
+
+        // path 2: write within a stamped struct's field
         let covering = self
             .map
             .iter()
@@ -510,14 +532,12 @@ impl ShadowTypeMap {
 
         let (base, stamp_seq, ti) = match covering {
             Some(x) => x,
-            None => return,
+            None => return false,
         };
 
-        // freshness guard: if the covering object's stamp predates the
-        // current allocation epoch at base, the projection is stale
         if let Some(alloc_seq) = alloc_tracker.alloc_seq(base) {
             if stamp_seq < alloc_seq {
-                return;
+                return false;
             }
         }
 
@@ -530,10 +550,53 @@ impl ShadowTypeMap {
             if field.type_info.is_pointer {
                 let pointee_name = field.type_info.name.strip_prefix('*').unwrap_or("");
                 if let Some(pointee_ti) = type_registry.get(pointee_name) {
-                    self.stamp_type(write_value, pointee_ti, &field.name, seq);
+                    // guard: don't create schisms from propagation; with event
+                    // loss the write_value may be stale/corrupt. only stamp
+                    // unstamped addresses or re-stamps of the same type.
+                    if let Some(existing) = self.map.get(&write_value) {
+                        if existing.type_info.name != pointee_ti.name {
+                            return false;
+                        }
+                    }
+                    let res = self.stamp_type(write_value, pointee_ti, &field.name, seq);
+                    if matches!(res, StampResult::Stamped | StampResult::Restamped) {
+                        return matches!(res, StampResult::Stamped);
+                    }
+                } else if pointee_name.starts_with('*') {
+                    // **T field: the written value is a pointer to an array of *T.
+                    // register the target allocation as holding T elements.
+                    let inner_name = pointee_name.strip_prefix('*').unwrap_or("");
+                    if let Some(inner_ti) = type_registry.get(inner_name) {
+                        self.indirect.insert(write_value, inner_ti.clone());
+                        self.indirect_registrations += 1;
+                    }
                 }
             }
         }
+        false
+    }
+
+    /// check if addr falls within an allocation whose base is registered in indirect map.
+    /// returns the element TypeInfo if so.
+    fn indirect_lookup(&self, addr: u64, alloc_tracker: &HeapAllocTracker) -> Option<TypeInfo> {
+        // find containing alloc, check if its base is in indirect map
+        let (base, size) = alloc_tracker.containing_alloc(addr)?;
+        if addr >= base + size {
+            return None;
+        }
+        self.indirect.get(&base).cloned()
+    }
+
+    /// register an indirect element type for an allocation base.
+    /// called externally when alloc-site or other mechanisms know the element type.
+    pub fn register_indirect(&mut self, alloc_base: u64, element_ti: TypeInfo) {
+        self.indirect.insert(alloc_base, element_ti);
+    }
+
+    /// purge indirect entries for freed range
+    pub fn purge_indirect(&mut self, addr: u64, size: u64) {
+        let hi = addr.saturating_add(size);
+        self.indirect.retain(|&base, _| base < addr || base >= hi);
     }
 
     pub fn lookup(&self, addr: u64) -> Option<&TypeProjection> {
@@ -548,6 +611,10 @@ impl ShadowTypeMap {
 
     pub fn len(&self) -> usize {
         self.map.len()
+    }
+
+    pub fn indirect_len(&self) -> usize {
+        self.indirect.len()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -566,8 +633,9 @@ impl ShadowTypeMap {
         before - self.map.len()
     }
 
-    /// bounded BFS from a freshly stamped address. reads last known pointer
-    /// values from HeapGraph fields to discover reachable typed structs.
+    /// bounded BFS from a freshly stamped address. reads pointer values from
+    /// HeapGraph first; falls back to /proc/pid/mem when HeapGraph has no data
+    /// (typical for fields written before the stamp, i.e. the temporal gap).
     pub fn retrospective_scan(
         &mut self,
         seed_addr: u64,
@@ -575,7 +643,9 @@ impl ShadowTypeMap {
         allocs: &HeapAllocTracker,
         type_registry: &HashMap<String, TypeInfo>,
         seq: u64,
+        mem: Option<&std::fs::File>,
     ) -> usize {
+        use std::os::unix::fs::FileExt;
         const FUEL: usize = 64;
         let mut queue: VecDeque<u64> = VecDeque::with_capacity(16);
         let mut visited: HashSet<u64> = HashSet::with_capacity(FUEL);
@@ -592,38 +662,70 @@ impl ShadowTypeMap {
                 Some(p) => p.type_info.clone(),
                 None => continue,
             };
+            // try HeapGraph for cached field values
+            let hg_obj = heap_graph.find_object_base(base).and_then(|hg_base| {
+                heap_graph.objects().get(&hg_base).map(|o| (hg_base, o))
+            });
 
-            let hg_base = match heap_graph.find_object_base(base) {
-                Some(b) => b,
-                None => continue,
-            };
-            let obj = match heap_graph.objects().get(&hg_base) {
-                Some(o) => o,
-                None => continue,
-            };
-            let delta = base.wrapping_sub(hg_base);
-
-            // collect candidates, sort by field name for deterministic BFS order
             let mut candidates: Vec<(&str, u64, &TypeInfo)> = Vec::new();
             for f in &proj.fields {
                 if !f.type_info.is_pointer || f.byte_size != 8 {
                     continue;
                 }
-                let hg_offset = delta + f.byte_offset;
-                let field_val = match obj.fields.get(&hg_offset) {
-                    Some(fi) if fi.last_value != 0 => fi.last_value,
-                    _ => continue,
+                // read field value: HeapGraph first, then /proc/pid/mem fallback
+                let field_addr = base.wrapping_add(f.byte_offset);
+                let field_val = if let Some((hg_base, obj)) = &hg_obj {
+                    let delta = base.wrapping_sub(*hg_base);
+                    let hg_offset = delta + f.byte_offset;
+                    obj.fields.get(&hg_offset)
+                        .map(|fi| fi.last_value)
+                        .filter(|&v| v != 0)
+                } else {
+                    None
                 };
-                if self.map.contains_key(&field_val) {
-                    continue;
-                }
-                if allocs.alloc_size(field_val).is_none() {
-                    continue;
-                }
+                // mem fallback: field not in HeapGraph (pre-stamp write)
+                let field_val = match field_val {
+                    Some(v) => v,
+                    None => {
+                        match mem {
+                            Some(m) => {
+                                let mut buf = [0u8; 8];
+                                match m.read_at(&mut buf, field_addr) {
+                                    Ok(8) => {
+                                        let v = u64::from_le_bytes(buf);
+                                        if v == 0 { continue; }
+                                        v
+                                    }
+                                    _ => continue,
+                                }
+                            }
+                            None => continue,
+                        }
+                    }
+                };
                 let pointee_name = f.type_info.name.strip_prefix('*').unwrap_or("");
+                // when mem is Some, pointer values are live reads; trust aligned non-zero
+                // values even if alloc_tracker missed the alloc event (ring overflow)
+                let known_alloc = allocs.alloc_size(field_val).is_some();
+                let live_plausible = mem.is_some() && field_val > 0x1000 && field_val & 0x7 == 0;
                 match type_registry.get(pointee_name) {
-                    Some(ti) => candidates.push((&f.name, field_val, ti)),
-                    None => continue,
+                    Some(ti) => {
+                        if self.map.contains_key(&field_val) || (!known_alloc && !live_plausible) {
+                            continue;
+                        }
+                        candidates.push((&f.name, field_val, ti));
+                    }
+                    None if pointee_name.starts_with('*') => {
+                        // **T: register target alloc as holding T elements
+                        let inner = pointee_name.strip_prefix('*').unwrap_or("");
+                        if let Some(inner_ti) = type_registry.get(inner) {
+                            if (known_alloc || live_plausible) && !self.indirect.contains_key(&field_val) {
+                                self.indirect.insert(field_val, inner_ti.clone());
+                                self.indirect_registrations += 1;
+                            }
+                        }
+                    }
+                    _ => {}
                 };
             }
             candidates.sort_by_key(|(name, _, _)| *name);
@@ -1070,6 +1172,8 @@ pub struct WorldState {
     pub bb_hits: HashMap<u32, u64>,
     pub type_stability: TypeStabilityMonitor,
     pub type_epochs: TypeEpochLog,
+    // /proc/pid/mem handle for retrospective_scan mem fallback
+    pub proc_mem: Option<std::fs::File>,
 }
 
 impl WorldState {
@@ -1085,6 +1189,7 @@ impl WorldState {
             bb_hits: HashMap::new(),
             type_stability: TypeStabilityMonitor::new(),
             type_epochs: TypeEpochLog::new(65536),
+            proc_mem: None,
         }
     }
 
@@ -1671,7 +1776,7 @@ mod tests {
         ws.ensure_node(NodeId::Global(0), "a", &ti("int", 4, false), 0x1000, 4);
 
         let mut ring = SnapshotRing::new(3);
-        // push 5 snapshots into a ring of cap 3 → slots 0,1 overwritten
+        // push 5 snapshots into a ring of cap 3 -> slots 0,1 overwritten
         for i in 0..5u64 {
             ws.update_value(NodeId::Global(0), i * 10, i);
             ws.inc_insn_counter();
@@ -1968,10 +2073,10 @@ mod tests {
         let r = log.query(0x1000, 400).unwrap();
         assert_eq!(r.type_name, "B");
 
-        // seq 250 falls between epochs — no match
+        // seq 250 falls between epochs; no match
         assert!(log.query(0x1000, 250).is_none());
 
-        // wrong address — no match
+        // wrong address; no match
         assert!(log.query(0x2000, 150).is_none());
     }
 
