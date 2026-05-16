@@ -560,7 +560,7 @@ pub struct AllocSiteOracle {
     unique: HashMap<u64, TypeInfo>,
     /// size -> candidate types for ambiguous sizes
     ambiguous: HashMap<u64, Vec<TypeInfo>>,
-    /// (func_low_pc, func_high_pc, alloc_size) → type, built from
+    /// (func_low_pc, func_high_pc, alloc_size) -> type, built from
     /// function locals that are pointers to structs
     callsite: Vec<(u64, u64, u64, TypeInfo)>,
 }
@@ -570,7 +570,7 @@ impl AllocSiteOracle {
         registry: &HashMap<String, TypeInfo>,
         functions: &BTreeMap<u64, FunctionMeta>,
     ) -> Self {
-        // group struct types by byte_size. only include types with fields —
+        // group struct types by byte_size. only include types with fields;
         // bare arrays (char[6]) and opaque typedefs have no structure worth stamping.
         let mut by_size: HashMap<u64, Vec<&TypeInfo>> = HashMap::new();
         for ti in registry.values() {
@@ -599,7 +599,7 @@ impl AllocSiteOracle {
                 if !local.type_info.is_pointer {
                     continue;
                 }
-                // strip one or two levels of pointer indirection: *T or **T → T
+                // strip one or two levels of pointer indirection: *T or **T -> T
                 let raw = local.type_info.name.strip_prefix('*').unwrap_or("");
                 let pointee_name = raw.strip_prefix('*').unwrap_or(raw);
                 if pointee_name.is_empty() { continue; }
@@ -675,6 +675,10 @@ pub struct DwarfInfo {
     pub name_accel: Option<NameAccelerator>,
     pub lib_globals: Vec<LibDwarf>,
     pub alloc_oracle: AllocSiteOracle,
+    // monotonic counter: incremented by ensure_type when a new type is
+    // materialized or upgraded. polled by main loop to trigger adaptive
+    // warm-scan re-seed when the type frontier expands.
+    pub types_materialized: u64,
 }
 
 impl DwarfInfo {
@@ -702,10 +706,82 @@ impl DwarfInfo {
         }
     }
 
+    /// unified on-demand type materializer.
+    /// - already deep in registry -> true (no-op)
+    /// - shallow in registry -> upgrade from DWARF
+    /// - absent from registry -> cold-materialize from DWARF
+    /// after resolution, recursively ensures all pointer-target types
+    /// exist in the registry (transitive closure). one call at any
+    /// stamp site guarantees the full reachable type graph is populated.
+    pub fn ensure_type(&mut self, type_name: &str) -> bool {
+        self.ensure_type_inner(type_name, 0)
+    }
+
+    fn ensure_type_inner(&mut self, type_name: &str, depth: u32) -> bool {
+        if depth > 6 { return false; }
+        let registry_size_before = self.type_registry.len();
+        match self.type_registry.get(type_name) {
+            Some(ti) if !ti.shallow => {
+                // already deep; still chase pointer targets (idempotent due to depth check above)
+                let targets: Vec<String> = ti.fields.iter()
+                    .filter(|f| f.type_info.is_pointer)
+                    .filter_map(|f| {
+                        let mut n = f.type_info.name.as_str();
+                        while let Some(rest) = n.strip_prefix('*') { n = rest; }
+                        if n.is_empty() || n == "void" || self.type_registry.contains_key(n) {
+                            None
+                        } else {
+                            Some(n.to_string())
+                        }
+                    }).collect();
+                for t in targets { self.ensure_type_inner(&t, depth + 1); }
+                if depth == 0 {
+                    let grew = self.type_registry.len() - registry_size_before;
+                    self.types_materialized += grew as u64;
+                }
+                return true;
+            }
+            _ => {}
+        }
+        if !self.resolve_deep(type_name) { return false; }
+        // chase pointer targets of the freshly resolved type
+        let targets: Vec<String> = match self.type_registry.get(type_name) {
+            Some(ti) => ti.fields.iter()
+                .filter(|f| f.type_info.is_pointer)
+                .filter_map(|f| {
+                    let mut n = f.type_info.name.as_str();
+                    while let Some(rest) = n.strip_prefix('*') { n = rest; }
+                    if n.is_empty() || n == "void" || self.type_registry.contains_key(n) {
+                        None
+                    } else {
+                        Some(n.to_string())
+                    }
+                }).collect(),
+            None => vec![],
+        };
+        for t in targets { self.ensure_type_inner(&t, depth + 1); }
+        if depth == 0 {
+            let grew = self.type_registry.len() - registry_size_before;
+            self.types_materialized += grew as u64;
+        }
+        true
+    }
+
     pub fn resolve_deep(&mut self, type_name: &str) -> bool {
+        // existing entry provides a floor for field count comparison.
+        // absent types use a synthetic zero-field floor.
         let existing = match self.type_registry.get(type_name) {
-            Some(ti) if ti.shallow => ti.clone(),
-            _ => return false,
+            Some(ti) if !ti.shallow => return true, // already deep
+            Some(ti) => ti.clone(),
+            None => TypeInfo {
+                name: type_name.to_string(),
+                byte_size: 0,
+                is_pointer: false,
+                is_volatile: false,
+                is_atomic: false,
+                shallow: true,
+                fields: vec![],
+            },
         };
         let file_data = match fs::read(&self.elf_path) {
             Ok(d) => d,
@@ -750,7 +826,10 @@ impl DwarfInfo {
             }
         }
 
-        // fallback: full CU scan (DWARF4 or .debug_names miss)
+        // fallback: full CU scan (DWARF4 or .debug_names miss).
+        // two-pass: exact size match first, then best-fields regardless of size.
+        // shallow entries from depth-truncated parse may carry wrong byte_size.
+        let mut best: Option<TypeInfo> = None;
         let mut iter = dw.units();
         while let Ok(Some(header)) = iter.next() {
             let unit = match dw.unit(header) {
@@ -774,31 +853,56 @@ impl DwarfInfo {
                     .attr_value(gimli::DW_AT_byte_size)
                     .and_then(|v| v.udata_value())
                     .unwrap_or(0);
-                if bs != existing.byte_size {
+                if bs == 0 {
                     continue;
                 }
                 let mut visited = HashSet::new();
                 let fields =
                     extract_struct_fields_deep(&dw, &unit, entry.offset(), 0, &mut visited);
-                if fields.len() > existing.fields.len() {
-                    let deep_ti = TypeInfo {
-                        name: name.clone(),
+                let dominated = match &best {
+                    Some(b) => fields.len() > b.fields.len(),
+                    None => fields.len() > existing.fields.len(),
+                };
+                if dominated {
+                    // exact size match: commit immediately
+                    if bs == existing.byte_size {
+                        let deep_ti = TypeInfo {
+                            name: name.clone(),
+                            byte_size: bs,
+                            is_pointer: false,
+                            is_volatile: existing.is_volatile,
+                            is_atomic: existing.is_atomic,
+                            shallow: false,
+                            fields,
+                        };
+                        self.type_registry.insert(name.clone(), deep_ti);
+                        eprintln!(
+                            "dwarf: deep-resolved {} ({} fields)",
+                            name,
+                            self.type_registry[&name].fields.len()
+                        );
+                        return true;
+                    }
+                    best = Some(TypeInfo {
+                        name,
                         byte_size: bs,
                         is_pointer: false,
                         is_volatile: existing.is_volatile,
                         is_atomic: existing.is_atomic,
                         shallow: false,
                         fields,
-                    };
-                    self.type_registry.insert(name.clone(), deep_ti);
-                    eprintln!(
-                        "dwarf: deep-resolved {} ({} fields)",
-                        name,
-                        self.type_registry[&name].fields.len()
-                    );
-                    return true;
+                    });
                 }
             }
+        }
+        // no exact size match; accept best candidate with different size
+        if let Some(deep_ti) = best {
+            eprintln!(
+                "dwarf: deep-resolved {} ({} fields, size {}→{})",
+                type_name, deep_ti.fields.len(), existing.byte_size, deep_ti.byte_size,
+            );
+            self.type_registry.insert(type_name.to_string(), deep_ti);
+            return true;
         }
         false
     }
@@ -831,7 +935,7 @@ fn resolve_deep_at<'a>(
         .attr_value(gimli::DW_AT_byte_size)
         .and_then(|v| v.udata_value())
         .unwrap_or(0);
-    if bs != existing.byte_size {
+    if bs == 0 {
         return None;
     }
     let mut visited = HashSet::new();
@@ -1068,6 +1172,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
         name_accel,
         lib_globals: Vec::new(),
         alloc_oracle,
+        types_materialized: 0,
     };
 
     // merge types + globals + functions from DT_NEEDED shared libraries (works from disk, no live process)
@@ -1080,7 +1185,7 @@ pub fn parse_elf(path: &str) -> Result<DwarfInfo, Box<dyn std::error::Error>> {
 }
 
 /// Resolve DT_NEEDED sonames from the target ELF and merge DWARF type info
-/// from any that contain .debug_info. Works entirely from on-disk ELF files —
+/// from any that contain .debug_info. Works entirely from on-disk ELF files;
 /// no live process required, immune to DynamoRIO's private loader hiding
 /// libraries from /proc/<pid>/maps.
 pub fn merge_needed_libs(info: &mut DwarfInfo) -> usize {
@@ -1229,7 +1334,7 @@ pub fn merge_needed_libs(info: &mut DwarfInfo) -> usize {
         let mut lib_globs: Vec<GlobalVar> = Vec::new();
         let mut lib_funcs: BTreeMap<u64, FunctionMeta> = BTreeMap::new();
 
-        // library's ELF base vaddr — same logic as main binary in parse_elf
+        // library's ELF base vaddr; same logic as main binary in parse_elf
         let lib_elf_base = obj
             .segments()
             .filter_map(|s| {
@@ -2417,6 +2522,7 @@ mod tests {
             name_accel: None,
             lib_globals: Vec::new(),
             alloc_oracle: AllocSiteOracle::empty(),
+            types_materialized: 0,
         };
 
         info.patch_shallow_fields(&mut parent);
@@ -2608,7 +2714,7 @@ mod tests {
 
     #[test]
     fn test_container_of_map_skips_zero_offset() {
-        // struct at offset 0 is not intrusive — it's just the first field
+        // struct at offset 0 is not intrusive; it's just the first field
         let inner = TypeInfo {
             name: "inner_t".into(),
             byte_size: 8,
