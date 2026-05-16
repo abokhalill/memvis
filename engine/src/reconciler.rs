@@ -195,9 +195,8 @@ pub fn process_event(
                         }
                     }
                 }
-                if let Some(ref info) = dwarf_info {
-                    let before = world.stm.len();
-                    world.stm.propagate_field_write(
+                if let Some(ref mut info) = dwarf_info {
+                    let stamped = world.stm.propagate_field_write(
                         ev.addr,
                         val,
                         ev.size,
@@ -205,17 +204,29 @@ pub fn process_event(
                         &info.type_registry,
                         &world.heap_allocs,
                     );
-                    let after = world.stm.len();
-                    if after > before {
+                    if stamped {
+                        // ensure_type: upgrade shallow / materialize absent / chase transitive ptrs
+                        if let Some(proj) = world.stm.lookup(val) {
+                            let tname = proj.type_info.name.clone();
+                            let src = proj.source_name.clone();
+                            let was_shallow = proj.type_info.shallow;
+                            info.ensure_type(&tname);
+                            if was_shallow {
+                                if let Some(deep) = info.type_registry.get(&tname) {
+                                    if !deep.shallow {
+                                        world.stm.stamp_type(val, deep, &src, ev.seq32() as u64);
+                                    }
+                                }
+                            }
+                        }
                         world.stm.retrospective_scan(
                             val,
                             heap_graph,
                             &world.heap_allocs,
                             &info.type_registry,
                             ev.seq32() as u64,
+                            world.proc_mem.as_ref(),
                         );
-                    }
-                    if after > before {
                         if let Some(ref mut ts) = topo {
                             if let Some(proj) = world.stm.lookup(val) {
                                 ts.emit_stamp(
@@ -284,13 +295,7 @@ pub fn process_event(
                             if let Some(ref mut info) = dwarf_info {
                                 let pointee_name =
                                     h_type.name.strip_prefix('*').unwrap_or("").to_string();
-                                if info
-                                    .type_registry
-                                    .get(&pointee_name)
-                                    .is_some_and(|ti| ti.shallow)
-                                {
-                                    info.resolve_deep(&pointee_name);
-                                }
+                                info.ensure_type(&pointee_name);
                                 if let Some(pointee_ti) =
                                     info.type_registry.get(&pointee_name).cloned()
                                 {
@@ -341,6 +346,7 @@ pub fn process_event(
                                             &world.heap_allocs,
                                             &info.type_registry,
                                             ev.seq32() as u64,
+                                            world.proc_mem.as_ref(),
                                         );
                                         if let Some(ref mut ts) = topo {
                                             ts.emit_stamp(
@@ -479,7 +485,7 @@ pub fn process_event(
             let ptr = ev.addr;
             let size = ev.size as u64;
             let is_duplicate = match world.heap_allocs.on_alloc(ptr, size) {
-                Some(old_size) if old_size == size => true,  // nested wrapper (zmalloc→malloc)
+                Some(old_size) if old_size == size => true,  // nested wrapper (zmalloc->malloc)
                 Some(old_size) => {
                     // realloc at same address with different size; close prior epoch
                     if let Some(proj) = world.stm.lookup(ptr).cloned() {
@@ -521,17 +527,21 @@ pub fn process_event(
                 if let Some(ti) = info.alloc_oracle.resolve(size, &caller_pcs).cloned() {
                     let source_pc = caller_pcs.first().copied().unwrap_or(0);
                     let source = format!("alloc@{:#x}", source_pc);
-                    let stamp_res = world.stm.stamp_type(ptr, &ti, &source, ev.seq32() as u64);
+                    info.ensure_type(&ti.name);
+                    let mut stamp_ti = info.type_registry.get(&ti.name).cloned().unwrap_or(ti);
+                    info.patch_shallow_fields(&mut stamp_ti);
+                    let stamp_res = world.stm.stamp_type(ptr, &stamp_ti, &source, ev.seq32() as u64);
                     if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
                         orch.bloom_insert(ptr);
                         world.stm.retrospective_scan(
                             ptr, heap_graph, &world.heap_allocs,
                             &info.type_registry, ev.seq32() as u64,
+                            world.proc_mem.as_ref(),
                         );
                         if let Some(ref mut ts) = topo {
                             ts.emit_stamp(
-                                ev.seq32() as u64, ptr, &ti.name,
-                                ti.byte_size, &source, ti.fields.len(),
+                                ev.seq32() as u64, ptr, &stamp_ti.name,
+                                stamp_ti.byte_size, &source, stamp_ti.fields.len(),
                             );
                         }
                     }
@@ -552,6 +562,7 @@ pub fn process_event(
                     }
                 }
                 world.stm.purge_range(ptr, old_size);
+                world.stm.purge_indirect(ptr, old_size);
                 heap_graph.on_free(ptr, old_size);
                 if let Some(ref mut ts) = topo {
                     ts.emit_free(ev.seq32() as u64, ev.thread_id, ptr, old_size);
@@ -872,11 +883,37 @@ impl WarmScanner {
     // seed queue from globals; call before first step or to re-scan.
     pub fn seed(
         &mut self,
-        info: &DwarfInfo,
+        info: &mut DwarfInfo,
         delta: u64,
         heap_oracle: &HeapOracle,
         topo: &mut Option<TopologyStream>,
+        stm: &mut crate::world::ShadowTypeMap,
+        alloc_tracker: &crate::world::HeapAllocTracker,
     ) {
+        // ensure_type on each global's type so depth-truncated structs
+        // (e.g. redisServer with 600+ fields) are fully materialized
+        // before scan_ptr_fields iterates their fields.
+        let global_names: Vec<String> = info.globals.iter().map(|g| g.type_info.name.clone()).collect();
+        for tn in &global_names {
+            info.ensure_type(tn);
+        }
+        // rebuild global type_info from the now-deep registry
+        // two-pass to avoid borrow conflict: collect patches, then apply
+        let patches: Vec<(usize, TypeInfo)> = info.globals.iter().enumerate()
+            .filter_map(|(i, g)| {
+                info.type_registry.get(&g.type_info.name)
+                    .filter(|fresh| fresh.fields.len() > g.type_info.fields.len())
+                    .map(|fresh| (i, fresh.clone()))
+            }).collect();
+        for (i, ti) in patches {
+            info.globals[i].type_info = ti;
+        }
+        for idx in 0..info.globals.len() {
+            let mut ti = info.globals[idx].type_info.clone();
+            info.patch_shallow_fields(&mut ti);
+            info.globals[idx].type_info = ti;
+        }
+        
         for g in &info.globals {
             let base = g.addr.wrapping_add(delta);
             self.stats.globals_scanned += 1;
@@ -893,6 +930,8 @@ impl WarmScanner {
                 &info.container_of_map,
                 topo,
                 u64::MAX,
+                stm,
+                alloc_tracker,
             );
         }
         self.seeded = true;
@@ -903,7 +942,7 @@ impl WarmScanner {
     pub fn step(
         &mut self,
         budget: u64,
-        info: &DwarfInfo,
+        info: &mut DwarfInfo,
         world: &mut WorldState,
         heap_oracle: &HeapOracle,
         topo: &mut Option<TopologyStream>,
@@ -911,7 +950,17 @@ impl WarmScanner {
         let start_reads = self.stats.reads;
         let mut stamps_this_step = 0u64;
 
-        while let Some((target_addr, pointee_ti, source_name, depth)) = self.queue.pop_front() {
+        while let Some((target_addr, mut pointee_ti, source_name, depth)) = self.queue.pop_front() {
+            // ensure full type graph is materialized before field iteration
+            if pointee_ti.shallow || pointee_ti.fields.is_empty() {
+                info.ensure_type(&pointee_ti.name);
+                if let Some(fresh) = info.type_registry.get(&pointee_ti.name) {
+                    if fresh.fields.len() > pointee_ti.fields.len() {
+                        pointee_ti = fresh.clone();
+                    }
+                }
+                info.patch_shallow_fields(&mut pointee_ti);
+            }
             if self.stats.reads - start_reads >= budget {
                 self.queue
                     .push_front((target_addr, pointee_ti, source_name, depth));
@@ -967,6 +1016,20 @@ impl WarmScanner {
                     );
                 }
             }
+            // retroscan with mem fallback: catches pointer fields in nested
+            // structs that scan_ptr_fields might miss due to depth limits
+            if pointee_ti.fields.iter().any(|f| f.type_info.is_pointer && f.byte_size == 8) {
+                // dummy heap_graph; warm-scan relies on mem reads, not HeapGraph
+                let empty_hg = crate::heap_graph::HeapGraph::new();
+                world.stm.retrospective_scan(
+                    target_addr,
+                    &empty_hg,
+                    &world.heap_allocs,
+                    &info.type_registry,
+                    0,
+                    Some(&self.mem),
+                );
+            }
             scan_ptr_fields(
                 &self.mem,
                 target_addr,
@@ -980,6 +1043,8 @@ impl WarmScanner {
                 &info.container_of_map,
                 topo,
                 u64::MAX,
+                &mut world.stm,
+                &world.heap_allocs,
             );
         }
         stamps_this_step
@@ -1023,6 +1088,8 @@ pub fn warm_scan(
             &info.container_of_map,
             topo,
             max_reads,
+            &mut world.stm,
+            &world.heap_allocs,
         );
     }
 
@@ -1093,6 +1160,8 @@ pub fn warm_scan(
             &info.container_of_map,
             topo,
             max_reads,
+            &mut world.stm,
+            &world.heap_allocs,
         );
     }
 
@@ -1113,6 +1182,8 @@ fn scan_ptr_fields(
     container_of_map: &HashMap<String, Vec<dwarf::ContainerOfEntry>>,
     topo: &mut Option<TopologyStream>,
     max_reads: u64,
+    stm: &mut crate::world::ShadowTypeMap,
+    alloc_tracker: &crate::world::HeapAllocTracker,
 ) {
     for f in &ti.fields {
         if stats.reads >= max_reads {
@@ -1166,6 +1237,43 @@ fn scan_ptr_fields(
                             queue.push_back((ptr, pointee_ti, qualified, depth));
                             stats.enqueued += 1;
                         }
+                        _ if pointee_name.starts_with('*') => {
+                            // **T: ptr is base of an allocation holding *T slots.
+                            // register indirect so online propagation stamps writes into it.
+                            // also read through the array to enqueue reachable T elements.
+                            let inner_name = pointee_name.strip_prefix('*').unwrap_or("");
+                            if let Some(inner_ti) = type_registry.get(inner_name) {
+                                // heap_oracle VMA check: alloc_tracker may miss due to event loss
+                                if heap_oracle.is_heap(ptr) {
+                                    stm.register_indirect(ptr, inner_ti.clone());
+                                    stm.indirect_registrations += 1;
+                                }
+                                // read through: the allocation at ptr holds *T pointers.
+                                // prefer alloc_tracker size; fall back to 16 slots for VMA-only hits
+                                let slot_limit = alloc_tracker.alloc_size(ptr)
+                                    .map(|sz| (sz / 8).min(128) as usize)
+                                    .unwrap_or_else(|| if heap_oracle.is_heap(ptr) { 16 } else { 0 });
+                                for slot_idx in 0..slot_limit {
+                                    if stats.reads >= max_reads {
+                                        break;
+                                    }
+                                    let slot_addr = ptr + (slot_idx as u64) * 8;
+                                    let mut sbuf = [0u8; 8];
+                                    match mem.read_at(&mut sbuf, slot_addr) {
+                                        Ok(8) => {
+                                            stats.reads += 1;
+                                            let elem = u64::from_le_bytes(sbuf);
+                                            if elem != 0 && heap_oracle.is_plausible_ptr(elem) {
+                                                let elem_source = format!("{}[{}]", qualified, slot_idx);
+                                                queue.push_back((elem, inner_ti.clone(), elem_source, depth + 1));
+                                                stats.enqueued += 1;
+                                            }
+                                        }
+                                        _ => { stats.read_errors += 1; break; }
+                                    }
+                                }
+                            }
+                        }
                         _ => {
                             stats.missing_pointee_ti += 1;
                         }
@@ -1187,6 +1295,8 @@ fn scan_ptr_fields(
                 container_of_map,
                 topo,
                 max_reads,
+                stm,
+                alloc_tracker,
             );
         }
     }
@@ -1433,7 +1543,7 @@ mod tests {
         assert!(world.bb_hits.is_empty());
     }
 
-    // a→b→c pointer chain in a synthetic pread-able file
+    // a->b->c pointer chain in a synthetic pread-able file
     fn make_synthetic_mem() -> (std::fs::File, dwarf::DwarfInfo) {
         use std::collections::BTreeMap;
         use std::os::unix::fs::FileExt;
@@ -1536,6 +1646,7 @@ mod tests {
             name_accel: None,
             lib_globals: Vec::new(),
             alloc_oracle: dwarf::AllocSiteOracle::empty(),
+            types_materialized: 0,
         };
         let f = std::fs::File::open(path).unwrap();
         (f, info)
@@ -1543,18 +1654,18 @@ mod tests {
 
     #[test]
     fn test_warm_scanner_full_traversal() {
-        let (mem, info) = make_synthetic_mem();
+        let (mem, mut info) = make_synthetic_mem();
         let mut scanner = WarmScanner::from_file(mem, 8);
         let mut world = WorldState::new();
         let oracle = HeapOracle::new();
         let mut topo: Option<TopologyStream> = None;
 
         assert!(!scanner.seeded);
-        scanner.seed(&info, 0, &oracle, &mut topo);
+        scanner.seed(&mut info, 0, &oracle, &mut topo, &mut world.stm, &world.heap_allocs);
         assert!(scanner.seeded);
         assert!(!scanner.is_idle());
 
-        let stamps = scanner.step(1000, &info, &mut world, &oracle, &mut topo);
+        let stamps = scanner.step(1000, &mut info, &mut world, &oracle, &mut topo);
         assert!(stamps > 0);
         assert!(scanner.is_idle());
         assert_eq!(scanner.passes, 1);
@@ -1563,27 +1674,27 @@ mod tests {
 
     #[test]
     fn test_warm_scanner_budget_exhaustion_and_resume() {
-        let (mem, info) = make_synthetic_mem();
+        let (mem, mut info) = make_synthetic_mem();
         let mut scanner = WarmScanner::from_file(mem, 8);
         let mut world = WorldState::new();
         let oracle = HeapOracle::new();
         let mut topo: Option<TopologyStream> = None;
 
-        scanner.seed(&info, 0, &oracle, &mut topo);
+        scanner.seed(&mut info, 0, &oracle, &mut topo, &mut world.stm, &world.heap_allocs);
         let mut total_stamps = 0u64;
         let mut steps = 0u32;
         while !scanner.is_idle() {
-            total_stamps += scanner.step(1, &info, &mut world, &oracle, &mut topo);
+            total_stamps += scanner.step(1, &mut info, &mut world, &oracle, &mut topo);
             steps += 1;
             assert!(steps < 100, "runaway BFS");
         }
 
         // parity: step-by-step == one-shot
-        let (mem2, info2) = make_synthetic_mem();
+        let (mem2, mut info2) = make_synthetic_mem();
         let mut sc2 = WarmScanner::from_file(mem2, 8);
         let mut w2 = WorldState::new();
-        sc2.seed(&info2, 0, &oracle, &mut topo);
-        let oneshot = sc2.step(1000, &info2, &mut w2, &oracle, &mut topo);
+        sc2.seed(&mut info2, 0, &oracle, &mut topo, &mut w2.stm, &w2.heap_allocs);
+        let oneshot = sc2.step(1000, &mut info2, &mut w2, &oracle, &mut topo);
 
         assert_eq!(
             total_stamps, oneshot,
@@ -1597,21 +1708,21 @@ mod tests {
 
     #[test]
     fn test_warm_scanner_reseed() {
-        let (mem, info) = make_synthetic_mem();
+        let (mem, mut info) = make_synthetic_mem();
         let mut scanner = WarmScanner::from_file(mem, 8);
         let mut world = WorldState::new();
         let oracle = HeapOracle::new();
         let mut topo: Option<TopologyStream> = None;
 
-        scanner.seed(&info, 0, &oracle, &mut topo);
-        scanner.step(1000, &info, &mut world, &oracle, &mut topo);
+        scanner.seed(&mut info, 0, &oracle, &mut topo, &mut world.stm, &world.heap_allocs);
+        scanner.step(1000, &mut info, &mut world, &oracle, &mut topo);
         assert!(scanner.is_idle());
         assert_eq!(scanner.passes, 1);
         let r1 = scanner.stats.reads;
 
-        scanner.seed(&info, 0, &oracle, &mut topo);
+        scanner.seed(&mut info, 0, &oracle, &mut topo, &mut world.stm, &world.heap_allocs);
         assert_eq!(scanner.passes, 2);
-        scanner.step(1000, &info, &mut world, &oracle, &mut topo);
+        scanner.step(1000, &mut info, &mut world, &oracle, &mut topo);
         assert!(scanner.is_idle());
         assert!(scanner.stats.reads >= r1);
     }
