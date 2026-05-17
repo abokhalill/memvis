@@ -460,9 +460,19 @@ pub struct TypeProjection {
 2. **Field propagation** (`propagate_field_write`): When a write hits an
    address covered by an existing STM projection, and the written field is
    a pointer whose pointee type exists in `type_registry`, the engine stamps
-   the written value with the pointee type.
+   the written value with the pointee type. Returns `bool` indicating whether
+   a new stamp was created. Includes a freshness guard: skips propagation if
+   the covering projection predates the current allocation epoch.
 
-3. **Size-validation sentinel** (`HeapAllocTracker::check_size`): Before
+3. **Indirect element registration**: When `propagate_field_write` encounters
+   a `**T` field (pointer-to-pointer), it registers the target allocation's
+   element type as `T` via `register_indirect(alloc_base, element_ti)`. Future
+   writes into that allocation (e.g., bucket array stores) are stamped via
+   `indirect_lookup` without requiring a covering STM projection on the bucket
+   array itself. Counters: `indirect_registrations` (registrations created),
+   `indirect_stamps` (stamps applied via indirect path).
+
+4. **Size-validation sentinel** (`HeapAllocTracker::check_size`): Before
    stamping, if the type's `byte_size` exceeds the known allocation size,
    a `SizeMismatch` is recorded but the stamp still proceeds (last-write-wins).
 
@@ -853,7 +863,12 @@ pub struct WarmScanner {
 }
 ```
 
-- **`seed(info, delta, heap_oracle, topo)`**: Enqueues all DWARF globals with
+- **`seed(&mut info, delta, heap_oracle, topo, stm, alloc_tracker)`**: Calls
+  `ensure_type` on each global's type to fully materialize depth-truncated
+  structs (e.g. `redisServer` with 487 fields) before traversal. Rebuilds
+  global `TypeInfo` from the now-deep registry via a two-pass collect-then-
+  apply pattern (avoids borrow conflict on `info.globals` vs `info.type_registry`).
+  Calls `patch_shallow_fields` on each global. Enqueues all DWARF globals with
   pointer fields. Reads pointer values from `/proc/<pid>/mem` via
   `scan_ptr_fields`. Increments `passes`.
 - **`step(budget, info, world, heap_oracle, topo)`**: Processes up to `budget`
@@ -861,10 +876,12 @@ pub struct WarmScanner {
   visited, stamp via `stm.stamp_type`, emit `COLD_STAMP`/`COLD_LINK`, recurse
   via `scan_ptr_fields`. Returns stamp count. If budget exhausted, remaining
   items stay in queue for the next call.
-- **`is_idle()`**: `seeded && queue.is_empty()`. Re-seed triggers on idle.
+- **`is_idle()`**: `seeded && queue.is_empty()`.
 
-Triggered in both TUI and headless loops when `total > 2M && idle_rounds >= 5`.
-Budget per step: 500 reads. Scanner is lazily initialized on first trigger.
+Initial seed at 100K events (after library globals are relocated). Periodic
+re-seed every 200K events thereafter (event-count based via `last_reseed_total`,
+works identically in TUI and headless modes regardless of wall-clock speed).
+Budget per step: 2000 reads. Scanner is lazily initialized on first trigger.
 
 `scan_ptr_fields` accepts the `container_of_map` from `DwarfInfo`. When a
 pointer field's pointee type has container-of entries, the scanner also
@@ -872,6 +889,11 @@ enqueues the container base address (`ptr - field_offset`) with the container
 type. This enables discovery of full enclosing objects when following intrusive
 links (e.g., `list_head*` → `task_struct`). The `container_of_stamps` stat
 tracks how many objects were discovered via this path.
+
+The `**T` alloc gate in `scan_ptr_fields` is relaxed: when the pointee
+address is not in `alloc_tracker` (alloc event lost to ring overflow),
+`heap_oracle.is_heap()` is used as a fallback. This ensures indirect
+pointer targets are still enqueued and stamped under backpressure.
 
 #### `warm_scan` (legacy one-shot)
 
@@ -1211,7 +1233,8 @@ Full startup when the user runs `memvis <target>`:
 7. Discover the first thread ring and attach (validating magic + proto).
 8. Spawn the consumer on a 64 MB stack thread (deep DWARF resolution).
 9. Consumer enters the main event loop (TUI or headless).
-10. Warm-scan triggers after 2M events + 5 idle rounds (reads `/proc/<pid>/mem`).
+10. Warm-scan: initial seed at 100K events; periodic re-seed every 200K events
+    (event-count based). Calls `ensure_type` on globals, reads `/proc/<pid>/mem`.
 11. If `--record`: `EventRecorder` writes events (compound REG_SNAPSHOT).
 12. If `--export-topology`: `TopologyStream` writes JSONL.
 13. On exit: finalize recorder/topology, send SIGTERM to tracer, reap child,

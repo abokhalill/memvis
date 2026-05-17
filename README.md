@@ -1,15 +1,15 @@
 # memvis
 
-Runtime memory topology analyzer for Linux x86-64. Instruments any binary
-via [DynamoRIO](https://dynamorio.org/), captures every memory write, read,
-function call, return, allocation, and basic-block entry, then correlates
+Runtime memory topology analyzer for Linux x86-64. Instruments any unmodified
+binary via [DynamoRIO](https://dynamorio.org/), captures every memory write,
+read, function call, return, allocation, and basic-block entry, then correlates
 with DWARF debug information to produce a **named, structure-aware view** of
 heap layout, pointer topology, cacheline contention, and type stability —
 **without recompilation or source modification**.
 
-Verified on real-world codebases including **Redis** and **jq**.
+Verified against **Redis 8.0** (487-field `redisServer`, 1.2M+ events) and **jq**.
 
-## What you get
+## What You Get
 
 ```
 MEMVIS │ insn 74656 │ events 45245 │ nodes 2 │ edges 2 │ rings 1 │ LAG 0 │ allocs 9/4 live 5
@@ -40,13 +40,13 @@ with its DWARF name, type, and current value. The `→` arrow means the value
 is a pointer to a heap allocation. HEAP TYPES shows how memvis **typed that
 heap memory** — it observed `g_head` being written with a pointer, looked up
 `g_head`'s type (`*node`), and projected the `node` struct layout onto the
-target address. This is the Shadow Type Map at work.
+target address. This is the Shadow Type Map (STM) at work.
 
-## Quick start
+## Quick Start
 
 **Requirements**: Linux x86-64, Rust 1.74+, CMake 3.7+, a C compiler,
-[DynamoRIO](https://dynamorio.org/) 11.91+. Target binaries must be compiled
-with `-g` (DWARF debug info).
+[DynamoRIO](https://dynamorio.org/) 11.91+. Target binaries must include
+DWARF debug info (`-g`).
 
 ```sh
 # 1. Install DynamoRIO (one-time)
@@ -74,7 +74,7 @@ docker run --rm \
     memvis /app/heap_chain
 ```
 
-## The four tools
+## The Four Tools
 
 Build produces `engine/target/release/{memvis,memvis-lint,memvis-diff,memvis-check}`
 and `build/libmemvis_tracer.so`. The engine auto-discovers the tracer from the
@@ -97,23 +97,30 @@ memvis replay trace.bin --dwarf ./my_program
 Under the hood:
 
 - **Shadow Type Map (STM)** types heap addresses by observing pointer writes
-  from typed globals. Recursive field propagation discovers entire struct
-  layouts. Purged on `free()`.
-- **Retrospective Type Reconciliation (RTR)** performs bounded BFS from
-  freshly-stamped addresses through pointer fields — discovers linked lists,
-  trees, and graphs from a single pointer write.
-- **Warm-scan** performs persistent BFS over `/proc/<pid>/mem` from DWARF
-  globals. Discovers typed structures built before tracing began, including
-  intrusive containers via container-of inference.
+  from typed globals. Recursive field propagation (`propagate_field_write`)
+  discovers entire struct layouts including indirect `**T` → element type
+  registration for bucket arrays. Purged on `free()`.
+- **Retrospective Type Reconciliation (RTR)** performs bounded BFS (fuel=64)
+  from freshly-stamped addresses through pointer fields — discovers linked
+  lists, trees, and graphs from a single pointer write.
+- **Warm-scan** performs persistent incremental BFS over `/proc/<pid>/mem`
+  from DWARF globals. Initial seed at 100K events; periodic re-seed every
+  200K events (event-count based, works in both TUI and headless modes).
+  Calls `ensure_type` on each global to fully materialize depth-truncated
+  structs before traversal. Discovers intrusive containers via container-of
+  inference. Budget: 2000 reads per step.
 - **Library DWARF merge** resolves `DT_NEEDED` shared libraries and merges
-  their type information at startup. Works from on-disk files — immune to
+  their type information at startup. Works from on-disk ELF files; immune to
   DynamoRIO's private loader.
+- **Type Stability Monitor** validates every write to a stamped heap region
+  against the projected field layout. Detects interstitial and spanning
+  violations invisible to ASan.
 - **Visual ASan** detects out-of-bounds and heap-hole accesses in real time.
   Each hazard carries the faulting PC and a full 18-register snapshot.
 - **CFI-hardened shadow stacks** verify callee-saved register preservation
   against `.eh_frame` data on every return. Longjmp-aware.
 - **Cross-process topology** tracks forks transparently. Shared-memory writes
-  across processes are detected via inode matching.
+  across processes are detected via `(dev, inode)` matching on `/proc/*/maps`.
 - Lock-free SPSC rings (2 atomics per 20K-event batch), inline write capture
   (~19 meta-instructions), adaptive backpressure that sheds reads under load
   while preserving writes and control events.
@@ -121,8 +128,9 @@ Under the hood:
 ### `memvis-lint` — static false-sharing detector
 
 **No instrumentation needed.** Analyzes DWARF struct layouts to predict
-cacheline false-sharing at compile time. Overlay with runtime heatmaps
-for divergence reports.
+cacheline false-sharing at compile time. Three-tier structural intent
+analysis (volatile/atomic qualifiers → alignment intent → heuristic).
+Overlay with runtime heatmaps for divergence reports.
 
 ```sh
 memvis-lint ./my_program --struct my_struct
@@ -134,8 +142,8 @@ memvis-lint ./my_program --struct S --heatmap heat.tsv       # divergence report
 ### `memvis-diff` — offline differential topology
 
 Replays two recorded traces and compares their ASLR-invariant topology.
-Type histograms, common-stamp masking, and steady-state divergence report
-structural regressions between builds or workloads.
+Canonical stamps, common-stamp masking, and steady-state type histograms
+report structural regressions between builds or workloads.
 
 ```sh
 memvis-diff --baseline a.bin --subject b.bin --dwarf ./my_program

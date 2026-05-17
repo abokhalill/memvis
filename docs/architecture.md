@@ -159,15 +159,23 @@ modules re-exported from `lib.rs`, with four binary entry points.
    gap reports that occurred when both domains' counters were conflated.
 
 5. **Warm-scan** (`reconciler.rs`). `WarmScanner`: persistent incremental BFS
-   over `/proc/<pid>/mem`. `seed()` enqueues globals; `step(budget)` processes
-   up to `budget` reads per call, yielding on exhaustion and resuming on the
-   next invocation. Depth-limited (12). Triggered after 2M events + 5 idle
-   rounds in both TUI and headless loops. Emits COLD_STAMP and COLD_LINK to
-   topology stream. `scan_ptr_fields` uses `DwarfInfo.container_of_map` for
-   intrusive container discovery: when following a pointer to an embedded
-   struct (e.g. `list_head*`), also enqueues the container base
-   (`ptr - field_offset`) with the container type. Legacy one-shot
-   `warm_scan` retained for replay.
+   over `/proc/<pid>/mem`. `seed(&mut DwarfInfo, delta, heap_oracle, topo, stm,
+   alloc_tracker)` calls `ensure_type` on each global's type to fully
+   materialize depth-truncated structs (e.g. `redisServer` with 487 fields),
+   rebuilds global `TypeInfo` from the now-deep registry, patches shallow
+   fields, then enqueues globals via `scan_ptr_fields`. `step(budget)`
+   processes up to `budget` reads per call, yielding on exhaustion and
+   resuming on the next invocation. Depth-limited (12). Initial seed at
+   100K events; periodic re-seed every 200K events (event-count based,
+   works identically in TUI and headless modes regardless of wall-clock
+   processing speed). Budget per step: 2000 reads. Emits COLD_STAMP and
+   COLD_LINK to topology stream. `scan_ptr_fields` uses
+   `DwarfInfo.container_of_map` for intrusive container discovery: when
+   following a pointer to an embedded struct (e.g. `list_head*`), also
+   enqueues the container base (`ptr - field_offset`) with the container
+   type. The `**T` alloc gate is relaxed via `heap_oracle.is_heap()` to
+   handle targets whose alloc events were lost to ring overflow. Legacy
+   one-shot `warm_scan` retained for replay.
 
 6. **Ring orchestration** (`ring.rs`). Attaches to control ring with protocol
    handshake. Discovers per-thread data rings. Batch pops up to 20,000
@@ -175,8 +183,12 @@ modules re-exported from `lib.rs`, with four binary entry points.
    `new_offline()` creates a dummy orchestrator for replay without SHM.
 
 7. **Shadow Type Map** (`world.rs`). Maps heap addresses to DWARF type
-   projections. Three stamp paths: direct stamp, field propagation,
-   retrospective scan. `purge_range` on FREE.
+   projections. Four stamp paths: direct stamp, field propagation
+   (`propagate_field_write`, returns `bool`), indirect element registration
+   (`**T` field writes register the target allocation's element type; the
+   written `*T` pointer is then stamped as `T` via `indirect_lookup`), and
+   retrospective scan. Counters: `indirect_stamps`, `indirect_registrations`.
+   `purge_range` on FREE.
 
 8. **Retrospective Type Reconciliation** (`world.rs`). Bounded BFS (fuel=64)
    from freshly-stamped addresses through HeapGraph pointer fields. Candidates
@@ -358,11 +370,12 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 ### Warm-scan path (cold discovery)
 
 ```
- target quiesces (2M events + 5 idle rounds)
+ initial seed at 100K events; re-seed every 200K events
          │
          ▼
- WarmScanner::seed() enqueues globals from DWARF
- WarmScanner::step(500) reads /proc/<pid>/mem, budget-bounded BFS
+ WarmScanner::seed(&mut info) calls ensure_type on globals,
+   rebuilds type_info from deep registry, enqueues via scan_ptr_fields
+ WarmScanner::step(2000) reads /proc/<pid>/mem, budget-bounded BFS
          │
          ├─ scan_ptr_fields follows pointer fields
          │   ├─ if pointee type has container_of entries:
