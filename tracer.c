@@ -1337,9 +1337,8 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
             }
         }
 
-        /* during BOOT: emit BB entry event but skip all memory instrumentation */
+        /* during BOOT: skip everything; zero ring traffic, preserve budget */
         if (g_phase == PHASE_BOOT) {
-            emit_bb_entry(drcontext, bb, instr, instr_get_app_pc(instr));
             dr_thread_free(drcontext, data, sizeof(*data));
             return DR_EMIT_DEFAULT;
         }
