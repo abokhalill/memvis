@@ -14,13 +14,25 @@ pub struct FieldHeatKey {
     pub field_offset: u64,
 }
 
+// compact key: zero-alloc hot path. strings resolved via intern table on export.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct CompactHeatKey {
+    thread_id: u16,
+    type_id: u32,
+    field_id: u32,
+    field_offset: u64,
+}
+
 /// Per-field write heatmap: tracks how many times each thread writes to each
 /// typed field on STM-projected heap addresses. Used to produce symbolic
 /// pressure maps for cacheline contention analysis.
 #[derive(Debug, Clone)]
 pub struct FieldHeatmap {
-    counts: HashMap<FieldHeatKey, u64>,
-    read_counts: HashMap<FieldHeatKey, u64>,
+    counts: HashMap<CompactHeatKey, u64>,
+    read_counts: HashMap<CompactHeatKey, u64>,
+    // intern tables: string -> id and id -> string
+    str_to_id: HashMap<String, u32>,
+    id_to_str: Vec<String>,
     pub contention_hits: u64,
 }
 
@@ -29,6 +41,8 @@ impl Default for FieldHeatmap {
         Self {
             counts: HashMap::with_capacity(512),
             read_counts: HashMap::with_capacity(256),
+            str_to_id: HashMap::with_capacity(128),
+            id_to_str: Vec::with_capacity(128),
             contention_hits: 0,
         }
     }
@@ -40,13 +54,21 @@ impl FieldHeatmap {
     }
 
     #[inline]
+    fn intern(&mut self, s: &str) -> u32 {
+        if let Some(&id) = self.str_to_id.get(s) {
+            return id;
+        }
+        let id = self.id_to_str.len() as u32;
+        self.id_to_str.push(s.to_string());
+        self.str_to_id.insert(s.to_string(), id);
+        id
+    }
+
+    #[inline]
     pub fn record(&mut self, thread_id: u16, type_name: &str, field_name: &str, field_offset: u64) {
-        let key = FieldHeatKey {
-            thread_id,
-            type_name: type_name.to_string(),
-            field_name: field_name.to_string(),
-            field_offset,
-        };
+        let type_id = self.intern(type_name);
+        let field_id = self.intern(field_name);
+        let key = CompactHeatKey { thread_id, type_id, field_id, field_offset };
         *self.counts.entry(key).or_insert(0) += 1;
     }
 
@@ -58,12 +80,9 @@ impl FieldHeatmap {
         field_name: &str,
         field_offset: u64,
     ) {
-        let key = FieldHeatKey {
-            thread_id,
-            type_name: type_name.to_string(),
-            field_name: field_name.to_string(),
-            field_offset,
-        };
+        let type_id = self.intern(type_name);
+        let field_id = self.intern(field_name);
+        let key = CompactHeatKey { thread_id, type_id, field_id, field_offset };
         *self.read_counts.entry(key).or_insert(0) += 1;
     }
 
@@ -79,19 +98,31 @@ impl FieldHeatmap {
         self.read_counts.len()
     }
 
+    // resolve compact key to string key (cold path only)
+    fn resolve(&self, k: &CompactHeatKey) -> FieldHeatKey {
+        FieldHeatKey {
+            thread_id: k.thread_id,
+            type_name: self.id_to_str.get(k.type_id as usize).cloned().unwrap_or_default(),
+            field_name: self.id_to_str.get(k.field_id as usize).cloned().unwrap_or_default(),
+            field_offset: k.field_offset,
+        }
+    }
+
     // TSV export for divergence analysis: type\tfield\toffset\tthread\twrites
     pub fn export_tsv(&self, path: &std::path::Path) -> std::io::Result<()> {
         use std::io::Write;
         let mut f = std::io::BufWriter::new(std::fs::File::create(path)?);
         writeln!(f, "type\tfield\toffset\tthread\twrites")?;
-        let mut entries: Vec<_> = self.counts.iter().collect();
+        let mut entries: Vec<_> = self.counts.iter()
+            .map(|(k, &c)| (self.resolve(k), c))
+            .collect();
         entries.sort_by(|a, b| {
             a.0.type_name
                 .cmp(&b.0.type_name)
                 .then(a.0.field_offset.cmp(&b.0.field_offset))
                 .then(a.0.thread_id.cmp(&b.0.thread_id))
         });
-        for (k, &c) in &entries {
+        for (k, c) in &entries {
             writeln!(
                 f,
                 "{}\t{}\t{}\t{}\t{}",
@@ -102,15 +133,19 @@ impl FieldHeatmap {
     }
 
     /// Return all entries sorted by write count descending.
-    pub fn top_entries(&self, limit: usize) -> Vec<(&FieldHeatKey, u64)> {
-        let mut v: Vec<_> = self.counts.iter().map(|(k, &c)| (k, c)).collect();
+    pub fn top_entries(&self, limit: usize) -> Vec<(FieldHeatKey, u64)> {
+        let mut v: Vec<_> = self.counts.iter()
+            .map(|(k, &c)| (self.resolve(k), c))
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         v.truncate(limit);
         v
     }
 
-    pub fn top_read_entries(&self, limit: usize) -> Vec<(&FieldHeatKey, u64)> {
-        let mut v: Vec<_> = self.read_counts.iter().map(|(k, &c)| (k, c)).collect();
+    pub fn top_read_entries(&self, limit: usize) -> Vec<(FieldHeatKey, u64)> {
+        let mut v: Vec<_> = self.read_counts.iter()
+            .map(|(k, &c)| (self.resolve(k), c))
+            .collect();
         v.sort_by(|a, b| b.1.cmp(&a.1));
         v.truncate(limit);
         v
@@ -122,12 +157,9 @@ impl FieldHeatmap {
         // group by (type_name, field_name, field_offset)
         let mut by_field: HashMap<(String, String, u64), Vec<(u16, u64)>> = HashMap::new();
         for (key, &count) in &self.counts {
+            let r = self.resolve(key);
             by_field
-                .entry((
-                    key.type_name.clone(),
-                    key.field_name.clone(),
-                    key.field_offset,
-                ))
+                .entry((r.type_name, r.field_name, r.field_offset))
                 .or_default()
                 .push((key.thread_id, count));
         }
@@ -136,8 +168,6 @@ impl FieldHeatmap {
             if threads.len() < 2 {
                 continue;
             }
-            // check if any address at this offset has CL contention
-            // (we can't recover exact addresses here, so just report multi-thread fields)
             let total: u64 = threads.iter().map(|(_, c)| c).sum();
             let mut ts = threads.clone();
             ts.sort_by(|a, b| b.1.cmp(&a.1));
@@ -149,8 +179,7 @@ impl FieldHeatmap {
                 total_writes: total,
             });
         }
-        // also check CL tracker for lines with multi-writer
-        let _ = cl_tracker; // used for future refinement
+        let _ = cl_tracker;
         result.sort_by(|a, b| b.total_writes.cmp(&a.total_writes));
         result
     }
@@ -432,25 +461,41 @@ pub enum StampResult {
     Rejected,
 }
 
+// deferred pointer write: buffered when propagate_field_write finds no
+// covering STM projection. replayed when stamp_type lands a new stamp
+// on a region that covers the write address.
+const DEFERRED_CAP: usize = 4096;
+
+#[derive(Clone)]
+struct DeferredWrite {
+    write_addr: u64,
+    write_value: u64,
+    seq: u64,
+}
+
 pub struct ShadowTypeMap {
-    map: HashMap<u64, TypeProjection>,
+    map: BTreeMap<u64, TypeProjection>,
     // indirect element map: alloc base -> element TypeInfo.
     // populated when a **T field write stores a pointer to an allocation;
     // that allocation is known to hold *T values (e.g. dict.ht_table -> dictEntry*[]).
     indirect: HashMap<u64, TypeInfo>,
+    deferred: VecDeque<DeferredWrite>,
     pub schism_count: u64,
     pub indirect_stamps: u64,
     pub indirect_registrations: u64,
+    pub deferred_replays: u64,
 }
 
 impl Default for ShadowTypeMap {
     fn default() -> Self {
         Self {
-            map: HashMap::with_capacity(256),
+            map: BTreeMap::new(),
             indirect: HashMap::with_capacity(64),
+            deferred: VecDeque::with_capacity(256),
             schism_count: 0,
             indirect_stamps: 0,
             indirect_registrations: 0,
+            deferred_replays: 0,
         }
     }
 }
@@ -494,6 +539,54 @@ impl ShadowTypeMap {
         result
     }
 
+    /// replay deferred pointer writes that now fall within a freshly stamped region.
+    /// called by the reconciler after stamp_type returns Stamped.
+    pub fn replay_deferred(
+        &mut self,
+        base: u64,
+        size: u64,
+        type_registry: &HashMap<String, TypeInfo>,
+        alloc_tracker: &HeapAllocTracker,
+    ) -> usize {
+        let hi = base.saturating_add(size);
+        // drain matching entries; retain non-matching
+        let mut hits: Vec<DeferredWrite> = Vec::new();
+        self.deferred.retain(|d| {
+            if d.write_addr >= base && d.write_addr < hi {
+                hits.push(d.clone());
+                false
+            } else {
+                true
+            }
+        });
+        let mut replayed = 0usize;
+        for d in &hits {
+            if self.propagate_field_write(
+                d.write_addr, d.write_value, 8, d.seq,
+                type_registry, alloc_tracker,
+            ) {
+                replayed += 1;
+            }
+        }
+        self.deferred_replays += replayed as u64;
+        replayed
+    }
+
+    /// buffer an 8-byte pointer write that had no covering STM projection.
+    /// bounded ring; oldest entries evicted silently.
+    pub fn defer_write(&mut self, write_addr: u64, write_value: u64, seq: u64) {
+        if self.deferred.len() >= DEFERRED_CAP {
+            self.deferred.pop_front();
+        }
+        self.deferred.push_back(DeferredWrite { write_addr, write_value, seq });
+    }
+
+    /// purge deferred writes for freed range
+    pub fn purge_deferred(&mut self, addr: u64, size: u64) {
+        let hi = addr.saturating_add(size);
+        self.deferred.retain(|d| d.write_addr < addr || d.write_addr >= hi);
+    }
+
     /// resolve *T->T on pointer field writes within stamped regions.
     /// also handles **T->register indirect element type on target alloc.
     /// freshness guard: skip if covering projection predates alloc epoch.
@@ -521,13 +614,12 @@ impl ShadowTypeMap {
             return false;
         }
 
-        // path 2: write within a stamped struct's field
+        // path 2: write within a stamped struct's field 
         let covering = self
             .map
-            .iter()
-            .find(|(_, p)| {
-                write_addr >= p.base_addr && write_addr < p.base_addr + p.type_info.byte_size
-            })
+            .range(..=write_addr)
+            .next_back()
+            .filter(|(_, p)| write_addr < p.base_addr + p.type_info.byte_size)
             .map(|(_, p)| (p.base_addr, p.stamp_seq, p.type_info.clone()));
 
         let (base, stamp_seq, ti) = match covering {
@@ -604,9 +696,12 @@ impl ShadowTypeMap {
     }
 
     pub fn covering(&self, addr: u64) -> Option<&TypeProjection> {
+        // O(log N): find largest base_addr <= addr, check if addr falls within
         self.map
-            .values()
-            .find(|p| addr >= p.base_addr && addr < p.base_addr + p.type_info.byte_size)
+            .range(..=addr)
+            .next_back()
+            .map(|(_, p)| p)
+            .filter(|p| addr < p.base_addr + p.type_info.byte_size)
     }
 
     pub fn len(&self) -> usize {
