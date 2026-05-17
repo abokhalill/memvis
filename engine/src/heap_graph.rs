@@ -238,6 +238,21 @@ impl HeapGraph {
                 }
             }
         }
+        #[cfg(debug_assertions)]
+        self.assert_addr_to_base_invariant();
+    }
+
+    /// debug-only: verify addr_to_base has no orphaned entries pointing to
+    /// removed objects. every value in addr_to_base must reference a live object.
+    #[cfg(debug_assertions)]
+    fn assert_addr_to_base_invariant(&self) {
+        for (&addr, &base) in &self.addr_to_base {
+            debug_assert!(
+                self.objects.contains_key(&base),
+                "addr_to_base orphan: addr=0x{:x} -> base=0x{:x} (object removed)",
+                addr, base,
+            );
+        }
     }
 
     pub fn edge_count(&self) -> usize {
