@@ -117,32 +117,32 @@ pub fn process_event(
                     ev.seq32() as u64,
                     heap_oracle,
                 );
-                // field heatmap + type stability: attribute write to typed field if STM covers it
+                // single covering() call: heatmap + stability + link emission
+                // clone only the fields needed; avoid full TypeInfo deep-copy
                 let covering_snap = world.stm.covering(ev.addr).map(|c| {
-                    (c.base_addr, c.type_info.name.clone(), c.type_info.fields.clone(), c.type_info.byte_size, c.source_name.clone(), c.stamp_seq, c.type_info.clone())
+                    (c.base_addr, c.type_info.clone(), c.source_name.clone(), c.stamp_seq)
                 });
-                if let Some((base, ref tn, ref fields, _byte_size, ref source, stamp_seq, ref ti_full)) = covering_snap {
+                if let Some((base, ref ti, ref source, stamp_seq)) = covering_snap {
                     let offset = ev.addr - base;
                     if let Some(field) =
-                        fields.iter().find(|f| {
+                        ti.fields.iter().find(|f| {
                             offset >= f.byte_offset && offset < f.byte_offset + f.byte_size
                         })
                     {
                         world.field_heatmap.record(
                             ev.thread_id,
-                            tn,
+                            &ti.name,
                             &field.name,
                             field.byte_offset,
                         );
                     } else {
                         world
                             .field_heatmap
-                            .record(ev.thread_id, tn, "<unresolved>", offset);
+                            .record(ev.thread_id, &ti.name, "<unresolved>", offset);
                     }
-                    // type stability check: reuse the extracted projection
                     let proj = crate::world::TypeProjection {
                         base_addr: base,
-                        type_info: ti_full.clone(),
+                        type_info: ti.clone(),
                         source_name: source.clone(),
                         stamp_seq,
                     };
@@ -167,17 +167,12 @@ pub fn process_event(
                             );
                         }
                     }
-                }
-                if ev.size == 8 && val != 0 {
-                    if let Some(ref mut ts) = topo {
-                        if let Some(covering) = world.stm.covering(ev.addr) {
-                            let offset = ev.addr - covering.base_addr;
-                            if let Some(field) = covering
-                                .type_info
-                                .fields
-                                .iter()
-                                .find(|f| f.byte_offset == offset && f.type_info.is_pointer)
-                            {
+                    // topology link emission: reuse same covering result
+                    if ev.size == 8 && val != 0 {
+                        if let Some(ref mut ts) = topo {
+                            if let Some(field) = ti.fields.iter().find(|f| {
+                                f.byte_offset == offset && f.type_info.is_pointer
+                            }) {
                                 let pointee = field
                                     .type_info
                                     .name
@@ -185,7 +180,7 @@ pub fn process_event(
                                     .unwrap_or(&field.type_info.name);
                                 ts.emit_link(
                                     ev.seq32() as u64,
-                                    &covering.type_info.name,
+                                    &ti.name,
                                     ev.addr,
                                     val,
                                     pointee,
@@ -204,6 +199,10 @@ pub fn process_event(
                         &info.type_registry,
                         &world.heap_allocs,
                     );
+                    // defer unresolved 8-byte pointer writes for retroactive replay
+                    if !stamped && ev.size == 8 && val != 0 {
+                        world.stm.defer_write(ev.addr, val, ev.seq32() as u64);
+                    }
                     if stamped {
                         // ensure_type: upgrade shallow / materialize absent / chase transitive ptrs
                         if let Some(proj) = world.stm.lookup(val) {
@@ -340,6 +339,10 @@ pub fn process_event(
                                     }
                                     if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
                                         orch.bloom_insert(ev.value);
+                                        world.stm.replay_deferred(
+                                            ev.value, patched.byte_size,
+                                            &info.type_registry, &world.heap_allocs,
+                                        );
                                         world.stm.retrospective_scan(
                                             ev.value,
                                             heap_graph,
@@ -483,7 +486,8 @@ pub fn process_event(
         }
         EVENT_ALLOC => {
             let ptr = ev.addr;
-            let size = ev.size as u64;
+            // ev.value carries full 64-bit size; ev.size is uint32_t (truncates >4GB)
+            let size = if ev.value != 0 { ev.value } else { ev.size as u64 };
             let is_duplicate = match world.heap_allocs.on_alloc(ptr, size) {
                 Some(old_size) if old_size == size => true,  // nested wrapper (zmalloc->malloc)
                 Some(old_size) => {
@@ -533,6 +537,10 @@ pub fn process_event(
                     let stamp_res = world.stm.stamp_type(ptr, &stamp_ti, &source, ev.seq32() as u64);
                     if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
                         orch.bloom_insert(ptr);
+                        world.stm.replay_deferred(
+                            ptr, stamp_ti.byte_size,
+                            &info.type_registry, &world.heap_allocs,
+                        );
                         world.stm.retrospective_scan(
                             ptr, heap_graph, &world.heap_allocs,
                             &info.type_registry, ev.seq32() as u64,
@@ -563,6 +571,7 @@ pub fn process_event(
                 }
                 world.stm.purge_range(ptr, old_size);
                 world.stm.purge_indirect(ptr, old_size);
+                world.stm.purge_deferred(ptr, old_size);
                 heap_graph.on_free(ptr, old_size);
                 if let Some(ref mut ts) = topo {
                     ts.emit_free(ev.seq32() as u64, ev.thread_id, ptr, old_size);
