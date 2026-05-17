@@ -231,8 +231,12 @@ impl HeapGraph {
         let hi = addr.saturating_add(size);
         let to_remove: Vec<u64> = self.objects.range(addr..hi).map(|(&k, _)| k).collect();
         for base in to_remove {
-            self.objects.remove(&base);
-            self.addr_to_base.retain(|_, v| *v != base);
+            if let Some(obj) = self.objects.remove(&base) {
+                // O(k) removal via object's own field index instead of O(N) retain
+                for &offset in obj.fields.keys() {
+                    self.addr_to_base.remove(&(base + offset));
+                }
+            }
         }
     }
 
