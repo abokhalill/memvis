@@ -1129,7 +1129,17 @@ fn run_headless(
                         seq_gaps
                     );
                 }
-                eprintln!("memvis: {} events processed, rendering snapshot", total);
+                eprintln!(
+                    "memvis: {} events processed, rendering snapshot\n\
+                     memvis: STM projections={} indirect_reg={} indirect_stamps={} schisms={} deferred_replays={} deferred_pending={}",
+                    total,
+                    world.stm.len(),
+                    world.stm.indirect_registrations,
+                    world.stm.indirect_stamps,
+                    world.stm.schism_count,
+                    world.stm.deferred_replays,
+                    world.stm.deferred_pending(),
+                );
                 let snap = world.snapshot();
                 headless_render(
                     &mut out,

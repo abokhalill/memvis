@@ -748,6 +748,10 @@ impl ShadowTypeMap {
         self.map.len()
     }
 
+    pub fn deferred_pending(&self) -> usize {
+        self.deferred.len()
+    }
+
     pub fn indirect_len(&self) -> usize {
         self.indirect.len()
     }
