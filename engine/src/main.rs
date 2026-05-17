@@ -25,6 +25,7 @@ struct RunConfig {
     heatmap_path: Option<String>,
     coverage_path: Option<String>,
     no_bb: bool,
+    tripwire_symbol: Option<String>,
 }
 
 /// seq domain: JIT-inlined events (WRITE/BB_ENTRY) use raw TLS seq counter,
@@ -2162,6 +2163,29 @@ fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
     }
 }
 
+/// resolve a function symbol name to its ELF offset (vaddr - base_vaddr).
+/// uses the object crate to read .symtab/.dynsym without full DWARF parse.
+fn resolve_elf_symbol_offset(elf_path: &str, symbol_name: &str) -> Option<u64> {
+    use object::{Object, ObjectSegment, ObjectSymbol, SymbolKind};
+    let data = std::fs::read(elf_path).ok()?;
+    let file = object::File::parse(&*data).ok()?;
+    let base_vaddr = file.segments()
+        .filter(|s| s.size() > 0)
+        .map(|s| s.address())
+        .min()
+        .unwrap_or(0);
+    for sym in file.symbols().chain(file.dynamic_symbols()) {
+        if sym.name() == Ok(symbol_name) && sym.kind() == SymbolKind::Text {
+            let addr = sym.address();
+            if addr > 0 {
+                return Some(addr - base_vaddr);
+            }
+        }
+    }
+    eprintln!("memvis: warning: tripwire symbol '{}' not found in {}", symbol_name, elf_path);
+    None
+}
+
 fn launch(target: &str, target_args: &[String], cfg: RunConfig) {
     let drrun = match find_drrun() {
         Some(p) => p,
@@ -2188,8 +2212,19 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig) {
 
     install_signal_handlers();
 
+    // resolve tripwire symbol to ELF offset before spawning drrun
+    let tripwire_offset: Option<u64> = cfg.tripwire_symbol.as_ref().and_then(|sym| {
+        resolve_elf_symbol_offset(target, sym)
+    });
+
     let mut cmd = std::process::Command::new(&drrun);
-    cmd.arg("-c").arg(&tracer).arg("--").arg(target);
+    cmd.arg("-c").arg(&tracer);
+    if let Some(off) = tripwire_offset {
+        cmd.arg(format!("{:x}", off));
+        eprintln!("memvis: tripwire '{}' at ELF offset 0x{:x}",
+                  cfg.tripwire_symbol.as_deref().unwrap_or("?"), off);
+    }
+    cmd.arg("--").arg(target);
     for a in target_args {
         cmd.arg(a);
     }
@@ -2367,6 +2402,7 @@ fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
     let live = take_flag(args, "--live");
     take_flag(args, "--once");
     let no_bb = take_flag(args, "--no-bb");
+    let tripwire_symbol = take_flag_value(args, "--tripwire");
     RunConfig {
         once: !live,
         min_events: take_flag_value(args, "--min-events")
@@ -2381,6 +2417,7 @@ fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
             .or_else(|| take_flag_value(args, "--export-heatmap")),
         coverage_path: take_flag_value(args, "--coverage"),
         no_bb,
+        tripwire_symbol,
     }
 }
 
