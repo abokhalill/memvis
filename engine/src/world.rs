@@ -539,37 +539,56 @@ impl ShadowTypeMap {
         result
     }
 
-    /// replay deferred pointer writes that now fall within a freshly stamped region.
-    /// called by the reconciler after stamp_type returns Stamped.
+    /// replay deferred pointer writes against all current STM projections.
+    /// convergence loop: each successful propagation may stamp a new region
+    /// whose own deferred writes must also be replayed (e.g. A->B->C chains).
+    /// capped at 8 passes to bound pathological graphs.
+    const REPLAY_MAX_PASSES: usize = 8;
+
     pub fn replay_deferred(
         &mut self,
-        base: u64,
-        size: u64,
+        _base: u64,
+        _size: u64,
         type_registry: &HashMap<String, TypeInfo>,
         alloc_tracker: &HeapAllocTracker,
     ) -> usize {
-        let hi = base.saturating_add(size);
-        // drain matching entries; retain non-matching
-        let mut hits: Vec<DeferredWrite> = Vec::new();
-        self.deferred.retain(|d| {
-            if d.write_addr >= base && d.write_addr < hi {
-                hits.push(d.clone());
-                false
-            } else {
-                true
+        let mut total_replayed = 0usize;
+        for _ in 0..Self::REPLAY_MAX_PASSES {
+            // drain all entries that now have a covering projection
+            let mut hits: Vec<DeferredWrite> = Vec::new();
+            self.deferred.retain(|d| {
+                let covered = self.map
+                    .range(..=d.write_addr)
+                    .next_back()
+                    .filter(|(_, p)| d.write_addr < p.base_addr + p.type_info.byte_size)
+                    .is_some();
+                if covered {
+                    hits.push(d.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            if hits.is_empty() {
+                break;
             }
-        });
-        let mut replayed = 0usize;
-        for d in &hits {
-            if self.propagate_field_write(
-                d.write_addr, d.write_value, 8, d.seq,
-                type_registry, alloc_tracker,
-            ) {
-                replayed += 1;
+            let mut pass_replayed = 0usize;
+            for d in &hits {
+                if self.propagate_field_write(
+                    d.write_addr, d.write_value, 8, d.seq,
+                    type_registry, alloc_tracker,
+                ) {
+                    pass_replayed += 1;
+                }
+            }
+            total_replayed += pass_replayed;
+            // no new stamps produced this pass -> no point continuing
+            if pass_replayed == 0 {
+                break;
             }
         }
-        self.deferred_replays += replayed as u64;
-        replayed
+        self.deferred_replays += total_replayed as u64;
+        total_replayed
     }
 
     /// buffer an 8-byte pointer write that had no covering STM projection.
@@ -696,12 +715,21 @@ impl ShadowTypeMap {
     }
 
     pub fn covering(&self, addr: u64) -> Option<&TypeProjection> {
-        // O(log N): find largest base_addr <= addr, check if addr falls within
-        self.map
-            .range(..=addr)
-            .next_back()
-            .map(|(_, p)| p)
-            .filter(|p| addr < p.base_addr + p.type_info.byte_size)
+        // O(log N) primary; one backward step if immediate match fails bounds
+        // (defends against nested/overlapping sub-projections masking a parent)
+        let mut iter = self.map.range(..=addr).rev();
+        if let Some((_, p)) = iter.next() {
+            if addr < p.base_addr + p.type_info.byte_size {
+                return Some(p);
+            }
+        }
+        // fallback: next-lower entry may be a larger parent that spans addr
+        if let Some((_, p)) = iter.next() {
+            if addr < p.base_addr + p.type_info.byte_size {
+                return Some(p);
+            }
+        }
+        None
     }
 
     pub fn len(&self) -> usize {
