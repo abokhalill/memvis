@@ -653,11 +653,23 @@ impl ShadowTypeMap {
         }
 
         let offset = write_addr - base;
-        if let Some(field) = ti
-            .fields
-            .iter()
-            .find(|f| f.byte_offset == offset && f.name != "<pointee>")
-        {
+        // union-aware: when multiple fields share the same offset (union layout),
+        // prefer the field whose byte_size matches write_size. falls back to
+        // largest field at offset (pointer > primitive for propagation).
+        let field_match = {
+            let candidates: Vec<_> = ti.fields.iter()
+                .filter(|f| f.byte_offset == offset && f.name != "<pointee>")
+                .collect();
+            if candidates.len() <= 1 {
+                candidates.into_iter().next()
+            } else {
+                // exact size match first; then largest (pointers are 8B)
+                candidates.iter().copied()
+                    .find(|f| f.byte_size == write_size as u64)
+                    .or_else(|| candidates.into_iter().max_by_key(|f| f.byte_size))
+            }
+        };
+        if let Some(field) = field_match {
             if field.type_info.is_pointer {
                 let pointee_name = field.type_info.name.strip_prefix('*').unwrap_or("");
                 if let Some(pointee_ti) = type_registry.get(pointee_name) {
@@ -769,15 +781,25 @@ impl ShadowTypeMap {
         mem: Option<&std::fs::File>,
     ) -> usize {
         use std::os::unix::fs::FileExt;
-        const FUEL: usize = 64;
+        // adaptive fuel: scale with root type's pointer field count.
+        // deep types (redisServer: ~60 ptrs) get fuel=240; simple structs get floor=64.
+        let fuel = match self.map.get(&seed_addr) {
+            Some(p) => {
+                let ptr_fields = p.type_info.fields.iter()
+                    .filter(|f| f.type_info.is_pointer && f.byte_size == 8)
+                    .count();
+                (ptr_fields * 4).max(64).min(256)
+            }
+            None => 64,
+        };
         let mut queue: VecDeque<u64> = VecDeque::with_capacity(16);
-        let mut visited: HashSet<u64> = HashSet::with_capacity(FUEL);
+        let mut visited: HashSet<u64> = HashSet::with_capacity(fuel);
         queue.push_back(seed_addr);
         visited.insert(seed_addr);
         let mut stamped = 0usize;
 
         while let Some(base) = queue.pop_front() {
-            if stamped >= FUEL {
+            if stamped >= fuel {
                 break;
             }
 
