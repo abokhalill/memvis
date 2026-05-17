@@ -1106,25 +1106,33 @@ impl TypeStabilityMonitor {
 
         match field {
             Some(f) => {
-                // write starts within this field. check if it stays within bounds.
                 let field_end = f.byte_offset + f.byte_size;
                 let write_end = offset + write_size as u64;
                 if write_end > field_end {
-                    // spans past this field into the next field or padding
-                    tally.spanning += 1;
-                    self.total_violations += 1;
-                    self.record_violation(TypeViolation {
-                        kind: ViolationKind::Spanning,
-                        write_addr,
-                        write_size,
-                        base_addr: proj.base_addr,
-                        offset,
-                        type_name: proj.type_info.name.clone(),
-                        expected_field: Some(f.name.clone()),
-                        expected_size: Some(f.byte_size),
-                        pc,
+                    // wide store: compiler may coalesce adjacent field writes
+                    // (e.g. 16B XMM store across two 8B fields). check if
+                    // write_end lands exactly on a field boundary.
+                    let coalesced = fields.iter().any(|nf| {
+                        nf.byte_offset >= field_end
+                            && nf.byte_offset + nf.byte_size >= write_end
+                            && write_end <= nf.byte_offset + nf.byte_size
                     });
-                    return true;
+                    if !coalesced {
+                        tally.spanning += 1;
+                        self.total_violations += 1;
+                        self.record_violation(TypeViolation {
+                            kind: ViolationKind::Spanning,
+                            write_addr,
+                            write_size,
+                            base_addr: proj.base_addr,
+                            offset,
+                            type_name: proj.type_info.name.clone(),
+                            expected_field: Some(f.name.clone()),
+                            expected_size: Some(f.byte_size),
+                            pc,
+                        });
+                        return true;
+                    }
                 }
                 tally.aligned += 1;
                 false
