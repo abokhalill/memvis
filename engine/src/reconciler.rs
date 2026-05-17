@@ -1014,6 +1014,10 @@ impl WarmScanner {
             if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
                 self.stats.stamps_applied += 1;
                 stamps_this_step += 1;
+                world.stm.replay_deferred(
+                    target_addr, pointee_ti.byte_size,
+                    &info.type_registry, &world.heap_allocs,
+                );
                 if let Some(ref mut ts) = topo {
                     ts.emit_cold_stamp(
                         target_addr,
@@ -1145,6 +1149,10 @@ pub fn warm_scan(
         }
         if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
             stats.stamps_applied += 1;
+            world.stm.replay_deferred(
+                target_addr, pointee_ti.byte_size,
+                &info.type_registry, &world.heap_allocs,
+            );
             if let Some(ref mut ts) = topo {
                 ts.emit_cold_stamp(
                     target_addr,
