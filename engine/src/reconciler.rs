@@ -199,8 +199,15 @@ pub fn process_event(
                         &info.type_registry,
                         &world.heap_allocs,
                     );
-                    // defer unresolved 8-byte pointer writes for retroactive replay
-                    if !stamped && ev.size == 8 && val != 0 {
+                    // defer unresolved 8-byte pointer writes for retroactive replay.
+                    // value-space filter: only buffer if the written value is a
+                    // plausible aligned heap pointer. drops raw integers, counters,
+                    // string data, stack/TLS/code refs. does NOT gate on
+                    // HeapAllocTracker (alloc event may not have arrived yet).
+                    if !stamped && ev.size == 8 && val != 0
+                        && val % 8 == 0
+                        && heap_oracle.is_heap(val)
+                    {
                         world.stm.defer_write(ev.addr, val, ev.seq32() as u64);
                     }
                     if stamped {
