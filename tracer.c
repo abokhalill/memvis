@@ -115,6 +115,14 @@ static uint64_t g_module_base = 0;
 static uint64_t g_module_end  = 0;
 static _Atomic int g_module_base_phase = 0;
 
+/* phase-delayed JIT hydration: skip instrumentation during init,
+ * activate when RIP hits tripwire (e.g. aeMain). */
+#define PHASE_BOOT  0
+#define PHASE_TRACE 1
+static volatile int g_phase = PHASE_TRACE;  /* default: full trace (no tripwire) */
+static uint64_t g_tripwire_offset = 0;      /* ELF offset from client argv */
+static void tripwire_hit(void);
+
 /* sidecar module table: written to /dev/shm/memvis_modules_<pid> */
 #define MODTAB_MAX 64
 static struct { uint64_t base; char path[256]; } g_modtab[MODTAB_MAX];
@@ -1317,7 +1325,31 @@ event_bb_insert(void *drcontext, void *tag, instrlist_t *bb, instr_t *instr,
 
     if (!data->bb_emitted) {
         data->bb_emitted = true;
+
+        /* phase-delayed hydration: check tripwire on every BB entry during BOOT.
+         * cost during BOOT: one compare + conditional clean call per BB.
+         * cost during TRACE: one compare (branch-predicted not-taken). */
+        if (g_phase == PHASE_BOOT && g_tripwire_offset != 0 && g_module_base != 0) {
+            uint64_t bb_off = (uint64_t)(ptr_uint_t)instr_get_app_pc(instr) - g_module_base;
+            if (bb_off == g_tripwire_offset) {
+                dr_insert_clean_call(drcontext, bb, instr,
+                                     (void *)tripwire_hit, false, 0);
+            }
+        }
+
+        /* during BOOT: emit BB entry event but skip all memory instrumentation */
+        if (g_phase == PHASE_BOOT) {
+            emit_bb_entry(drcontext, bb, instr, instr_get_app_pc(instr));
+            dr_thread_free(drcontext, data, sizeof(*data));
+            return DR_EMIT_DEFAULT;
+        }
+
         emit_bb_entry(drcontext, bb, instr, instr_get_app_pc(instr));
+    }
+
+    /* all instrumentation below is PHASE_TRACE only */
+    if (g_phase == PHASE_BOOT) {
+        return DR_EMIT_DEFAULT;
     }
 
     handle_pending_post_write(drcontext, bb, instr, data);
@@ -2036,10 +2068,33 @@ event_exit(void)
     drmgr_exit();
 }
 
+static void tripwire_hit(void)
+{
+    if (g_phase != PHASE_BOOT) return;
+    g_phase = PHASE_TRACE;
+    dr_printf("memvis: TRIPWIRE HIT — phase transition BOOT->TRACE, flushing code cache\n");
+    /* dr_delay_flush_region: no lock restrictions, most performant flush.
+     * invalidates entire code cache; all BBs recompiled with full instrumentation. */
+    dr_delay_flush_region(0, (size_t)~0ULL, 0, NULL);
+}
+
 DR_EXPORT void
 dr_client_main(client_id_t id, int argc, const char *argv[])
 {
-    (void)id; (void)argc; (void)argv;
+    (void)id;
+
+    /* parse client args: argv[0] is client lib path, argv[1..] are our args.
+     * first real arg is hex tripwire ELF offset (0 = disabled). */
+    if (argc >= 2 && argv[1] != NULL) {
+        char *end = NULL;
+        uint64_t off = (uint64_t)strtoull(argv[1], &end, 16);
+        if (end != argv[1] && off != 0) {
+            g_tripwire_offset = off;
+            g_phase = PHASE_BOOT;
+            dr_printf("memvis: tripwire armed at ELF+0x%llx (PHASE_BOOT)\n",
+                      (unsigned long long)off);
+        }
+    }
 
     dr_set_client_name("memvis tracer", "https://github.com/abokhalill/memvis");
 
