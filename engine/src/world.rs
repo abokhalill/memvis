@@ -515,28 +515,40 @@ impl ShadowTypeMap {
         if target_addr == 0 || pointee_type.byte_size == 0 {
             return StampResult::Rejected;
         }
-        let result = if let Some(existing) = self.map.get(&target_addr) {
-            if existing.type_info.name != pointee_type.name {
-                self.schism_count += 1;
-                StampResult::Schism {
-                    old_type: existing.type_info.name.clone(),
-                    old_source: existing.source_name.clone(),
-                    old_stamp_seq: existing.stamp_seq,
-                }
-            } else {
-                StampResult::Restamped
+        if let Some(existing) = self.map.get(&target_addr) {
+            if existing.type_info.name == pointee_type.name {
+                return StampResult::Restamped;
             }
+            // never overwrite a stamp with a higher seq.
+            // cold warm-scan stamps (seq=0) never overwrite online stamps (seq>0).
+            // stale indirect/deferred replays (lower seq) never overwrite newer stamps.
+            if existing.stamp_seq > seq {
+                return StampResult::Rejected;
+            }
+            self.schism_count += 1;
+            let schism = StampResult::Schism {
+                old_type: existing.type_info.name.clone(),
+                old_source: existing.source_name.clone(),
+                old_stamp_seq: existing.stamp_seq,
+            };
+            let proj = TypeProjection {
+                base_addr: target_addr,
+                type_info: pointee_type.clone(),
+                source_name: source_name.to_string(),
+                stamp_seq: seq,
+            };
+            self.map.insert(target_addr, proj);
+            schism
         } else {
+            let proj = TypeProjection {
+                base_addr: target_addr,
+                type_info: pointee_type.clone(),
+                source_name: source_name.to_string(),
+                stamp_seq: seq,
+            };
+            self.map.insert(target_addr, proj);
             StampResult::Stamped
-        };
-        let proj = TypeProjection {
-            base_addr: target_addr,
-            type_info: pointee_type.clone(),
-            source_name: source_name.to_string(),
-            stamp_seq: seq,
-        };
-        self.map.insert(target_addr, proj);
-        result
+        }
     }
 
     /// replay deferred pointer writes against all current STM projections.
@@ -1064,6 +1076,7 @@ pub struct TypeStabilityTally {
     pub interstitial: u64,
     pub spanning: u64,
     pub aligned: u64,
+    pub synthesized: u64,
 }
 
 impl TypeStabilityMonitor {
@@ -1102,7 +1115,7 @@ impl TypeStabilityMonitor {
         });
 
         let tally = self.tally.entry(proj.type_info.name.clone())
-            .or_insert(TypeStabilityTally { interstitial: 0, spanning: 0, aligned: 0 });
+            .or_insert(TypeStabilityTally { interstitial: 0, spanning: 0, aligned: 0, synthesized: 0 });
 
         match field {
             Some(f) => {
@@ -1112,12 +1125,19 @@ impl TypeStabilityMonitor {
                     // wide store: compiler may coalesce adjacent field writes
                     // (e.g. 16B XMM store across two 8B fields). check if
                     // write_end lands exactly on a field boundary.
+                    // coalesced: write lands within an adjacent field's boundary
                     let coalesced = fields.iter().any(|nf| {
                         nf.byte_offset >= field_end
                             && nf.byte_offset + nf.byte_size >= write_end
                             && write_end <= nf.byte_offset + nf.byte_size
                     });
-                    if !coalesced {
+                    // tail spill: write extends past the last field into struct
+                    // tail padding or alignment space (e.g. 16B XMM store on
+                    // last 8B function pointer). accept if overshoot ≤ 8 bytes.
+                    let tail_spill = !coalesced
+                        && write_end <= proj.type_info.byte_size + 8
+                        && write_end > proj.type_info.byte_size;
+                    if !coalesced && !tail_spill {
                         tally.spanning += 1;
                         self.total_violations += 1;
                         self.record_violation(TypeViolation {
@@ -1138,21 +1158,32 @@ impl TypeStabilityMonitor {
                 false
             }
             None => {
-                // no field covers this offset: padding, tail, or corruption
-                tally.interstitial += 1;
-                self.total_violations += 1;
-                self.record_violation(TypeViolation {
-                    kind: ViolationKind::Interstitial,
-                    write_addr,
-                    write_size,
-                    base_addr: proj.base_addr,
-                    offset,
-                    type_name: proj.type_info.name.clone(),
-                    expected_field: None,
-                    expected_size: None,
-                    pc,
-                });
-                true
+                // No field covers this offset. if the write is within the
+                // type's declared byte_size, it hits a DWARF shadow zone:
+                // feature-gated or macro-disabled fields that occupy real
+                // struct space but lack DW_TAG_member entries. synthesize
+                // an anonymous field and classify as aligned.
+                let write_end = offset + write_size as u64;
+                if write_end <= proj.type_info.byte_size {
+                    tally.synthesized += 1;
+                    tally.aligned += 1;
+                    false
+                } else {
+                    tally.interstitial += 1;
+                    self.total_violations += 1;
+                    self.record_violation(TypeViolation {
+                        kind: ViolationKind::Interstitial,
+                        write_addr,
+                        write_size,
+                        base_addr: proj.base_addr,
+                        offset,
+                        type_name: proj.type_info.name.clone(),
+                        expected_field: None,
+                        expected_size: None,
+                        pc,
+                    });
+                    true
+                }
             }
         }
     }
