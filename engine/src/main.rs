@@ -1571,8 +1571,8 @@ fn headless_render(
             }
             let _ = writeln!(
                 out,
-                "  {:<30} aligned={:<8} interstitial={:<8} spanning={}",
-                tn, t.aligned, t.interstitial, t.spanning
+                "  {:<30} aligned={:<8} synthesized={:<6} interstitial={:<8} spanning={}",
+                tn, t.aligned, t.synthesized, t.interstitial, t.spanning
             );
         }
         let _ = writeln!(out, "  Top violations (capped at 128):");
