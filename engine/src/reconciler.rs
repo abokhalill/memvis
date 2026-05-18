@@ -583,6 +583,19 @@ pub fn process_event(
                 if let Some(ref mut ts) = topo {
                     ts.emit_free(ev.seq32() as u64, ev.thread_id, ptr, old_size);
                 }
+            } else if let Some(proj) = world.stm.lookup(ptr).cloned() {
+                // orphan free: alloc happened during PHASE_BOOT (untracked).
+                // purge the warm-scan stamp to prevent schism on address reuse.
+                let purge_size = proj.type_info.byte_size;
+                let seq = ev.seq32() as u64;
+                world.type_epochs.close_epoch(ptr, purge_size, &proj, seq, EpochClose::Free);
+                if let Some(ref mut ts) = topo {
+                    ts.emit_type_epoch_close(seq, ptr, &proj.type_info.name, &proj.source_name, proj.stamp_seq, seq, "free");
+                }
+                world.stm.purge_range(ptr, purge_size);
+                world.stm.purge_indirect(ptr, purge_size);
+                world.stm.purge_deferred(ptr, purge_size);
+                heap_graph.on_free(ptr, purge_size);
             }
             true
         }
