@@ -1999,22 +1999,31 @@ fn cleanup_shm() {
     }
 }
 
-fn find_drrun() -> Option<std::path::PathBuf> {
-    // 1. MEMVIS_DRRUN env var (explicit override)
+fn find_drrun(cfg: &memvis::config::Config) -> Option<std::path::PathBuf> {
+    if let Some(ref p) = cfg.drrun_path {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
     if let Ok(p) = env::var("MEMVIS_DRRUN") {
         let path = std::path::PathBuf::from(&p);
         if path.exists() {
             return Some(path);
         }
     }
-    // 2. DYNAMORIO_HOME env var
     if let Ok(home) = env::var("DYNAMORIO_HOME") {
         let path = std::path::PathBuf::from(&home).join("bin64/drrun");
         if path.exists() {
             return Some(path);
         }
     }
-    // 3. PATH lookup
+    if let Some(ref home) = cfg.dynamorio_home {
+        let path = std::path::PathBuf::from(home).join("bin64/drrun");
+        if path.exists() {
+            return Some(path);
+        }
+    }
     if let Ok(output) = std::process::Command::new("which").arg("drrun").output() {
         if output.status.success() {
             let s = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -2023,22 +2032,30 @@ fn find_drrun() -> Option<std::path::PathBuf> {
             }
         }
     }
+    if let Some(dr_home) = memvis::config::discover_dynamorio() {
+        let path = dr_home.join("bin64/drrun");
+        if path.exists() {
+            return Some(path);
+        }
+    }
     None
 }
 
-fn find_tracer() -> Option<std::path::PathBuf> {
-    // 1. MEMVIS_TRACER env var
+fn find_tracer(cfg: &memvis::config::Config) -> Option<std::path::PathBuf> {
+    if let Some(ref p) = cfg.tracer_path {
+        let path = std::path::PathBuf::from(p);
+        if path.exists() {
+            return Some(path);
+        }
+    }
     if let Ok(p) = env::var("MEMVIS_TRACER") {
         let path = std::path::PathBuf::from(&p);
         if path.exists() {
             return Some(path);
         }
     }
-    // 2. relative to the current exe
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
-            // release binary is at engine/target/release/memvis
-            // tracer is at build/libmemvis_tracer.so
             for candidate in &[
                 dir.join("../../build/libmemvis_tracer.so"),
                 dir.join("../../../build/libmemvis_tracer.so"),
@@ -2186,20 +2203,38 @@ fn resolve_elf_symbol_offset(elf_path: &str, symbol_name: &str) -> Option<u64> {
     None
 }
 
-fn launch(target: &str, target_args: &[String], cfg: RunConfig) {
-    let drrun = match find_drrun() {
+fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &memvis::config::Config) {
+    let drrun = match find_drrun(resolved_cfg) {
         Some(p) => p,
         None => {
-            eprintln!("memvis: error: cannot find drrun.");
-            eprintln!("  Set DYNAMORIO_HOME or MEMVIS_DRRUN environment variable.");
+            eprintln!("memvis: error: could not locate DynamoRIO.");
+            eprintln!();
+            eprintln!("  To fix this, do ONE of the following:");
+            eprintln!();
+            eprintln!("    1. Run 'memvis setup' to auto-discover and persist the path.");
+            eprintln!("    2. Set the environment variable:");
+            eprintln!("         export DYNAMORIO_HOME=/path/to/DynamoRIO-Linux-*");
+            eprintln!("    3. Add to ~/.config/memvis/config:");
+            eprintln!("         paths.dynamorio_home = /path/to/DynamoRIO-Linux-*");
+            eprintln!();
+            eprintln!("  Searched: MEMVIS_DRRUN, DYNAMORIO_HOME, config file, PATH, ~/DynamoRIO-Linux-*, /opt/dynamorio");
             std::process::exit(1);
         }
     };
-    let tracer = match find_tracer() {
+    let tracer = match find_tracer(resolved_cfg) {
         Some(p) => p,
         None => {
-            eprintln!("memvis: error: cannot find libmemvis_tracer.so.");
-            eprintln!("  Set MEMVIS_TRACER or build with: cd build && cmake --build .");
+            eprintln!("memvis: error: could not locate libmemvis_tracer.so.");
+            eprintln!();
+            eprintln!("  To fix this, do ONE of the following:");
+            eprintln!();
+            eprintln!("    1. Build the tracer:");
+            eprintln!("         cd build && cmake .. -DDynamoRIO_DIR=$DYNAMORIO_HOME/cmake && make");
+            eprintln!("    2. Run 'memvis setup' to auto-detect after building.");
+            eprintln!("    3. Set the environment variable:");
+            eprintln!("         export MEMVIS_TRACER=/path/to/libmemvis_tracer.so");
+            eprintln!();
+            eprintln!("  Searched: config file, MEMVIS_TRACER, relative to memvis binary");
             std::process::exit(1);
         }
     };
@@ -2294,35 +2329,66 @@ fn print_help() {
     eprintln!("memvis {} — runtime memory topology analyzer", VERSION);
     eprintln!();
     eprintln!("USAGE:");
-    eprintln!("  memvis <target> [args...]          Instrument and print snapshot (headless)");
-    eprintln!("  memvis <target> --live [args...]    Instrument with interactive TUI");
-    eprintln!("  memvis record -o <file> <target>   Record event trace to file");
-    eprintln!("  memvis replay <file> [--dwarf <elf>]");
-    eprintln!("                                     Replay a recorded trace");
-    eprintln!("  memvis attach [--dwarf <elf>]       Attach to already-running tracer");
+    eprintln!("  memvis <target> [-- target_args]    Instrument a binary");
+    eprintln!("  memvis <target> --live              Interactive TUI");
     eprintln!();
-    eprintln!("EXAMPLES:");
-    eprintln!("  memvis ./my_program                Headless snapshot of ./my_program");
-    eprintln!("  memvis ./my_program --live          Interactive TUI");
-    eprintln!("  memvis record -o trace.bin ./app    Record trace");
-    eprintln!("  memvis replay trace.bin --dwarf ./app");
+    eprintln!("COMMANDS:");
+    eprintln!("  setup                  One-time setup: locate DynamoRIO, persist config");
+    eprintln!("  init <target>          Create .memvis project profile with auto-detected tripwire");
+    eprintln!("  record -o <f> <target> Record event trace for offline replay");
+    eprintln!("  replay <file>          Replay a recorded trace");
+    eprintln!("  attach                 Attach to an already-running tracer");
     eprintln!();
-    eprintln!("OPTIONS:");
-    eprintln!("  --live                 Interactive TUI instead of headless");
+    eprintln!("COMMON OPTIONS:");
+    eprintln!("  --tripwire <sym>       Begin tracing when <sym> is entered (skips init redundancy)");
+    eprintln!("  --live                 Interactive TUI instead of headless snapshot");
     eprintln!("  --topology <file>      Export topology graph as JSONL");
     eprintln!("  --heatmap <file>       Export field write heatmap as TSV");
-    eprintln!("  --min-events <N>       Minimum events before snapshot (default: 1)");
-    eprintln!("  --dwarf <elf>          Explicit DWARF source (if separate from target)");
-    eprintln!("  --no-bb                Skip BB_ENTRY events (reduces volume)");
-    eprintln!("  --coverage <file>      Export basic-block coverage map as TSV");
-    eprintln!("  -o, --output <file>    Output file (for record, diff)");
     eprintln!("  -h, --help             Show this help");
     eprintln!("  -V, --version          Print version");
+    eprintln!();
+    eprintln!("GETTING STARTED:");
+    eprintln!("  memvis setup                       Auto-detect DynamoRIO and write config");
+    eprintln!("  memvis ./my_server                 Headless snapshot");
+    eprintln!("  memvis ./my_server -- --port 9999  Override target args");
+    eprintln!();
+    eprintln!("  Run 'memvis help advanced' for all options and tuning flags.");
+}
+
+fn print_help_advanced() {
+    eprintln!("memvis {} — advanced options", VERSION);
+    eprintln!();
+    eprintln!("INSTRUMENTATION:");
+    eprintln!("  --tripwire <sym>       Defer tracing until function <sym> is entered");
+    eprintln!("  --no-bb                Skip BB_ENTRY events (reduces ring buffer volume)");
+    eprintln!("  --min-events <N>       Minimum events before snapshot (default: 1)");
+    eprintln!("  --dr-home <path>       Explicit DynamoRIO installation (overrides config/env)");
+    eprintln!();
+    eprintln!("EXPORTS:");
+    eprintln!("  --topology <file>      Export topology graph as JSONL");
+    eprintln!("  --heatmap <file>       Export field write heatmap as TSV");
+    eprintln!("  --coverage <file>      Export basic-block coverage map as TSV");
+    eprintln!("  -o, --output <file>    Output file (for record)");
+    eprintln!();
+    eprintln!("REPLAY:");
+    eprintln!("  --dwarf <elf>          Explicit DWARF source (if separate from target)");
+    eprintln!();
+    eprintln!("CONFIGURATION:");
+    eprintln!("  Global:  ~/.config/memvis/config   (created by 'memvis setup')");
+    eprintln!("  Project: .memvis                   (created by 'memvis init')");
+    eprintln!();
+    eprintln!("  Resolution order: CLI > env var > .memvis > global config > auto-detect");
     eprintln!();
     eprintln!("ENVIRONMENT (optional — auto-detected if not set):");
     eprintln!("  DYNAMORIO_HOME         DynamoRIO installation directory");
     eprintln!("  MEMVIS_DRRUN           Explicit path to drrun binary");
     eprintln!("  MEMVIS_TRACER          Explicit path to libmemvis_tracer.so");
+    eprintln!();
+    eprintln!("ARGUMENT OVERRIDE SEMANTICS:");
+    eprintln!("  memvis [MEMVIS_FLAGS] <target> [-- TARGET_ARGS]");
+    eprintln!();
+    eprintln!("  Args after '--' fully REPLACE any target.*.args from .memvis.");
+    eprintln!("  Without '--', target args come from the project profile (if defined).");
 }
 
 fn die(msg: &str) -> ! {
@@ -2372,6 +2438,14 @@ fn main() {
 
     let first = args.first().map(|s| s.as_str()).unwrap_or("");
     match first {
+        "setup" => {
+            args.remove(0);
+            cmd_setup(&mut args);
+        }
+        "init" => {
+            args.remove(0);
+            cmd_init(&mut args);
+        }
         "record" => {
             args.remove(0);
             cmd_record(&mut args);
@@ -2383,6 +2457,15 @@ fn main() {
         "attach" => {
             args.remove(0);
             cmd_attach(&mut args);
+        }
+        "help" => {
+            args.remove(0);
+            if args.first().map(|s| s.as_str()) == Some("advanced") {
+                print_help_advanced();
+            } else {
+                print_help();
+            }
+            std::process::exit(0);
         }
         _ => {
             if args.iter().any(|a| a == "--replay") {
@@ -2422,7 +2505,14 @@ fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
 }
 
 fn cmd_run(args: &mut Vec<String>) {
-    let cfg = parse_common_flags(args);
+    let dr_home_flag = take_flag_value(args, "--dr-home");
+    let mut cfg = parse_common_flags(args);
+
+    let (mut resolved_cfg, proj_cfg) = memvis::config::resolve_config();
+    if let Some(ref dr) = dr_home_flag {
+        resolved_cfg.drrun_path = Some(format!("{}/bin64/drrun", dr));
+        resolved_cfg.dynamorio_home = Some(dr.clone());
+    }
 
     let target_idx = args.iter().position(|a| !a.starts_with('-'));
     let target_idx = match target_idx {
@@ -2431,15 +2521,66 @@ fn cmd_run(args: &mut Vec<String>) {
     };
 
     let target = args[target_idx].clone();
-    let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(&target, &target_args, cfg);
+    // '--' boundary: full override, no merge
+    let has_separator = args[target_idx + 1..].iter().any(|a| a == "--");
+    let target_args: Vec<String> = if has_separator {
+        let sep_pos = args[target_idx + 1..].iter().position(|a| a == "--").unwrap();
+        args[target_idx + 1 + sep_pos + 1..].to_vec()
+    } else {
+        let profile = memvis::config::resolve_target_profile(&proj_cfg, &target);
+        if let Some(prof) = profile {
+            if cfg.tripwire_symbol.is_none() {
+                cfg.tripwire_symbol = prof.tripwire.clone();
+            }
+            if cfg.topo_path.is_none() {
+                cfg.topo_path = prof.topology.clone();
+            }
+            if cfg.heatmap_path.is_none() {
+                cfg.heatmap_path = prof.heatmap.clone();
+            }
+            if cfg.coverage_path.is_none() {
+                cfg.coverage_path = prof.coverage.clone();
+            }
+            if !prof.args.is_empty() {
+                prof.args.clone()
+            } else {
+                args[target_idx + 1..].to_vec()
+            }
+        } else {
+            args[target_idx + 1..].to_vec()
+        }
+    };
+
+    if cfg.topo_path.is_none() && resolved_cfg.default_topology == Some(true) {
+        let base = std::path::Path::new(&target)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("memvis");
+        cfg.topo_path = Some(format!("{}.topo.jsonl", base));
+    }
+    if cfg.heatmap_path.is_none() && resolved_cfg.default_heatmap == Some(true) {
+        let base = std::path::Path::new(&target)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("memvis");
+        cfg.heatmap_path = Some(format!("{}.heatmap.tsv", base));
+    }
+
+    launch(&target, &target_args, cfg, &resolved_cfg);
 }
 
 fn cmd_record(args: &mut Vec<String>) {
+    let dr_home_flag = take_flag_value(args, "--dr-home");
     let cfg = parse_common_flags(args);
     if cfg.record_path.is_none() {
         die("record requires -o <file>");
+    }
+
+    let (mut resolved_cfg, _proj_cfg) = memvis::config::resolve_config();
+    if let Some(ref dr) = dr_home_flag {
+        resolved_cfg.drrun_path = Some(format!("{}/bin64/drrun", dr));
+        resolved_cfg.dynamorio_home = Some(dr.clone());
     }
 
     let target_idx = args.iter().position(|a| !a.starts_with('-'));
@@ -2451,7 +2592,7 @@ fn cmd_record(args: &mut Vec<String>) {
     let target = args[target_idx].clone();
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(&target, &target_args, cfg);
+    launch(&target, &target_args, cfg, &resolved_cfg);
 }
 
 fn cmd_replay(args: &mut Vec<String>) {
@@ -2524,8 +2665,15 @@ fn cmd_record_compat(args: &mut Vec<String>) {
 }
 
 fn cmd_run_with_record(args: &mut Vec<String>, record_path: String) {
+    let dr_home_flag = take_flag_value(args, "--dr-home");
     let mut cfg = parse_common_flags(args);
     cfg.record_path = Some(record_path);
+
+    let (mut resolved_cfg, _proj_cfg) = memvis::config::resolve_config();
+    if let Some(ref dr) = dr_home_flag {
+        resolved_cfg.drrun_path = Some(format!("{}/bin64/drrun", dr));
+        resolved_cfg.dynamorio_home = Some(dr.clone());
+    }
 
     let target_idx = args.iter().position(|a| !a.starts_with('-'));
     let target_idx = match target_idx {
@@ -2536,5 +2684,241 @@ fn cmd_run_with_record(args: &mut Vec<String>, record_path: String) {
     let target = args[target_idx].clone();
     let target_args: Vec<String> = args[target_idx + 1..].to_vec();
 
-    launch(&target, &target_args, cfg);
+    launch(&target, &target_args, cfg, &resolved_cfg);
 }
+
+fn cmd_setup(_args: &mut Vec<String>) {
+    eprintln!("memvis {} — setup", VERSION);
+    eprintln!();
+
+    // step 1: find DynamoRIO
+    let dr_home = if let Ok(home) = env::var("DYNAMORIO_HOME") {
+        let p = std::path::PathBuf::from(&home);
+        if p.join("bin64/drrun").exists() {
+            eprintln!("[1/3] DynamoRIO");
+            eprintln!("  Found (env): {}", p.display());
+            Some(p)
+        } else {
+            eprintln!("[1/3] DynamoRIO");
+            eprintln!("  DYNAMORIO_HOME is set but bin64/drrun not found at: {}", p.display());
+            None
+        }
+    } else if let Some(discovered) = memvis::config::discover_dynamorio() {
+        eprintln!("[1/3] DynamoRIO");
+        eprintln!("  Auto-discovered: {}", discovered.display());
+        Some(discovered)
+    } else {
+        eprintln!("[1/3] DynamoRIO");
+        eprintln!("  NOT FOUND.");
+        eprintln!();
+        eprintln!("  To install DynamoRIO:");
+        eprintln!("    wget https://github.com/DynamoRIO/dynamorio/releases/download/release_11.0.0/DynamoRIO-Linux-11.0.19548.tar.gz");
+        eprintln!("    tar xzf DynamoRIO-Linux-*.tar.gz -C ~/");
+        eprintln!();
+        eprintln!("  Then re-run: memvis setup");
+        None
+    };
+
+    // step 2: find tracer
+    let temp_cfg = memvis::config::Config {
+        dynamorio_home: dr_home.as_ref().map(|p| p.to_string_lossy().to_string()),
+        ..Default::default()
+    };
+    let tracer = find_tracer(&temp_cfg);
+    match &tracer {
+        Some(p) => {
+            eprintln!("[2/3] Tracer");
+            eprintln!("  Found: {}", p.display());
+        }
+        None => {
+            eprintln!("[2/3] Tracer");
+            eprintln!("  NOT FOUND.");
+            eprintln!();
+            if let Some(ref dr) = dr_home {
+                eprintln!("  To build the tracer:");
+                eprintln!("    mkdir -p build && cd build");
+                eprintln!("    cmake .. -DDynamoRIO_DIR={}/cmake", dr.display());
+                eprintln!("    make");
+                eprintln!();
+                eprintln!("  Then re-run: memvis setup");
+            } else {
+                eprintln!("  Install DynamoRIO first (step 1), then build the tracer.");
+            }
+        }
+    }
+
+    // step 3: write config
+    let cfg_dir = memvis::config::global_config_dir();
+    let cfg_path = cfg_dir.join("config");
+    let dr_str = dr_home.as_ref().map(|p| p.to_string_lossy().to_string());
+    let tracer_str = tracer.as_ref().map(|p| p.to_string_lossy().to_string());
+    let content = memvis::config::generate_global_config(
+        dr_str.as_deref(),
+        tracer_str.as_deref(),
+    );
+
+    eprintln!("[3/3] Writing config");
+    if let Err(e) = std::fs::create_dir_all(&cfg_dir) {
+        eprintln!("  Failed to create {}: {}", cfg_dir.display(), e);
+        std::process::exit(1);
+    }
+    if let Err(e) = std::fs::write(&cfg_path, &content) {
+        eprintln!("  Failed to write {}: {}", cfg_path.display(), e);
+        std::process::exit(1);
+    }
+    eprintln!("  Wrote: {}", cfg_path.display());
+    eprintln!();
+
+    if dr_home.is_some() && tracer.is_some() {
+        eprintln!("Done. You can now run:");
+        eprintln!("  memvis ./your_binary");
+    } else {
+        eprintln!("Setup incomplete — resolve the issues above and re-run 'memvis setup'.");
+        std::process::exit(1);
+    }
+}
+
+fn cmd_init(args: &mut Vec<String>) {
+    let target = match args.first() {
+        Some(t) => t.clone(),
+        None => {
+            eprintln!("memvis: error: 'init' requires a target binary path.");
+            eprintln!();
+            eprintln!("  Usage: memvis init ./my_server");
+            eprintln!();
+            eprintln!("  This creates a .memvis project file with a target profile,");
+            eprintln!("  including an auto-detected tripwire symbol if possible.");
+            std::process::exit(1);
+        }
+    };
+
+    let target_path = std::path::Path::new(&target);
+    if !target_path.exists() {
+        eprintln!("memvis: error: target '{}' does not exist.", target);
+        eprintln!("  Provide a path to the binary you want to instrument.");
+        std::process::exit(1);
+    }
+
+    let target_name = target_path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or(&target);
+
+    eprintln!("memvis init — creating .memvis profile for '{}'", target_name);
+    eprintln!();
+
+    // tripwire auto detection via symbol name 
+    let tripwire = detect_tripwire_symbol(&target);
+
+    match &tripwire {
+        Some(sym) => eprintln!("  Tripwire auto-detected: {}", sym),
+        None => eprintln!("  No tripwire auto-detected (you can set one manually in .memvis)"),
+    }
+
+    let memvis_path = std::path::Path::new(".memvis");
+    if memvis_path.exists() {
+        eprintln!();
+        eprintln!("  .memvis already exists. Appending profile for '{}'.", target_name);
+        let existing = std::fs::read_to_string(memvis_path).unwrap_or_default();
+        let profile_key = format!("target.{}.tripwire", target_name);
+        if existing.contains(&profile_key) {
+            eprintln!("  Profile for '{}' already present — skipping.", target_name);
+            return;
+        }
+        let mut append = String::new();
+        append.push_str(&format!("\n# Profile for: {}\n", target_name));
+        if let Some(ref tw) = tripwire {
+            append.push_str(&format!("target.{}.tripwire = {}\n", target_name, tw));
+        }
+        append.push_str(&format!("# target.{}.args = \n", target_name));
+        if let Err(e) = std::fs::OpenOptions::new()
+            .append(true)
+            .open(memvis_path)
+            .and_then(|mut f| {
+                use std::io::Write;
+                f.write_all(append.as_bytes())
+            })
+        {
+            eprintln!("  Failed to append to .memvis: {}", e);
+            std::process::exit(1);
+        }
+    } else {
+        let content = memvis::config::generate_project_config(target_name, tripwire.as_deref());
+        if let Err(e) = std::fs::write(memvis_path, &content) {
+            eprintln!("  Failed to write .memvis: {}", e);
+            std::process::exit(1);
+        }
+    }
+    eprintln!("  Wrote: .memvis");
+    eprintln!();
+    eprintln!("You can now run:");
+    eprintln!("  memvis {}", target_name);
+}
+
+// score ELF text symbols by event-loop likelihood: pattern weight + brevity bonus + size penalty.
+fn detect_tripwire_symbol(elf_path: &str) -> Option<String> {
+    use object::{Object, ObjectSymbol, SymbolKind};
+    let data = std::fs::read(elf_path).ok()?;
+    let file = object::File::parse(&*data).ok()?;
+
+    let mut text_syms: Vec<(String, u64, u64)> = Vec::new();
+    for sym in file.symbols().chain(file.dynamic_symbols()) {
+        if sym.kind() == SymbolKind::Text && sym.size() > 0 {
+            if let Ok(name) = sym.name() {
+                if !name.is_empty() && !name.starts_with('_') && !name.starts_with('.') {
+                    text_syms.push((name.to_string(), sym.address(), sym.size()));
+                }
+            }
+        }
+    }
+
+    let loop_patterns: &[(&str, u32)] = &[
+        ("Main", 15), ("main_loop", 20), ("event_loop", 20),
+        ("Loop", 10), ("Cycle", 12), ("Run", 8), ("run_server", 18),
+        ("Process", 6), ("process_events", 18), ("dispatch", 10), ("serve", 8),
+    ];
+
+    let mut candidates: Vec<(&str, u32)> = Vec::new();
+    for (name, _addr, size) in &text_syms {
+        if name == "main" || name == "_start" {
+            continue;
+        }
+        if name.contains("init") || name.contains("Init") || name.contains("Setup")
+            || name.contains("Config") || name.contains("config")
+        {
+            continue;
+        }
+        if name.starts_with("RM_") || name.starts_with("__") {
+            continue;
+        }
+
+        let mut score: u32 = 0;
+        for &(pat, weight) in loop_patterns {
+            if name.contains(pat) {
+                score += weight;
+                if name.ends_with(pat) {
+                    score += 10;
+                }
+            }
+        }
+        // brevity correlates with entry-point status
+        if name.len() <= 12 && score > 0 {
+            score += 8;
+        } else if name.len() <= 20 && score > 0 {
+            score += 3;
+        }
+        if *size > 10000 {
+            score = score.saturating_sub(5);
+        }
+        if *size > 50 && *size < 2000 {
+            score += 3;
+        }
+        if score > 0 {
+            candidates.push((name, score));
+        }
+    }
+
+    candidates.sort_by(|a, b| b.1.cmp(&a.1));
+    candidates.first().map(|(name, _)| name.to_string())
+}
+
