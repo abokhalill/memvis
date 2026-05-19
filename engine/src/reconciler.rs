@@ -284,9 +284,13 @@ pub fn process_event(
             if let Some(h) = addr_index.lookup(ev.addr) {
                 let nid = h.node_id;
                 let h_name = h.name.to_string();
-                let h_type = h.type_info.clone();
+                let h_type_name = h.type_info.name.clone();
                 let is_ptr = h.type_info.is_pointer;
-                world.ensure_node(nid, &h_name, &h_type, ev.addr, ev.size as u64);
+                // defer TypeInfo clone: only needed when inserting a new node
+                if !world.node_exists(nid) {
+                    let h_type = h.type_info.clone();
+                    world.ensure_node(nid, &h_name, &h_type, ev.addr, ev.size as u64);
+                }
                 world.update_value(nid, val, world.insn_counter());
                 if is_ptr && ev.size == 8 {
                     let target = if ev.value == 0 {
@@ -300,7 +304,7 @@ pub fn process_event(
                         if is_heap {
                             if let Some(ref mut info) = dwarf_info {
                                 let pointee_name =
-                                    h_type.name.strip_prefix('*').unwrap_or("").to_string();
+                                    h_type_name.strip_prefix('*').unwrap_or("").to_string();
                                 info.ensure_type(&pointee_name);
                                 if let Some(pointee_ti) =
                                     info.type_registry.get(&pointee_name).cloned()
@@ -385,7 +389,7 @@ pub fn process_event(
                         }
                         if let Some(ref mut ts) = topo {
                             let pointee_name =
-                                h_type.name.strip_prefix('*').unwrap_or(&h_type.name);
+                                h_type_name.strip_prefix('*').unwrap_or(&h_type_name);
                             ts.emit_link(
                                 ev.seq32() as u64,
                                 &h_name,

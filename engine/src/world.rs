@@ -1402,6 +1402,11 @@ impl WorldState {
         self.inc_insn_counter();
     }
 
+    #[inline]
+    pub fn node_exists(&self, id: NodeId) -> bool {
+        self.inner.nodes.contains_key(&id)
+    }
+
     pub fn ensure_node(
         &mut self,
         id: NodeId,
