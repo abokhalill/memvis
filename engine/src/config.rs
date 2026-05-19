@@ -350,17 +350,12 @@ pub fn generate_project_config(target_name: &str, tripwire: Option<&str>) -> Str
         out.push_str(&format!("# target.{}.tripwire = main\n", target_name));
     }
     out.push_str("\n");
-    out.push_str(&format!("# Default arguments passed to the target binary.\n"));
-    out.push_str(&format!("# Override on CLI with: memvis {} -- --port 7399\n", target_name));
-    out.push_str(&format!("# target.{}.args = --port 6399\n", target_name));
+    out.push_str(&format!("# target args: override on CLI with: memvis run {} -- --custom-flag\n", target_name));
+    out.push_str(&format!("# target.{}.args =\n", target_name));
     out.push_str("\n");
-    out.push_str(&format!("# Auto-export topology JSONL to this path.\n"));
-    out.push_str(&format!("# target.{}.topology = {}.topo.jsonl\n", target_name, target_name));
+    out.push_str(&format!("target.{}.topology = {}.topo.jsonl\n", target_name, target_name));
+    out.push_str(&format!("target.{}.heatmap = {}.heatmap.tsv\n", target_name, target_name));
     out.push_str("\n");
-    out.push_str(&format!("# Auto-export field heatmap to this path.\n"));
-    out.push_str(&format!("# target.{}.heatmap = {}.heatmap.tsv\n", target_name, target_name));
-    out.push_str("\n");
-    out.push_str(&format!("# Skip basic-block events for this target.\n"));
     out.push_str(&format!("# target.{}.no_bb = false\n", target_name));
     out
 }
