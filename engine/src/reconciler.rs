@@ -326,10 +326,21 @@ pub fn process_event(
                                                 };
                                                 world.type_epochs.close_epoch(ev.value, alloc_size, &fake_proj, ev.seq32() as u64, EpochClose::Schism);
                                             }
-                                            eprintln!(
-                                                "memvis: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
-                                                ev.value, patched.name, h_name, old_type, old_source
-                                            );
+                                            thread_local! {
+                                                static ONLINE_SCHISM_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+                                            }
+                                            ONLINE_SCHISM_COUNT.with(|c| {
+                                                let n = c.get() + 1;
+                                                c.set(n);
+                                                if n <= 20 {
+                                                    eprintln!(
+                                                        "memvis: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                                                        ev.value, patched.name, h_name, old_type, old_source
+                                                    );
+                                                } else if n == 21 {
+                                                    eprintln!("memvis: suppressing further online TYPE_SCHISM messages");
+                                                }
+                                            });
                                             if let Some(ref mut ts) = topo {
                                                 ts.emit_type_schism(
                                                     ev.seq32() as u64,
@@ -862,7 +873,13 @@ pub struct WarmScanStats {
     pub not_heap: u64,
     pub globals_scanned: u64,
     pub container_of_stamps: u64,
+    pub schisms: u64,
+    pub queue_cap_hits: u64,
 }
+
+// hard BFS limit; prevents runaway on dense overlapping globals (nginx: 416 globals, ~931 container_of entries)
+const WARM_SCAN_QUEUE_CAP: usize = 50_000;
+pub const WARM_SCAN_QUEUE_CAP_VALUE: usize = WARM_SCAN_QUEUE_CAP;
 
 pub struct WarmScanner {
     mem: File,
@@ -1013,10 +1030,15 @@ impl WarmScanner {
                 .stm
                 .stamp_type(target_addr, &pointee_ti, &source_name, 0);
             if let StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } = stamp_res {
-                eprintln!(
-                    "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
-                    target_addr, pointee_ti.name, source_name, old_type, old_source
-                );
+                self.stats.schisms += 1;
+                if self.stats.schisms <= 10 {
+                    eprintln!(
+                        "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                        target_addr, pointee_ti.name, source_name, old_type, old_source
+                    );
+                } else if self.stats.schisms == 11 {
+                    eprintln!("memvis: suppressing further TYPE_SCHISM messages (dense global layout)");
+                }
                 if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
                     let fake_proj = crate::world::TypeProjection {
                         base_addr: target_addr,
@@ -1259,6 +1281,10 @@ fn scan_ptr_fields(
                             // container base (ptr - offset) with the container type.
                             if let Some(containers) = container_of_map.get(pointee_name) {
                                 for entry in containers {
+                                    if queue.len() >= WARM_SCAN_QUEUE_CAP {
+                                        stats.queue_cap_hits += 1;
+                                        break;
+                                    }
                                     let container_base = ptr.wrapping_sub(entry.field_offset);
                                     if container_base != 0 && heap_oracle.is_plausible_ptr(container_base) {
                                         if let Some(container_ti) = type_registry.get(&entry.container_type) {
@@ -1271,8 +1297,12 @@ fn scan_ptr_fields(
                                     }
                                 }
                             }
-                            queue.push_back((ptr, pointee_ti, qualified, depth));
-                            stats.enqueued += 1;
+                            if queue.len() < WARM_SCAN_QUEUE_CAP {
+                                queue.push_back((ptr, pointee_ti, qualified, depth));
+                                stats.enqueued += 1;
+                            } else {
+                                stats.queue_cap_hits += 1;
+                            }
                         }
                         _ if pointee_name.starts_with('*') => {
                             // **T: ptr is base of an allocation holding *T slots.
@@ -1302,8 +1332,12 @@ fn scan_ptr_fields(
                                             let elem = u64::from_le_bytes(sbuf);
                                             if elem != 0 && heap_oracle.is_plausible_ptr(elem) {
                                                 let elem_source = format!("{}[{}]", qualified, slot_idx);
-                                                queue.push_back((elem, inner_ti.clone(), elem_source, depth + 1));
-                                                stats.enqueued += 1;
+                                                if queue.len() < WARM_SCAN_QUEUE_CAP {
+                                                    queue.push_back((elem, inner_ti.clone(), elem_source, depth + 1));
+                                                    stats.enqueued += 1;
+                                                } else {
+                                                    stats.queue_cap_hits += 1;
+                                                }
                                             }
                                         }
                                         _ => { stats.read_errors += 1; break; }

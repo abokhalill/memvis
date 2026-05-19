@@ -19,7 +19,7 @@ use memvis::world::{ShadowStack, SnapshotRing, WorldState};
 
 struct RunConfig {
     once: bool,
-    min_events: u64,
+    server_mode: bool,
     record_path: Option<String>,
     topo_path: Option<String>,
     heatmap_path: Option<String>,
@@ -263,7 +263,7 @@ impl ChildProcessTracker {
 
 fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunConfig) {
     let once = cfg.once;
-    let min_events = cfg.min_events;
+    let server_mode = cfg.server_mode;
     let no_bb = cfg.no_bb;
     let record_path = cfg.record_path;
     let topo_path = cfg.topo_path;
@@ -324,7 +324,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
         run_headless(
             &mut orch,
             &mut dwarf_info,
-            min_events,
+            server_mode,
             &mut addr_index,
             &mut world,
             &mut stacks,
@@ -695,15 +695,17 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                         "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
                         scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
                     );
+                    if scanner.stats.queue_cap_hits > 0 {
+                        eprintln!(
+                            "memvis: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
+                            scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP_VALUE
+                        );
+                    }
                     last_reseed_total = total;
                 }
             }
 
-            // periodic warm-scan re-seed: every 200K events, re-read globals
-            // from /proc/pid/mem. target process may have initialized globals
-            // (e.g. server.db) after the initial seed at 100K events.
-            // event-count based, not wall-clock, so it works in both TUI and
-            // headless modes regardless of processing speed.
+            // re-seed every 200K events; globals may be lazily initialized
             if warm_scanner.is_some()
                 && relocation_delta.is_some()
                 && total >= last_reseed_total + 200_000
@@ -719,8 +721,8 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     let new_stamps = scanner.stats.stamps_applied - prev_stamps;
                     if new_stamps > 0 {
                         eprintln!(
-                            "memvis: warm-scan reseed @{}: +{} stamps, {} total reads",
-                            total, new_stamps, scanner.stats.reads,
+                            "memvis: warm-scan reseed @{}: +{} stamps, {} reads, {} dropped",
+                            total, new_stamps, scanner.stats.reads, scanner.stats.queue_cap_hits,
                         );
                     }
                 }
@@ -799,7 +801,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
 fn run_headless(
     orch: &mut RingOrchestrator,
     dwarf_info: &mut Option<DwarfInfo>,
-    _min_events: u64,
+    server_mode: bool,
     addr_index: &mut AddressIndex,
     world: &mut WorldState,
     stacks: &mut HashMap<u16, ShadowStack>,
@@ -1083,9 +1085,9 @@ fn run_headless(
 
             let tracer_gone = TRACER_EXITED.load(AtomicOrdering::Relaxed);
 
-            // after seeing events, if the ring stays empty for 50 consecutive
-            // rounds (~500ms), the target has finished. render final snapshot.
-            if *total > 0 && (idle_rounds >= 50 || tracer_gone) {
+            // idle timeout: 50 empty rounds (~5s). in server mode (tripwire set),
+            // only exit when tracer actually dies — servers block in epoll_wait.
+            if *total > 0 && (tracer_gone || (!server_mode && idle_rounds >= 50)) {
                 // final ring discovery sweep: catch rings from short-lived
                 // threads that spawned and died between poll intervals.
                 orch.poll_new_rings();
@@ -1262,6 +1264,12 @@ fn run_headless(
                     "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
                     scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
                 );
+                if scanner.stats.queue_cap_hits > 0 {
+                    eprintln!(
+                        "memvis: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
+                        scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP_VALUE
+                    );
+                }
                 last_reseed_total = *total;
             }
         }
@@ -1271,9 +1279,7 @@ fn run_headless(
             world.cl_tracker_tick();
         }
 
-        // periodic warm-scan re-seed: every 200K events, re-read globals
-        // from /proc/pid/mem. target process may have initialized globals
-        // (e.g. server.db) after the initial seed at 100K events.
+        // re-seed every 200K events; globals may be lazily initialized
         if warm_scanner.is_some()
             && relocation_delta.is_some()
             && *total >= last_reseed_total + 200_000
@@ -1289,8 +1295,8 @@ fn run_headless(
                 let new_stamps = scanner.stats.stamps_applied - prev_stamps;
                 if new_stamps > 0 {
                     eprintln!(
-                        "memvis: warm-scan reseed: +{} stamps, {} reads, {} queued",
-                        new_stamps, scanner.stats.reads, scanner.queue_len(),
+                        "memvis: warm-scan reseed: +{} stamps, {} reads, {} dropped",
+                        new_stamps, scanner.stats.reads, scanner.stats.queue_cap_hits,
                     );
                 }
             }
@@ -2340,7 +2346,7 @@ fn print_help() {
     eprintln!("  attach                 Attach to an already-running tracer");
     eprintln!();
     eprintln!("COMMON OPTIONS:");
-    eprintln!("  --tripwire <sym>       Begin tracing when <sym> is entered (skips init redundancy)");
+    eprintln!("  --tripwire <sym>       Begin tracing at <sym>; implies server mode (wait for exit)");
     eprintln!("  --live                 Interactive TUI instead of headless snapshot");
     eprintln!("  --topology <file>      Export topology graph as JSONL");
     eprintln!("  --heatmap <file>       Export field write heatmap as TSV");
@@ -2458,6 +2464,10 @@ fn main() {
             args.remove(0);
             cmd_attach(&mut args);
         }
+        "run" => {
+            args.remove(0);
+            cmd_run(&mut args);
+        }
         "help" => {
             args.remove(0);
             if args.first().map(|s| s.as_str()) == Some("advanced") {
@@ -2488,9 +2498,7 @@ fn parse_common_flags(args: &mut Vec<String>) -> RunConfig {
     let tripwire_symbol = take_flag_value(args, "--tripwire");
     RunConfig {
         once: !live,
-        min_events: take_flag_value(args, "--min-events")
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(1u64),
+        server_mode: tripwire_symbol.is_some(),
         record_path: take_flag_value(args, "--record")
             .or_else(|| take_flag_value(args, "-o"))
             .or_else(|| take_flag_value(args, "--output")),
@@ -2532,6 +2540,9 @@ fn cmd_run(args: &mut Vec<String>) {
         if let Some(prof) = profile {
             if cfg.tripwire_symbol.is_none() {
                 cfg.tripwire_symbol = prof.tripwire.clone();
+                if cfg.tripwire_symbol.is_some() {
+                    cfg.server_mode = true;
+                }
             }
             if cfg.topo_path.is_none() {
                 cfg.topo_path = prof.topology.clone();
