@@ -978,6 +978,7 @@ impl WarmScanner {
                 u64::MAX,
                 stm,
                 alloc_tracker,
+                &self.visited,
             );
         }
         self.seeded = true;
@@ -1100,6 +1101,7 @@ impl WarmScanner {
                 u64::MAX,
                 &mut world.stm,
                 &world.heap_allocs,
+                &self.visited,
             );
         }
         stamps_this_step
@@ -1145,6 +1147,7 @@ pub fn warm_scan(
             max_reads,
             &mut world.stm,
             &world.heap_allocs,
+            &visited,
         );
     }
 
@@ -1221,6 +1224,7 @@ pub fn warm_scan(
             max_reads,
             &mut world.stm,
             &world.heap_allocs,
+            &visited,
         );
     }
 
@@ -1243,6 +1247,7 @@ fn scan_ptr_fields(
     max_reads: u64,
     stm: &mut crate::world::ShadowTypeMap,
     alloc_tracker: &crate::world::HeapAllocTracker,
+    visited: &HashSet<u64>,
 ) {
     for f in &ti.fields {
         if stats.reads >= max_reads {
@@ -1286,7 +1291,10 @@ fn scan_ptr_fields(
                                         break;
                                     }
                                     let container_base = ptr.wrapping_sub(entry.field_offset);
-                                    if container_base != 0 && heap_oracle.is_plausible_ptr(container_base) {
+                                    if container_base != 0
+                                        && !visited.contains(&container_base)
+                                        && heap_oracle.is_plausible_ptr(container_base)
+                                    {
                                         if let Some(container_ti) = type_registry.get(&entry.container_type) {
                                             let cof_source = format!("{}->container_of({}.{})",
                                                 qualified, entry.container_type, entry.field_name);
@@ -1297,10 +1305,10 @@ fn scan_ptr_fields(
                                     }
                                 }
                             }
-                            if queue.len() < WARM_SCAN_QUEUE_CAP {
+                            if !visited.contains(&ptr) && queue.len() < WARM_SCAN_QUEUE_CAP {
                                 queue.push_back((ptr, pointee_ti, qualified, depth));
                                 stats.enqueued += 1;
-                            } else {
+                            } else if queue.len() >= WARM_SCAN_QUEUE_CAP {
                                 stats.queue_cap_hits += 1;
                             }
                         }
@@ -1331,11 +1339,11 @@ fn scan_ptr_fields(
                                             stats.reads += 1;
                                             let elem = u64::from_le_bytes(sbuf);
                                             if elem != 0 && heap_oracle.is_plausible_ptr(elem) {
-                                                let elem_source = format!("{}[{}]", qualified, slot_idx);
-                                                if queue.len() < WARM_SCAN_QUEUE_CAP {
+                                                if !visited.contains(&elem) && queue.len() < WARM_SCAN_QUEUE_CAP {
+                                                    let elem_source = format!("{}[{}]", qualified, slot_idx);
                                                     queue.push_back((elem, inner_ti.clone(), elem_source, depth + 1));
                                                     stats.enqueued += 1;
-                                                } else {
+                                                } else if queue.len() >= WARM_SCAN_QUEUE_CAP {
                                                     stats.queue_cap_hits += 1;
                                                 }
                                             }
@@ -1368,6 +1376,7 @@ fn scan_ptr_fields(
                 max_reads,
                 stm,
                 alloc_tracker,
+                visited,
             );
         }
     }
