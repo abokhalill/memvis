@@ -1345,7 +1345,7 @@ fn headless_render(
     };
     let _ = writeln!(
         out,
-        "MEMVIS │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ LAG {} │ allocs {}/{} live {}{}",
+        "RTMAP │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ LAG {} │ allocs {}/{} live {}{}",
         world.insn_counter,
         total,
         world.nodes.len(),

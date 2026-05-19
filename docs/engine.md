@@ -262,7 +262,7 @@ The orchestrator manages all shared memory connections to the tracer.
 
 On attach, `try_attach_ctl` validates:
 1. `magic` matches the expected constant.
-2. `proto_version == MEMVIS_PROTO_VERSION` (currently 3).
+2. `proto_version == RTMAP_PROTO_VERSION` (currently 3).
 3. `build_hash == rtmap_abi_hash()` — structural ABI hash over `sizeof`/`offsetof`
    of `Event`, `RingHeader`, and scratch pad offsets. Mismatches are rejected
    with `ABI MISMATCH` diagnostic and the engine refuses to attach.
@@ -858,7 +858,7 @@ The tracer uses two independent per-thread sequence counters:
 
 | Domain | Counter | Events |
 |---|---|---|
-| JIT (0) | raw TLS `MEMVIS_RAW_SLOT_SEQ` | WRITE, BB_ENTRY |
+| JIT (0) | raw TLS `RTMAP_RAW_SLOT_SEQ` | WRITE, BB_ENTRY |
 | Clean-call (1) | drmgr TLS `TLS_SLOT_SEQ` | READ, CALL, RETURN, TAIL_CALL, ALLOC, FREE, REG_SNAPSHOT, RELOAD |
 
 The engine classifies events via `seq_domain(ev_kind)` and tracks
@@ -1049,7 +1049,7 @@ Displayed with K/M suffixes.
 ### File format
 
 ```
-Bytes 0..8:    magic  = 0x4D454D5649535243 ("MEMVISRC")
+Bytes 0..8:    magic  = 0x52544D4150524300 ("RTMAPRC")
 Bytes 8..12:   proto_version (u32) = 3
 Bytes 12..20:  event_count (u64, backpatched on close)
 Bytes 20..24:  reserved (u32, zero)
@@ -1278,8 +1278,8 @@ Full startup when the user runs `rtmap run <target>`:
 4. If `attach`: spawn consumer thread, attach to existing tracer.
 5. Otherwise (launch mode):
    a. Locate `drrun` (via config `paths.dynamorio_home`, `DYNAMORIO_HOME`,
-      `MEMVIS_DRRUN`, `--dr-home`, or glob auto-detect).
-   b. Locate `librtmap_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
+      `RTMAP_DRRUN`, `--dr-home`, or glob auto-detect).
+   b. Locate `librtmap_tracer.so` (via `RTMAP_TRACER` or relative to binary).
    c. Resolve tripwire symbol to ELF offset via `resolve_elf_symbol_offset`.
    d. Clean up stale `/dev/shm/rtmap_*` from previous runs.
    e. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.

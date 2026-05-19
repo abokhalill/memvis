@@ -15,7 +15,7 @@
 #include <string.h>
 
 #define RTMAP_CACHE_LINE    64
-#define RTMAP_MAGIC         0x4D454D56495342ULL  /* "MEMVISB\0" */
+#define RTMAP_MAGIC         0x52544D4150425200ULL  /* "RTMAPBR\0" */
 #define RTMAP_PROTO_VERSION 3
 #define RTMAP_SHM_ENV       "RTMAP_SHM_PATH"
 
@@ -395,7 +395,7 @@ static inline void rtmap_push_overflow(rtmap_ring_header_t *ring,
 #define RTMAP_CTL_SHM_NAME     "/rtmap_ctl"
 #define RTMAP_CTL_SHM_FMT      "/rtmap_ctl_%u"
 #define RTMAP_RING_SHM_FMT     "/rtmap_ring_%u_%u"  /* pid, tid */
-#define RTMAP_CTL_MAGIC        0x4D56435430303032ULL  /* "MVCTL002" */
+#define RTMAP_CTL_MAGIC        0x5254435430303032ULL  /* "RTCT0002" */
 #define RTMAP_MAX_THREADS      256
 #define RTMAP_RING_NAME_LEN    48
 

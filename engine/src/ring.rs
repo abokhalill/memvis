@@ -7,8 +7,8 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{mem, ptr};
 
 pub const CACHE_LINE: usize = 64;
-pub const RTMAP_MAGIC: u64 = 0x4D454D56495342;
-pub const RTMAP_CTL_MAGIC: u64 = 0x4D56435430303032;
+pub const RTMAP_MAGIC: u64 = 0x52544D4150425200;
+pub const RTMAP_CTL_MAGIC: u64 = 0x5254435430303032;
 pub const RTMAP_PROTO_VERSION: u32 = 3;
 pub const MAX_THREADS: usize = 256;
 pub const RING_NAME_LEN: usize = 48;

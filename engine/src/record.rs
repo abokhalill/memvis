@@ -2,7 +2,7 @@
 // event recording and replay.
 //
 // wire format (little-endian):
-//   [0..8]   magic 0x4D454D5649535243
+//   [0..8]   magic 0x52544D4150524300
 //   [8..12]  proto_version u32
 //   [12..20] event_count u64 (backpatched on close)
 //   [20..24] reserved u32
@@ -15,7 +15,7 @@ use std::path::Path;
 
 use crate::ring::Event;
 
-const RECORD_MAGIC: u64 = 0x4D454D5649535243;
+const RECORD_MAGIC: u64 = 0x52544D4150524300;
 const PROTO_VERSION: u32 = 3;
 const HEADER_SIZE: u64 = 24;
 

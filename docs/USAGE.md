@@ -204,8 +204,8 @@ Exit code 1 if any warnings are emitted.
 | Variable | Purpose |
 |---|---|
 | `DYNAMORIO_HOME` | DynamoRIO installation directory |
-| `MEMVIS_DRRUN` | Explicit path to `drrun` binary |
-| `MEMVIS_TRACER` | Explicit path to `librtmap_tracer.so` |
+| `RTMAP_DRRUN` | Explicit path to `drrun` binary |
+| `RTMAP_TRACER` | Explicit path to `librtmap_tracer.so` |
 
 ## TUI keybindings
 

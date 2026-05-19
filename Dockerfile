@@ -83,7 +83,7 @@ USER rtmap
 WORKDIR /app
 
 ENV DYNAMORIO_HOME=/opt/dynamorio \
-    MEMVIS_TRACER=/app/librtmap_tracer.so \
+    RTMAP_TRACER=/app/librtmap_tracer.so \
     LD_LIBRARY_PATH=/opt/dynamorio/ext/lib64/release
 
 STOPSIGNAL SIGTERM

@@ -103,7 +103,7 @@ snapshot pattern (atomic multi-slot run).
 | Field | Value |
 |---|---|
 | `kind` | `WRITE` (0) |
-| `flags` | `MEMVIS_FLAG_COMPOUND` (0x40) |
+| `flags` | `RTMAP_FLAG_COMPOUND` (0x40) |
 | `addr` | Effective address of the write |
 | `size` | Full write size in bytes (e.g. 16, 32, 64) |
 | `value` | Low 8 bytes of the written value |
@@ -115,14 +115,14 @@ snapshot pattern (atomic multi-slot run).
 | Field | Value |
 |---|---|
 | `kind` | `WRITE` (0) |
-| `flags` | `MEMVIS_FLAG_CONTINUATION` (0x20) |
+| `flags` | `RTMAP_FLAG_CONTINUATION` (0x20) |
 | `addr` | `EA + k*8` (chunk effective address) |
 | `size` | `min(8, remaining_bytes)` |
 | `value` | 8-byte chunk at that offset |
 | `rip_lo` | 0 |
 | `seq_lo` | 0 |
 
-**Slot count**: `ceil(write_size / 8)`, capped at `MEMVIS_COMPOUND_MAX_SLOTS`
+**Slot count**: `ceil(write_size / 8)`, capped at `RTMAP_COMPOUND_MAX_SLOTS`
 (8). A 64-byte AVX-512 / cache-line write uses all 8 slots (header + 7
 continuations). Writes >64 bytes capture the first 64 bytes.
 
@@ -145,12 +145,12 @@ count.
 **Flag definitions** (`rtmap_bridge.h`):
 
 ```c
-#define MEMVIS_FLAG_COMPOUND      0x40  /* header of multi-slot wide write */
-#define MEMVIS_FLAG_CONTINUATION  0x20  /* continuation slot of compound write */
-#define MEMVIS_COMPOUND_MAX_SLOTS 8     /* header + 7 continuations = 64B max */
+#define RTMAP_FLAG_COMPOUND      0x40  /* header of multi-slot wide write */
+#define RTMAP_FLAG_CONTINUATION  0x20  /* continuation slot of compound write */
+#define RTMAP_COMPOUND_MAX_SLOTS 8     /* header + 7 continuations = 64B max */
 ```
 
-**Distinction from TRUNCATED**: `MEMVIS_FLAG_TRUNCATED` (0x80) is retained for
+**Distinction from TRUNCATED**: `RTMAP_FLAG_TRUNCATED` (0x80) is retained for
 REP MOVS/STOS and LOCK-prefixed wide writes that use the `safe_read_into_slot`
 clean-call fallback. Those events carry only the low 8 bytes and the engine
 zero-poisons their values. Compound writes replace truncation for all other
@@ -217,26 +217,26 @@ Byte offset   Size   Field            Cache line
 136           56     padding
 ```
 
-Static assert: `sizeof(rtmap_ring_header_t) == 192` (3 × `MEMVIS_CACHE_LINE`).
+Static assert: `sizeof(rtmap_ring_header_t) == 192` (3 × `RTMAP_CACHE_LINE`).
 
 The event data array begins immediately after the header, at byte offset 192.
 
 ### Fields
 
-- **`magic`** (u64): `0x4D454D56495342` (ASCII "MEMVISB"). Validated by both
+- **`magic`** (u64): `0x52544D4150425200` (ASCII "RTMAPBR"). Validated by both
   tracer (on init) and consumer (on attach).
 - **`capacity`** (u32): Number of event slots. **Must be a power of two.**
   Enforced at runtime by `rtmap_ring_init` — a non-power-of-two capacity
   causes the ring to be zero-initialized and left invalid. Default:
-  `MEMVIS_THREAD_RING_CAPACITY = 1 << 20` (1,048,576). Compile-time asserted
-  via `MEMVIS_IS_POW2`.
+  `RTMAP_THREAD_RING_CAPACITY = 1 << 20` (1,048,576). Compile-time asserted
+  via `RTMAP_IS_POW2`.
 - **`entry_size`** (u32): `sizeof(rtmap_event_t)` = 32.
-- **`flags`** (u64): Bitfield. Bit 0 (`MEMVIS_FLAG_SPIN_ON_FULL`): if set, the
+- **`flags`** (u64): Bitfield. Bit 0 (`RTMAP_FLAG_SPIN_ON_FULL`): if set, the
   producer spins when the ring is full instead of dropping the event.
 - **`backpressure`** (atomic u32): Set to 1 by the consumer when ring fill
   exceeds 6/8 capacity. Cleared when fill drops below 3/8. The producer checks
   this flag and sheds `READ` events when backpressure is active.
-- **`proto_version`** (u32): `MEMVIS_PROTO_VERSION` (currently 3). Written by
+- **`proto_version`** (u32): `RTMAP_PROTO_VERSION` (currently 3). Written by
   `rtmap_ring_init`. The consumer validates this on attach and rejects
   mismatched versions with a diagnostic message to stderr.
 - **`status`** (atomic u32): Ring lifecycle state. `MV_STATUS_ACTIVE` (0) is
@@ -263,12 +263,12 @@ in the ring is `head - tail` (unsigned subtraction handles wrap correctly).
 
 ### Head caching
 
-The tracer caches the head pointer in raw TLS (`MEMVIS_RAW_SLOT_HEAD`) to
+The tracer caches the head pointer in raw TLS (`RTMAP_RAW_SLOT_HEAD`) to
 avoid an atomic store on every event. The cached head is flushed to the ring
 header's atomic `head` field in two cases:
 
-1. **Conditional flush**: Every 64 events (`head & MEMVIS_HEAD_FLUSH_MASK ==
-   0`, where `MEMVIS_HEAD_FLUSH_MASK = 0x3F`).
+1. **Conditional flush**: Every 64 events (`head & RTMAP_HEAD_FLUSH_MASK ==
+   0`, where `RTMAP_HEAD_FLUSH_MASK = 0x3F`).
 2. **BB-exit flush**: Unconditionally at the end of every basic block. This
    ensures the consumer sees events even from threads that produce fewer than
    64 writes per BB before blocking.
@@ -345,7 +345,7 @@ pressure without losing writes, lifecycle events, or control events.
 
 ## Spin-on-full
 
-If the ring's `flags` field has bit 0 set (`MEMVIS_FLAG_SPIN_ON_FULL`), the
+If the ring's `flags` field has bit 0 set (`RTMAP_FLAG_SPIN_ON_FULL`), the
 producer spins instead of dropping events when the ring is full:
 
 ```c
@@ -356,7 +356,7 @@ while (head - tail >= capacity) {
 ```
 
 The `pause` intrinsic reduces the rate of cache-line acquisitions on the
-consumer's `tail` line. The default policy is `MEMVIS_FLAG_DROP_ON_FULL`
+consumer's `tail` line. The default policy is `RTMAP_FLAG_DROP_ON_FULL`
 (flags = 0), which drops events rather than stalling the target program.
 
 ## Control ring
@@ -368,8 +368,8 @@ used for thread discovery. The root process also creates a legacy
 
 ```c
 typedef struct {
-    uint64_t magic;                              // 0x4D56435430303032 ("MVCTL002")
-    uint32_t proto_version;                      // MEMVIS_PROTO_VERSION (3)
+    uint64_t magic;                              // 0x5254435430303032 ("RTCT0002")
+    uint32_t proto_version;                      // RTMAP_PROTO_VERSION (3)
     _Atomic uint32_t thread_count;               // high-water mark of allocated slots
     uint32_t max_threads;                        // 256
     uint32_t build_hash;                         // structural ABI hash (FNV-1a)
@@ -377,7 +377,7 @@ typedef struct {
     uint32_t parent_pid;                         // 0 for root process
     _Atomic uint32_t tripwire_hit;               // tracer sets to 1 on tripwire entry (release)
     uint32_t _ctl_reserved;                      // padding for 8-byte alignment before bloom
-    uint64_t priority_bloom[MEMVIS_BLOOM_U64S];  // address-level priority filter
+    uint64_t priority_bloom[RTMAP_BLOOM_U64S];  // address-level priority filter
     rtmap_thread_entry_t threads[256];
 } rtmap_ctl_header_t;
 ```
@@ -448,8 +448,8 @@ When a thread exits:
 
 Both the ring header and control ring header carry `proto_version`:
 
-- `rtmap_ring_init` sets `ring->proto_version = MEMVIS_PROTO_VERSION`.
-- `rtmap_ctl_init` sets `ctl->proto_version = MEMVIS_PROTO_VERSION`.
+- `rtmap_ring_init` sets `ring->proto_version = RTMAP_PROTO_VERSION`.
+- `rtmap_ctl_init` sets `ctl->proto_version = RTMAP_PROTO_VERSION`.
 - The engine's `ThreadRing::from_shm` validates `proto_version` on ring
   attach and rejects mismatches.
 - The engine's `try_attach_ctl` validates `proto_version` on ctl attach

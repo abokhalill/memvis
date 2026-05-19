@@ -14,7 +14,7 @@ reuse events correctly separated from 195 genuine schisms), and **jq**.
 ## What You Get
 
 ```
-MEMVIS │ insn 74656 │ events 45245 │ nodes 2 │ edges 2 │ rings 1 │ LAG 0 │ allocs 9/4 live 5
+RTMAP │ insn 74656 │ events 45245 │ nodes 2 │ edges 2 │ rings 1 │ LAG 0 │ allocs 9/4 live 5
 ────────────────────────────────────────────────────────────────────────────────────────────────────
 MEMORY MAP
   ── cacheline 0x7b6201bfe000 ──
@@ -107,7 +107,7 @@ docker run --rm \
 
 Build produces `engine/target/release/{rtmap,rtmap-lint,rtmap-diff,rtmap-check}`
 and `build/librtmap_tracer.so`. The engine auto-discovers the tracer from
-the repo root; override with `MEMVIS_TRACER` if running from elsewhere.
+the repo root; override with `RTMAP_TRACER` if running from elsewhere.
 
 ### `rtmap` — runtime instrumentation
 
@@ -188,14 +188,14 @@ and assertion DSL.
  │         TRACER            │ =============> │             ENGINE                │
  │  (DynamoRIO client, C)    │  SPSC rings    │        (Rust, 4 binaries)         │
  │                           │  ctl per PID   │                                   │
- │  tracer.c                 │  tripwire_hit  │  rtmap       main.rs  (live)     │
- │  rtmap_bridge.h          │   (atomic)     │  rtmap-lint  lint.rs  (static)   │
- │                           │                │  rtmap-diff  diff.rs  (offline)  │
- │  phase-delayed JIT:       │                │  rtmap-check check.rs (CI/CD)    │
+ │  tracer.c                 │  tripwire_hit  │  rtmap       main.rs  (live)      │
+ │  rtmap_bridge.h           │   (atomic)     │  rtmap-lint  lint.rs  (static)    │
+ │                           │                │  rtmap-diff  diff.rs  (offline)   │
+ │  phase-delayed JIT:       │                │  rtmap-check check.rs (CI/CD)     │
  │  BOOT → tripwire → TRACE  │                │                                   │
- │                           │                │  config.rs     (.rtmap profiles) │
+ │                           │                │  config.rs     (.rtmap profiles)  │
  │  fork → child gets own    │                │  reconciler.rs (event dispatch)   │
- │  PID-scoped ctl + rings   │                │  world.rs      (STM, pool_reuse) │
+ │  PID-scoped ctl + rings   │                │  world.rs      (STM, pool_reuse)  │
  └───────────────────────────┘                └───────────────────────────────────┘
        runs inside target's                         separate process
        address space (+ forks)
@@ -212,7 +212,7 @@ and assertion DSL.
 | Symptom | Cause | Fix |
 |---|---|---|
 | `cannot find drrun` | DynamoRIO not found | Run `rtmap setup` or `export DYNAMORIO_HOME=/path/to/DynamoRIO-Linux-*` |
-| `cannot find librtmap_tracer.so` | Tracer not built or wrong cwd | `cmake --build build` from repo root, or `MEMVIS_TRACER=/path/to/librtmap_tracer.so` |
+| `cannot find librtmap_tracer.so` | Tracer not built or wrong cwd | `cmake --build build` from repo root, or `RTMAP_TRACER=/path/to/librtmap_tracer.so` |
 | Empty output / no events | Target lacks DWARF info | Recompile with `gcc -g` |
 | `ABI MISMATCH` | Tracer and engine built from different `rtmap_bridge.h` | Rebuild both from the same source |
 | Premature exit on server | Tripwire not set or not found | Use `rtmap init <target>` to auto-detect, or `--tripwire <symbol>` |

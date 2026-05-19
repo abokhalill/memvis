@@ -484,7 +484,7 @@ No mutex, spinlock, or CAS in the hot path. CAS only in:
 
 ### Head caching
 
-Cached in raw TLS (`MEMVIS_RAW_SLOT_HEAD`). Flushed to ring header:
+Cached in raw TLS (`RTMAP_RAW_SLOT_HEAD`). Flushed to ring header:
 - Every 64 events (`head & 0x3F == 0`): conditional inline flush.
 - Every BB exit: unconditional flush.
 
@@ -573,5 +573,5 @@ via compatibility shims.
 | Variable | Purpose |
 |---|---|
 | `DYNAMORIO_HOME` | Path to DynamoRIO installation directory |
-| `MEMVIS_DRRUN` | Explicit path to `drrun` binary |
-| `MEMVIS_TRACER` | Explicit path to `librtmap_tracer.so` |
+| `RTMAP_DRRUN` | Explicit path to `drrun` binary |
+| `RTMAP_TRACER` | Explicit path to `librtmap_tracer.so` |

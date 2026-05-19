@@ -72,14 +72,14 @@ The raw TLS slots are used by inline JIT instrumentation (no clean call):
 
 | Slot | Name | Purpose |
 |---|---|---|
-| 0 | `MEMVIS_RAW_SLOT_RING` | Ring header pointer (for inline head flush) |
-| 1 | `MEMVIS_RAW_SLOT_HEAD` | Cached head counter (deferred release store) |
-| 2 | `MEMVIS_RAW_SLOT_SEQ` | Cached sequence counter (inline increment) |
-| 3 | `MEMVIS_RAW_SLOT_TID` | Thread ID (inline event metadata) |
-| 4 | `MEMVIS_RAW_SLOT_BP` | Backpressure flag mirror (inline check) |
-| 5 | `MEMVIS_RAW_SLOT_SCRATCH` | Pointer to `rtmap_scratch_pad_t` |
-| 6 | `MEMVIS_RAW_SLOT_RDBUF` | Read buffer pointer (inline overflow check) |
-| 7 | `MEMVIS_RAW_SLOT_GUARD` | Inline reentrancy guard |
+| 0 | `RTMAP_RAW_SLOT_RING` | Ring header pointer (for inline head flush) |
+| 1 | `RTMAP_RAW_SLOT_HEAD` | Cached head counter (deferred release store) |
+| 2 | `RTMAP_RAW_SLOT_SEQ` | Cached sequence counter (inline increment) |
+| 3 | `RTMAP_RAW_SLOT_TID` | Thread ID (inline event metadata) |
+| 4 | `RTMAP_RAW_SLOT_BP` | Backpressure flag mirror (inline check) |
+| 5 | `RTMAP_RAW_SLOT_SCRATCH` | Pointer to `rtmap_scratch_pad_t` |
+| 6 | `RTMAP_RAW_SLOT_RDBUF` | Read buffer pointer (inline overflow check) |
+| 7 | `RTMAP_RAW_SLOT_GUARD` | Inline reentrancy guard |
 
 Raw TLS is accessed via segment base + offset (`dr_raw_tls_opnd`), which
 compiles to a single `MOV` through `gs:` or `fs:` segment override — no
@@ -122,7 +122,7 @@ were tested and all failed (see Design Decisions below).
    - `size` = write size (JIT-time constant)
    - `thread_id` = from raw TLS
    - `seq_lo` = from raw TLS
-   - `kind_flags` = `MEMVIS_EVENT_WRITE | (wide_write ? MEMVIS_FLAG_TRUNCATED << 8 : 0) | (seq_hi << 16)`
+   - `kind_flags` = `RTMAP_EVENT_WRITE | (wide_write ? RTMAP_FLAG_TRUNCATED << 8 : 0) | (seq_hi << 16)`
    - `rip_lo` = app PC offset from module base (JIT-time constant)
 8. Save slot pointer to `pad.scratch[1]` (0 if skipped).
 9. Unreserve `scratch`. Keep `reg_addr` reserved across the app store.
@@ -141,16 +141,16 @@ were tested and all failed (see Design Decisions below).
      line is hot.
    - **Cat-B wide (compound multi-slot)**: for writes where `sz > 8` and
      no REP/LOCK prefix (`!ccc_force_clean`). Header event reads the low
-     8 bytes inline (vector 7) with `MEMVIS_FLAG_COMPOUND` in `kind_flags`.
+     8 bytes inline (vector 7) with `RTMAP_FLAG_COMPOUND` in `kind_flags`.
      A clean call to `compound_fill_continuations` then writes N-1
-     continuation events (each with `MEMVIS_FLAG_CONTINUATION`, 8B chunk
+     continuation events (each with `RTMAP_FLAG_CONTINUATION`, 8B chunk
      value, chunk EA) into consecutive ring slots and advances the cached
      head. Max 8 slots (64B). Engine reassembles full value per-chunk —
      no data loss, no zero-poisoning. Bumps `pad->stat_truncated_writes`.
    - **Cat-B fallback**: clean call to `safe_read_into_slot(EA, size, slot)`.
      `DR_TRY_EXCEPT`-guarded `memcpy`. ~100 cycles. Only used for
      REP MOVS/STOS and LOCK-prefixed wide writes (`ccc_force_clean`).
-     These retain `MEMVIS_FLAG_TRUNCATED` and the engine zero-poisons.
+     These retain `RTMAP_FLAG_TRUNCATED` and the engine zero-poisons.
 3. Increment `pad->stat_inline_writes` inline. (Wide writes also increment
    `pad->stat_truncated_writes` in the vector 7 path.)
 4. Increment per-thread `seq` counter (raw TLS).

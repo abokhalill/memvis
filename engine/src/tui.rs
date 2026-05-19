@@ -660,7 +660,7 @@ pub fn draw(
             ""
         };
         let header = Paragraph::new(Line::from(vec![
-            Span::styled("MEMVIS", Style::default().fg(Color::Cyan).bold()),
+            Span::styled("RTMAP", Style::default().fg(Color::Cyan).bold()),
             Span::raw(format!(
                 " │ insn {} │ events {} │ nodes {} │ edges {} │ rings {} │ ",
                 world.insn_counter,
