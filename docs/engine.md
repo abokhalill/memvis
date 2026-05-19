@@ -454,8 +454,17 @@ pub struct TypeProjection {
 
 1. **Direct stamp** (`stamp_type`): When a DWARF-typed pointer global or
    local writes a non-zero value to a heap address, the pointee's struct
-   type is looked up in `type_registry` and stamped. Returns `true` if this
-   is a new stamp (address was not previously in the map).
+   type is looked up in `type_registry` and stamped. Returns a `StampResult`
+   enum:
+
+   | Variant | Meaning |
+   |---|---|
+   | `New` | First stamp at this address |
+   | `Replaced` | Overwrites a same-type or first-time different-type stamp |
+   | `PoolReuse` | Address has 2+ schisms (recycled by allocator) |
+
+   The caller uses `StampResult` to decide whether to trigger RTR (`New`)
+   and whether to emit a `TYPE_SCHISM` or `pool_reuse` topology event.
 
 2. **Field propagation** (`propagate_field_write`): When a write hits an
    address covered by an existing STM projection, and the written field is
@@ -475,6 +484,21 @@ pub struct TypeProjection {
 4. **Size-validation sentinel** (`HeapAllocTracker::check_size`): Before
    stamping, if the type's `byte_size` exceeds the known allocation size,
    a `SizeMismatch` is recorded but the stamp still proceeds (last-write-wins).
+
+### Pool/arena reuse classification
+
+Addresses that oscillate between types (e.g., jemalloc slab reuse, nginx
+pool recycling) are classified as `PoolReuse` rather than genuine type
+confusion. The STM tracks a per-address schism counter. On the second
+type overwrite at the same address, all future stamps are `PoolReuse`.
+
+The topology stream emits:
+- `TYPE_SCHISM` with `"pool_reuse": true` — allocator recycling noise.
+- `TYPE_SCHISM` with `"pool_reuse": false` — genuine structural confusion.
+- `TYPE_EPOCH_CLOSE` — the old type's reign at this address ended.
+
+Verified: nginx 1811 pool_reuse vs 38 schisms; Redis 119,922 pool_reuse
+vs 195 schisms.
 
 ### Purge
 
@@ -883,6 +907,15 @@ re-seed every 200K events thereafter (event-count based via `last_reseed_total`,
 works identically in TUI and headless modes regardless of wall-clock speed).
 Budget per step: 2000 reads. Scanner is lazily initialized on first trigger.
 
+**Queue cap**: `WARM_SCAN_QUEUE_CAP = 50_000`. Enqueues beyond this limit are
+dropped and counted in `stats.dropped`. Prevents unbounded memory growth on
+targets with deep pointer graphs (e.g., Redis with 400K+ reachable objects).
+
+**Visited pre-filter**: `scan_ptr_fields` checks `visited.contains(addr)`
+before cloning `TypeInfo` and enqueuing. This eliminates redundant TypeInfo
+clones on dense graphs where many pointers converge on the same object,
+reducing peak memory by ~40% on Redis workloads.
+
 `scan_ptr_fields` accepts the `container_of_map` from `DwarfInfo`. When a
 pointer field's pointee type has container-of entries, the scanner also
 enqueues the container base address (`ptr - field_offset`) with the container
@@ -970,12 +1003,27 @@ Filter state shown in panel title: `Events [W only, T3]`.
 
 ### Headless mode (`--once`)
 
-Plain-text output to stdout. Exits via idle-timeout: after events begin
-flowing, if the ring stays empty for 500ms (50 consecutive 10ms polls),
-the engine performs a **final ring discovery sweep** (`poll_new_rings`)
-followed by a drain loop to capture any remaining events from short-lived
-threads that spawned and died between poll intervals, then renders the
-final snapshot and exits.
+Plain-text output to stdout. Exits via two conditions:
+
+1. **Tracer death**: `TRACER_EXITED` flag set by the `waitpid` thread.
+   Bypasses arming — triggers immediate final drain and exit.
+2. **Idle timeout**: consecutive poll rounds (100ms each) with zero events
+   drained, subject to arming:
+
+| Mode | Idle limit | Armed when |
+|---|---|---|
+| Normal | 50 rounds (~5s) | `total > 0` (any events received) |
+| Server | 200 rounds (~20s) | `ctl.tripwire_hit == 1` or `stm.len() > 0` |
+
+Server mode is activated by `--tripwire` or a `.memvis` profile with a
+tripwire symbol. The engine reads the `tripwire_hit` atomic flag from the
+shared ctl header to determine arming. This prevents premature exit during
+DynamoRIO's multi-second JIT compilation pause.
+
+On exit, the engine performs a **final ring discovery sweep**
+(`poll_new_rings`) followed by a drain loop to capture any remaining
+events from short-lived threads that spawned and died between poll
+intervals, then renders the final snapshot and exports artifacts.
 
 Headless output sections:
 1. **Status line**: insn count, events, nodes, edges, rings, LAG, alloc stats.
@@ -1212,30 +1260,39 @@ Exit code 1 if any warnings are emitted (CI/CD gatekeeper).
 
 ## Startup sequence
 
-Full startup when the user runs `memvis <target>`:
+Full startup when the user runs `memvis run <target>`:
 
-1. Parse CLI: subcommand routing (`record`, `replay`, `attach`, or default
-   run). Legacy flags (`--once`, `--record`, `--replay`, `--consumer-only`)
-   accepted via compat shims. `parse_common_flags` builds a `RunConfig`
-   struct carrying `once` (default true; `--live` sets false), `no_bb`,
-   `min_events`, `record_path`, `topo_path`, `heatmap_path`, `coverage_path`.
-2. If `replay`: spawn replay thread, call `run_replay(no_bb)`. No tracer.
-3. If `attach`: spawn consumer thread, attach to existing tracer.
-4. Otherwise (launch mode):
-   a. Locate `drrun` (via `DYNAMORIO_HOME`, `MEMVIS_DRRUN`, or PATH).
+1. Parse CLI: subcommand routing (`setup`, `init`, `record`, `replay`,
+   `attach`, or default `run`). Legacy flags (`--once`, `--record`,
+   `--replay`, `--consumer-only`) accepted via compat shims.
+   `parse_common_flags` builds a `RunConfig` struct carrying `once`
+   (default true; `--live` sets false), `no_bb`, `tripwire_symbol`,
+   `server_mode`, `min_events`, `record_path`, `topo_path`, `heatmap_path`,
+   `coverage_path`.
+2. Load configuration: `resolve_config()` merges global config
+   (`~/.config/memvis/config`) with project config (`.memvis` found by
+   walking cwd upward). `resolve_target_profile` matches the target
+   binary name to a `TargetProfile` and applies tripwire, args, topology,
+   heatmap, coverage, no_bb settings (CLI flags take precedence).
+3. If `replay`: spawn replay thread, call `run_replay(no_bb)`. No tracer.
+4. If `attach`: spawn consumer thread, attach to existing tracer.
+5. Otherwise (launch mode):
+   a. Locate `drrun` (via config `paths.dynamorio_home`, `DYNAMORIO_HOME`,
+      `MEMVIS_DRRUN`, `--dr-home`, or glob auto-detect).
    b. Locate `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
-   c. Clean up stale `/dev/shm/memvis_*` from previous runs.
-   d. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.
-   e. Spawn the tracer: `drrun -c libmemvis_tracer.so -- <target> [args]`.
-5. Parse DWARF from the target ELF binary (globals, functions, locals, types,
+   c. Resolve tripwire symbol to ELF offset via `resolve_elf_symbol_offset`.
+   d. Clean up stale `/dev/shm/memvis_*` from previous runs.
+   e. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.
+   f. Spawn: `drrun -c libmemvis_tracer.so [tripwire_offset_hex] -- <target> [args]`.
+6. Parse DWARF from the target ELF binary (globals, functions, locals, types,
    type_registry). ELF symtab fallback for `DW_AT_specification` globals.
-6. Poll for `/memvis_ctl` (up to 30 seconds, validating magic + proto).
-7. Discover the first thread ring and attach (validating magic + proto).
-8. Spawn the consumer on a 64 MB stack thread (deep DWARF resolution).
-9. Consumer enters the main event loop (TUI or headless).
-10. Warm-scan: initial seed at 100K events; periodic re-seed every 200K events
+7. Poll for `/memvis_ctl` (up to 30 seconds, validating magic + proto).
+8. Discover the first thread ring and attach (validating magic + proto).
+9. Spawn the consumer on a 64 MB stack thread (deep DWARF resolution).
+10. Consumer enters the main event loop (TUI or headless).
+11. Warm-scan: initial seed at 100K events; periodic re-seed every 200K events
     (event-count based). Calls `ensure_type` on globals, reads `/proc/<pid>/mem`.
-11. If `--record`: `EventRecorder` writes events (compound REG_SNAPSHOT).
-12. If `--export-topology`: `TopologyStream` writes JSONL.
-13. On exit: finalize recorder/topology, send SIGTERM to tracer, reap child,
-    unmap all rings.
+12. If `--record`: `EventRecorder` writes events (compound REG_SNAPSHOT).
+13. If `--topology`: `TopologyStream` writes JSONL.
+14. On exit: finalize recorder/topology/heatmap, send SIGTERM to tracer, reap
+    child, unmap all rings.

@@ -375,6 +375,8 @@ typedef struct {
     uint32_t build_hash;                         // structural ABI hash (FNV-1a)
     uint32_t target_pid;                         // PID of instrumented process
     uint32_t parent_pid;                         // 0 for root process
+    _Atomic uint32_t tripwire_hit;               // tracer sets to 1 on tripwire entry (release)
+    uint32_t _ctl_reserved;                      // padding for 8-byte alignment before bloom
     uint64_t priority_bloom[MEMVIS_BLOOM_U64S];  // address-level priority filter
     memvis_thread_entry_t threads[256];
 } memvis_ctl_header_t;

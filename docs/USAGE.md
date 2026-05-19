@@ -2,25 +2,65 @@
 
 Full flag reference and invocation examples for all memvis binaries.
 
+## First-time setup
+
+```sh
+memvis setup
+```
+
+Auto-detects DynamoRIO, locates `drrun` and `libmemvis_tracer.so`, and
+writes `~/.config/memvis/config`. Run once after installation.
+
+## Project profiles
+
+```sh
+memvis init /path/to/my_server
+```
+
+Creates a `.memvis` file in the current directory with auto-detected settings
+for the target binary. Auto-detects the tripwire symbol (event-loop function)
+for servers, and enables topology + heatmap export by default.
+
+The `.memvis` file is a flat key-value config:
+
+```ini
+target.nginx.tripwire = ngx_epoll_process_events
+target.nginx.topology = nginx.topo.jsonl
+target.nginx.heatmap = nginx.heatmap.tsv
+# target.nginx.args = -p /tmp/nginx-install -c nginx.conf
+# target.nginx.no_bb = false
+```
+
+Resolution order: **CLI flags > `.memvis` project > `~/.config/memvis/config` > auto-detect**.
+
 ## memvis
 
 ### Instrument and run
 
 ```sh
 # headless (default): print snapshot to stdout, exit on idle
-memvis ./my_program [args...]
+memvis run ./my_program [args...]
 
-# interactive TUI
-memvis ./my_program --live [args...]
+# interactive TUI (20 Hz refresh, time-travel, 6 panels)
+memvis run ./my_program --live [args...]
+
+# server mode: defer tracing until event loop starts, auto-exit after traffic
+memvis run --tripwire aeProcessEvents ./redis-server --port 6399
+
+# with project profile (reads .memvis, no flags needed)
+memvis run ./my_server
+
+# override profile args on CLI
+memvis run ./my_server -- --port 7399
 
 # record events for offline analysis
 memvis record -o trace.bin ./my_program
 
 # export topology, heatmap, and BB coverage
-memvis ./my_program --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
+memvis run ./my_program --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
 
-# skip BB_ENTRY events (reduces volume, no topology impact)
-memvis ./my_program --no-bb
+# skip BB_ENTRY events (reduces ring volume, no topology impact)
+memvis run ./my_program --no-bb
 ```
 
 ### Replay
@@ -41,14 +81,32 @@ memvis attach --live
 
 | Flag | Description |
 |---|---|
+| `--tripwire <sym>` | Defer tracing until `<sym>` is entered; implies server mode |
 | `--live` | Interactive TUI instead of headless |
 | `--topology <file>` | Export topology graph as JSONL |
 | `--heatmap <file>` | Export field write heatmap as TSV |
 | `--coverage <file>` | Export basic-block coverage map as TSV |
+| `--record <file>` | Record events to `.bin` file |
 | `--no-bb` | Skip BB_ENTRY events (reduces volume) |
 | `--min-events <N>` | Minimum events before snapshot (default: 1) |
 | `--dwarf <elf>` | Explicit DWARF source |
+| `--dr-home <path>` | Explicit DynamoRIO installation (overrides config/env) |
 | `-o, --output <file>` | Output file (for record) |
+
+### Server mode idle timeout
+
+When `--tripwire` is set (or resolved from `.memvis`), the engine enters
+server mode. The idle timeout is armed only after the tracer confirms the
+tripwire has fired (via an atomic `tripwire_hit` flag in the shared ctl
+header). This prevents premature exit during DynamoRIO's JIT compilation
+phase.
+
+| Mode | Idle timeout | Armed when |
+|---|---|---|
+| Normal | 50 rounds (~5s) | Any events received (`total > 0`) |
+| Server | 200 rounds (~20s) | `ctl.tripwire_hit == 1` or STM has projections |
+
+Tracer death always triggers immediate exit regardless of arming state.
 
 ## memvis-diff
 

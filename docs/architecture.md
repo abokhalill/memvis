@@ -20,11 +20,15 @@ memory, plus offline analysis tools that operate on recorded traces:
  │  inline pre/post write    │                │  memvis-check check.rs (CI/CD)    │
  │  clean-call value capture │                │                                   │
  │  per-thread raw TLS       │                │  reconciler.rs  (event dispatch)  │
- │  adaptive backpressure    │                │  record.rs      (recording I/O)   │
- │  tail-call detection      │                │  topology.rs    (JSONL streaming) │
- │  selective reload detect  │                │  dwarf.rs       (DWARF + ELF+CFI) │
- │  allocator hooks (drwrap) │                │  world.rs       (STM, RTR, ASan)  │
+ │  adaptive backpressure    │                │  config.rs     (configuration)    │
+ │  tail-call detection      │                │  record.rs      (recording I/O)   │
+ │  selective reload detect  │                │  topology.rs    (JSONL streaming) │
+ │  allocator hooks (drwrap) │                │  dwarf.rs       (DWARF + ELF+CFI) │
  │                           │                │  ring.rs        (SHM consumer)    │
+ │                           │                │  index.rs       (interval map)     │
+ │                           │                │  world.rs       (STM, RTR, ASan)  │
+ │                           │                │  shadow_regs.rs (shadow registers) │
+ │                           │                │  heap_graph.rs  (heap object discovery) │
  └───────────────────────────┘                └───────────────────────────────────┘
        runs inside target's                         separate process(es)
        address space (DBI)
@@ -35,10 +39,10 @@ target by DynamoRIO. The **engine** is a Rust crate producing four binaries:
 
 | Binary | Entry point | Purpose |
 |---|---|---|
-| `memvis` | `main.rs` | Live instrumentation (TUI/headless), recording, replay |
-| `memvis-lint` | `lint.rs` | Static cacheline false-sharing detector with divergence report |
-| `memvis-diff` | `diff.rs` | Offline ASLR-invariant differential topology comparison |
-| `memvis-check` | `check.rs` | CI/CD structural assertion engine over JSONL topology |
+| `memvis` | `main.rs` | CLI shell with subcommands (`setup`, `init`, `record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` carries `--live`, `--no-bb`, `--tripwire`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path, `server_mode`. |
+| `memvis-lint` | `lint.rs` | Static cacheline lint: struct analysis, divergence report, diff mode |
+| `memvis-diff` | `diff.rs` | Replay two `.bin` traces, diff ASLR-invariant topology |
+| `memvis-check` | `check.rs` | Evaluate `.assertions` against JSONL topology |
 
 ## Components
 
@@ -75,6 +79,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
 | File | Module | Role |
 |---|---|---|
 | `reconciler.rs` | `reconciler` | Event dispatch: `process_event`, `populate_globals`, `warm_scan` (legacy one-shot), `WarmScanner` (continuous BFS with `seed()`/`step(budget)`) |
+| `config.rs` | `config` | Configuration resolution: `.memvis` project profiles, `~/.config/memvis/config`, `TargetProfile` (tripwire, args, export paths), auto-detect |
 | `dwarf.rs` | `dwarf` | DWARF parser + ELF symtab fallback + CFI table + JIT deep resolution: globals, functions, locals, types, type_registry, `.eh_frame` |
 | `ring.rs` | `ring` | SHM mapping, ring consumer, orchestrator, `new_offline()` for replay |
 | `index.rs` | `index` | Two-tier interval map. O(log N) address-to-variable lookup |
@@ -82,7 +87,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
 | `shadow_regs.rs` | `shadow_regs` | Shadow Register File, 7 confidence tiers (incl. `CfiVerified`), piece assembler |
 | `heap_graph.rs` | `heap_graph` | Heap object discovery, field value storage, pointer edges, type inference |
 | `record.rs` | `record` | EventRecorder (write), EventPlayer (read), compound REG_SNAPSHOT I/O |
-| `topology.rs` | `topology` | JSONL topology streamer: STAMP, LINK, HAZARD, COLD_*, PROCESS_FORK, CROSS_PROCESS_WRITE, SUMMARY |
+| `topology.rs` | `topology` | JSONL topology streamer: STAMP, LINK, HAZARD, COLD_*, PROCESS_FORK, CROSS_PROCESS_WRITE, SUMMARY, TYPE_SCHISM, TYPE_EPOCH_CLOSE |
 | `proc_maps.rs` | `proc_maps` | `/proc/<pid>/maps` parser, shared region detection via `(dev, inode)` matching |
 | `tui.rs` | `tui` | ratatui TUI: 6 panels, keybindings, event filters, time-travel |
 | `lib.rs` | — | Crate root. Re-exports all modules |
@@ -91,7 +96,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 | File | Binary | Role |
 |---|---|---|
-| `main.rs` | `memvis` | CLI shell with subcommands (`record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` struct carries `--live`, `--no-bb`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path. |
+| `main.rs` | `memvis` | CLI shell with subcommands (`setup`, `init`, `record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` carries `--live`, `--no-bb`, `--tripwire`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path, `server_mode`. |
 | `lint.rs` | `memvis-lint` | Static cacheline lint: struct analysis, divergence report, diff mode |
 | `diff.rs` | `memvis-diff` | Replay two `.bin` traces, diff ASLR-invariant topology |
 | `check.rs` | `memvis-check` | Evaluate `.assertions` against JSONL topology |
@@ -190,6 +195,14 @@ modules re-exported from `lib.rs`, with four binary entry points.
    retrospective scan. Counters: `indirect_stamps`, `indirect_registrations`.
    `purge_range` on FREE.
 
+   **Pool/arena reuse classification**: `stamp_type` returns a `StampResult`
+   enum (`New`, `Replaced`, `PoolReuse`). Addresses with 2+ type schisms
+   (different type overwrites) are classified as `PoolReuse` — the address
+   is being recycled by an allocator, not genuinely type-confused. The
+   topology stream emits `pool_reuse` events (distinct from `schism`
+   events). Verified: nginx 1811 pool_reuse vs 38 schisms; Redis 119,922
+   pool_reuse vs 195 schisms.
+
 8. **Retrospective Type Reconciliation** (`world.rs`). Bounded BFS (fuel=64)
    from freshly-stamped addresses through HeapGraph pointer fields. Candidates
    sorted by field name for deterministic discovery order across runs.
@@ -225,8 +238,10 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 12. **Topology streaming** (`topology.rs`). JSONL emitter for structural graph
     deltas: ALLOC, FREE, STAMP, LINK, COLD_STAMP, COLD_LINK, HAZARD,
-    FALSE_SHARE, PROCESS_FORK, CROSS_PROCESS_WRITE, SUMMARY. Consumed by
-    `memvis-check`.
+    FALSE_SHARE, PROCESS_FORK, CROSS_PROCESS_WRITE, TYPE_SCHISM,
+    TYPE_EPOCH_CLOSE, SEQ_GAP, SUMMARY. `TYPE_SCHISM` events carry a
+    `pool_reuse` boolean distinguishing allocator recycling from genuine
+    type confusion. Consumed by `memvis-check`.
 
 16. **Cross-process topology** (`main.rs`, `proc_maps.rs`).
     `ChildProcessTracker` manages fork-discovered child processes:
@@ -263,10 +278,26 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 ### Headless exit path
 
-On idle timeout (500ms) or tracer exit, the engine performs a final
-`poll_new_rings()` sweep to discover rings from short-lived threads that
-spawned and died between poll intervals, drains all remaining events,
-then renders the final snapshot and exits.
+The engine exits headless mode via two conditions:
+
+1. **Tracer death**: `TRACER_EXITED` flag (set by `waitpid` thread).
+   Bypasses arming — triggers immediate final drain and exit.
+2. **Idle timeout**: consecutive poll rounds with zero events.
+
+| Mode | Idle limit | Armed when |
+|---|---|---|
+| Normal | 50 rounds (~5s) | `total > 0` (any events received) |
+| Server | 200 rounds (~20s) | `ctl.tripwire_hit == 1` or `stm.len() > 0` |
+
+In server mode, the engine reads the `tripwire_hit` atomic flag from the
+shared ctl header. The tracer sets this flag (release store) when the
+tripwire function is entered. This prevents premature exit during
+DynamoRIO's JIT compilation phase, where startup ALLOC/FREE events are
+followed by a multi-second pause before the server's event loop begins.
+
+On exit, the engine performs a final `poll_new_rings()` sweep to discover
+rings from short-lived threads that spawned and died between poll
+intervals, drains all remaining events, then renders the final snapshot.
 
 ### Shared memory protocol (`memvis_bridge.h`)
 
