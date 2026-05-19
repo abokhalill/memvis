@@ -2071,6 +2071,8 @@ static void tripwire_hit(void)
 {
     if (g_phase != PHASE_BOOT) return;
     g_phase = PHASE_TRACE;
+    if (g_ctl)
+        atomic_store_explicit(&g_ctl->tripwire_hit, 1, memory_order_release);
     dr_printf("memvis: TRIPWIRE HIT — phase transition BOOT->TRACE, flushing code cache\n");
     /* dr_delay_flush_region: no lock restrictions, most performant flush.
      * invalidates entire code cache; all BBs recompiled with full instrumentation. */

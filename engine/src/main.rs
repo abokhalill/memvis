@@ -1085,11 +1085,16 @@ fn run_headless(
 
             let tracer_gone = TRACER_EXITED.load(AtomicOrdering::Relaxed);
 
-            // idle timeout: 50 rounds (~5s) normal, 200 rounds (~20s) server mode.
-            // server mode uses a longer window so the user can send traffic bursts
-            // without memvis exiting prematurely between requests.
+            // server mode: arm when tracer confirms tripwire hit via ctl shm,
+            // or fall back to STM engagement for offline/no-tripwire targets.
+            // tracer death always triggers immediate exit.
             let idle_limit = if server_mode { 200 } else { 50 };
-            if *total > 0 && (tracer_gone || idle_rounds >= idle_limit) {
+            let armed = if server_mode {
+                orch.tripwire_hit() || world.stm.len() > 0
+            } else {
+                *total > 0
+            };
+            if tracer_gone || (armed && idle_rounds >= idle_limit) {
                 // final ring discovery sweep: catch rings from short-lived
                 // threads that spawned and died between poll intervals.
                 orch.poll_new_rings();

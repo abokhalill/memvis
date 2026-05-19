@@ -424,6 +424,8 @@ typedef struct {
     uint32_t build_hash;
     uint32_t target_pid;
     uint32_t parent_pid;        /* 0 for root process */
+    _Atomic uint32_t tripwire_hit;  /* tracer sets to 1 on tripwire entry */
+    uint32_t _ctl_reserved;
     uint64_t priority_bloom[MEMVIS_BLOOM_U64S];
     memvis_thread_entry_t threads[MEMVIS_MAX_THREADS];
 } memvis_ctl_header_t;

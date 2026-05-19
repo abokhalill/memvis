@@ -169,6 +169,8 @@ struct CtlHeader {
     build_hash: u32,
     target_pid: u32,
     parent_pid: u32,
+    tripwire_hit: AtomicU32,
+    _ctl_reserved: u32,
     priority_bloom: [u64; BLOOM_U64S],
     threads: [ThreadEntry; MAX_THREADS],
 }
@@ -437,6 +439,15 @@ impl RingOrchestrator {
         } else {
             Some(hdr.target_pid)
         }
+    }
+
+    pub fn tripwire_hit(&self) -> bool {
+        let shm = match self.ctl.as_ref() {
+            Some(s) => s,
+            None => return false,
+        };
+        let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
+        hdr.tripwire_hit.load(Ordering::Relaxed) != 0
     }
 
     pub fn parent_pid(&self) -> Option<u32> {
