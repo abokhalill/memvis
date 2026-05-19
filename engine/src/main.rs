@@ -1085,9 +1085,11 @@ fn run_headless(
 
             let tracer_gone = TRACER_EXITED.load(AtomicOrdering::Relaxed);
 
-            // idle timeout: 50 empty rounds (~5s). in server mode (tripwire set),
-            // only exit when tracer actually dies — servers block in epoll_wait.
-            if *total > 0 && (tracer_gone || (!server_mode && idle_rounds >= 50)) {
+            // idle timeout: 50 rounds (~5s) normal, 200 rounds (~20s) server mode.
+            // server mode uses a longer window so the user can send traffic bursts
+            // without memvis exiting prematurely between requests.
+            let idle_limit = if server_mode { 200 } else { 50 };
+            if *total > 0 && (tracer_gone || idle_rounds >= idle_limit) {
                 // final ring discovery sweep: catch rings from short-lived
                 // threads that spawned and died between poll intervals.
                 orch.poll_new_rings();
