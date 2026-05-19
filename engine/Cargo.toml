@@ -1,24 +1,24 @@
 [package]
-name = "memvis"
+name = "rtmap"
 version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Yousef Mahmoud <yosefkhalil610@gmail.com>"]
 
 [[bin]]
-name = "memvis"
+name = "rtmap"
 path = "src/main.rs"
 
 [[bin]]
-name = "memvis-check"
+name = "rtmap-check"
 path = "src/check.rs"
 
 [[bin]]
-name = "memvis-diff"
+name = "rtmap-diff"
 path = "src/diff.rs"
 
 [[bin]]
-name = "memvis-lint"
+name = "rtmap-lint"
 path = "src/lint.rs"
 
 [dependencies]

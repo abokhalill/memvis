@@ -8,7 +8,7 @@ shared memory.
 
 This document covers the tracer's instrumentation strategy, thread-local
 storage layout, event emission, and performance characteristics. All claims
-are derived from the current `tracer.c` and `memvis_bridge.h`.
+are derived from the current `tracer.c` and `rtmap_bridge.h`.
 
 ## Initialization
 
@@ -19,8 +19,8 @@ The tracer entry point is `dr_client_main()`. It performs the following steps:
 2. Registers 6 drmgr TLS fields via `drmgr_register_tls_field`. The returned
    indices are stored in `g_tls_idx[]`.
 3. Registers 8 raw TLS slots via `drmgr_tls_field_request_raw`.
-4. Creates the PID-scoped control ring shared memory (`/memvis_ctl_<pid>`).
-   Root processes also create a legacy `/memvis_ctl` for backward compat.
+4. Creates the PID-scoped control ring shared memory (`/rtmap_ctl_<pid>`).
+   Root processes also create a legacy `/rtmap_ctl` for backward compat.
 5. Registers callbacks: module load, thread init/exit, process exit,
    fork init (`dr_register_fork_init_event`), BB analysis, and BB insertion.
 6. If a tripwire ELF offset was passed by the engine (first argument to the
@@ -77,7 +77,7 @@ The raw TLS slots are used by inline JIT instrumentation (no clean call):
 | 2 | `MEMVIS_RAW_SLOT_SEQ` | Cached sequence counter (inline increment) |
 | 3 | `MEMVIS_RAW_SLOT_TID` | Thread ID (inline event metadata) |
 | 4 | `MEMVIS_RAW_SLOT_BP` | Backpressure flag mirror (inline check) |
-| 5 | `MEMVIS_RAW_SLOT_SCRATCH` | Pointer to `memvis_scratch_pad_t` |
+| 5 | `MEMVIS_RAW_SLOT_SCRATCH` | Pointer to `rtmap_scratch_pad_t` |
 | 6 | `MEMVIS_RAW_SLOT_RDBUF` | Read buffer pointer (inline overflow check) |
 | 7 | `MEMVIS_RAW_SLOT_GUARD` | Inline reentrancy guard |
 
@@ -203,7 +203,7 @@ The `at_call` function:
 - Increments `pad->stat_calls`.
 - Increments `g_insn_counter` by 8 (relaxed).
 - Snapshots all 18 registers via `dr_get_mcontext` and pushes a 7-slot
-  `REG_SNAPSHOT` via `memvis_push_reg_snapshot`.
+  `REG_SNAPSHOT` via `rtmap_push_reg_snapshot`.
 - Clears the reentrancy guard.
 
 ### Returns
@@ -260,7 +260,7 @@ Memory reads use a buffered strategy to reduce clean_call overhead:
    No ring push occurs here.
 3. At the last application instruction of the BB, a `flush_read_buf` call is
    inserted. This iterates the buffer and pushes all buffered reads into the
-   ring via `memvis_push_sampled` (which sheds reads under backpressure).
+   ring via `rtmap_push_sampled` (which sheds reads under backpressure).
 
 A BB with 10 read instructions produces 10 fast `at_mem_read_buf` calls (no
 ring interaction) plus 1 `flush_read_buf` call (pushes up to 10 events).
@@ -293,22 +293,22 @@ atomics, printed at process exit).
    `g_next_thread_id`.
 3. Initializes the per-thread sequence counter to 0.
 4. Allocates a per-thread ring via `shm_open` (name:
-   `/memvis_ring_<pid>_<tid>`). Ring is initialized with `memvis_ring_init`
+   `/rtmap_ring_<pid>_<tid>`). Ring is initialized with `rtmap_ring_init`
    (sets magic, capacity, proto_version).
-5. Allocates a `memvis_scratch_pad_t` (128 bytes) via `dr_thread_alloc`.
+5. Allocates a `rtmap_scratch_pad_t` (128 bytes) via `dr_thread_alloc`.
    Populates `ring_data` and `ring_mask` from the ring header.
 6. Allocates a per-thread read buffer (capacity 16) via `dr_thread_alloc`.
 7. Initializes raw TLS slots: ring pointer, head=0, seq=0, tid, bp=0,
    scratch pad pointer.
 8. Registers the thread in the control ring via
-   `memvis_ctl_register_thread` (CAS reclaim or fresh allocation).
+   `rtmap_ctl_register_thread` (CAS reclaim or fresh allocation).
 
 ### Thread exit (`event_thread_exit`)
 
 1. Flushes the cached head to the ring header (release store).
 2. Drains per-thread pad stats into global atomics via
    `atomic_fetch_add_explicit`.
-3. Marks the thread as `DEAD` in the control ring (`memvis_ctl_mark_dead`).
+3. Marks the thread as `DEAD` in the control ring (`rtmap_ctl_mark_dead`).
 4. Unmaps and unlinks the per-thread ring shared memory.
 5. Frees the scratch pad and read buffer via `dr_thread_free`.
 
@@ -332,7 +332,7 @@ the main executable. The CAS ensures exactly one thread emits the event.
 ## Reentrancy guard
 
 The inline write path uses `pad->nesting_level` (per-thread, in
-`memvis_scratch_pad_t`) to detect reentrant writes. `emit_pre_write`
+`rtmap_scratch_pad_t`) to detect reentrant writes. `emit_pre_write`
 increments `nesting_level` before writing event metadata; `emit_post_write`
 decrements it after. If `nesting_level > 0` at entry, the write is dropped
 and `pad->stat_reentrant_drops` is incremented.

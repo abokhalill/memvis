@@ -1,8 +1,8 @@
 # Ring Protocol
 
 This document specifies the shared memory ring buffer protocol used for
-communication between the memvis tracer (producer) and engine (consumer).
-The protocol is defined in `memvis_bridge.h`. Protocol version: **3**.
+communication between the rtmap tracer (producer) and engine (consumer).
+The protocol is defined in `rtmap_bridge.h`. Protocol version: **3**.
 
 ## Design goals
 
@@ -23,9 +23,9 @@ The protocol is defined in `memvis_bridge.h`. Protocol version: **3**.
 
 Two event struct layouts are defined. Both are 32 bytes, 32-byte aligned.
 
-### v2 format (`memvis_event_t`)
+### v2 format (`rtmap_event_t`)
 
-Used by `memvis_push_ex`, `memvis_push_reg_snapshot`, and the ring data
+Used by `rtmap_push_ex`, `rtmap_push_reg_snapshot`, and the ring data
 accessor functions:
 
 ```c
@@ -36,10 +36,10 @@ typedef struct __attribute__((aligned(32))) {
     uint16_t seq;         // byte 14: per-thread sequence number (wraps at 2^16)
     uint64_t value;       // byte 16: payload (written value, frame base, etc.)
     uint64_t kind_flags;  // byte 24: kind (low 8 bits) | flags (bits 8-15)
-} memvis_event_t;
+} rtmap_event_t;
 ```
 
-### v3 format (`memvis_event_v3_t`)
+### v3 format (`rtmap_event_v3_t`)
 
 Used by the inline write path for extended sequence numbers and RIP tracking:
 
@@ -52,7 +52,7 @@ typedef struct __attribute__((aligned(32))) {
     uint64_t value;       // byte 16: post-write value (captured via clean call)
     uint32_t kind_flags;  // byte 24: kind:8 | flags:8 | seq_hi:16
     uint32_t rip_lo;      // byte 28: app PC offset from module base
-} memvis_event_v3_t;
+} rtmap_event_v3_t;
 ```
 
 Both are `sizeof == 32` (compile-time asserted).
@@ -142,7 +142,7 @@ call to `compound_fill_continuations` writes the continuation slots with
 `DR_TRY_EXCEPT`-guarded reads and advances the cached head by the continuation
 count.
 
-**Flag definitions** (`memvis_bridge.h`):
+**Flag definitions** (`rtmap_bridge.h`):
 
 ```c
 #define MEMVIS_FLAG_COMPOUND      0x40  /* header of multi-slot wide write */
@@ -172,7 +172,7 @@ slot 5: regs[12..14]   { regs[12], (u32)regs[13], tid, 0, regs[14], REG_SNAPSHOT
 slot 6: regs[15..17]   { regs[15], (u32)regs[16], tid, 0, regs[17], REG_SNAPSHOT }
 ```
 
-Register indices follow the memvis layout (not DWARF numbering):
+Register indices follow the rtmap layout (not DWARF numbering):
 
 | Index | Register | Index | Register |
 |---|---|---|---|
@@ -190,7 +190,7 @@ The producer checks that 7 slots are available before writing a snapshot. If
 there is insufficient space, the entire snapshot is dropped.
 
 **Recording**: `EventRecorder::record_reg_snapshot` writes the same 7-event
-layout to disk. The offline replayer (`memvis-diff`, `memvis --replay`)
+layout to disk. The offline replayer (`rtmap-diff`, `rtmap --replay`)
 detects the header, reads 6 continuations, and reconstructs the 18-register
 array for `ShadowRegisterFile` population.
 
@@ -217,7 +217,7 @@ Byte offset   Size   Field            Cache line
 136           56     padding
 ```
 
-Static assert: `sizeof(memvis_ring_header_t) == 192` (3 × `MEMVIS_CACHE_LINE`).
+Static assert: `sizeof(rtmap_ring_header_t) == 192` (3 × `MEMVIS_CACHE_LINE`).
 
 The event data array begins immediately after the header, at byte offset 192.
 
@@ -226,18 +226,18 @@ The event data array begins immediately after the header, at byte offset 192.
 - **`magic`** (u64): `0x4D454D56495342` (ASCII "MEMVISB"). Validated by both
   tracer (on init) and consumer (on attach).
 - **`capacity`** (u32): Number of event slots. **Must be a power of two.**
-  Enforced at runtime by `memvis_ring_init` — a non-power-of-two capacity
+  Enforced at runtime by `rtmap_ring_init` — a non-power-of-two capacity
   causes the ring to be zero-initialized and left invalid. Default:
   `MEMVIS_THREAD_RING_CAPACITY = 1 << 20` (1,048,576). Compile-time asserted
   via `MEMVIS_IS_POW2`.
-- **`entry_size`** (u32): `sizeof(memvis_event_t)` = 32.
+- **`entry_size`** (u32): `sizeof(rtmap_event_t)` = 32.
 - **`flags`** (u64): Bitfield. Bit 0 (`MEMVIS_FLAG_SPIN_ON_FULL`): if set, the
   producer spins when the ring is full instead of dropping the event.
 - **`backpressure`** (atomic u32): Set to 1 by the consumer when ring fill
   exceeds 6/8 capacity. Cleared when fill drops below 3/8. The producer checks
   this flag and sheds `READ` events when backpressure is active.
 - **`proto_version`** (u32): `MEMVIS_PROTO_VERSION` (currently 3). Written by
-  `memvis_ring_init`. The consumer validates this on attach and rejects
+  `rtmap_ring_init`. The consumer validates this on attach and rejects
   mismatched versions with a diagnostic message to stderr.
 - **`status`** (atomic u32): Ring lifecycle state. `MV_STATUS_ACTIVE` (0) is
   the initial state. The tracer sets `MV_STATUS_TERMINAL` (1) on thread exit
@@ -333,7 +333,7 @@ Fill <  3/8 capacity:  consumer stores backpressure = 0  (release)
 ```
 
 The producer checks `backpressure` with a relaxed load. When backpressure is
-active, `memvis_push_sampled()` silently drops `READ` and `BB_ENTRY` events
+active, `rtmap_push_sampled()` silently drops `READ` and `BB_ENTRY` events
 (returns 1 instead of 0). `WRITE`, `CALL`, `RETURN`, `TAIL_CALL`, `ALLOC`,
 `FREE`, `RELOAD`, `MODULE_LOAD`, and `REG_SNAPSHOT` are **never** dropped by
 backpressure.
@@ -361,9 +361,9 @@ consumer's `tail` line. The default policy is `MEMVIS_FLAG_DROP_ON_FULL`
 
 ## Control ring
 
-The control ring is a PID-scoped shared memory object (`/memvis_ctl_<pid>`)
+The control ring is a PID-scoped shared memory object (`/rtmap_ctl_<pid>`)
 used for thread discovery. The root process also creates a legacy
-`/memvis_ctl` for backward compatibility. It contains a fixed-size array of
+`/rtmap_ctl` for backward compatibility. It contains a fixed-size array of
 256 thread entries:
 
 ```c
@@ -378,8 +378,8 @@ typedef struct {
     _Atomic uint32_t tripwire_hit;               // tracer sets to 1 on tripwire entry (release)
     uint32_t _ctl_reserved;                      // padding for 8-byte alignment before bloom
     uint64_t priority_bloom[MEMVIS_BLOOM_U64S];  // address-level priority filter
-    memvis_thread_entry_t threads[256];
-} memvis_ctl_header_t;
+    rtmap_thread_entry_t threads[256];
+} rtmap_ctl_header_t;
 ```
 
 Each thread entry is 56 bytes:
@@ -389,13 +389,13 @@ typedef struct {
     _Atomic uint32_t state;       // EMPTY=0, ACTIVE=1, DEAD=2
     uint16_t thread_id;
     uint16_t _reserved;
-    char shm_name[48];            // e.g. "/memvis_ring_12345_0"
-} memvis_thread_entry_t;
+    char shm_name[48];            // e.g. "/rtmap_ring_12345_0"
+} rtmap_thread_entry_t;
 ```
 
 ### Thread registration protocol
 
-When a new thread starts in the target process, `memvis_ctl_register_thread`
+When a new thread starts in the target process, `rtmap_ctl_register_thread`
 executes a two-pass allocation:
 
 **Pass 1: Dead-slot reclamation (CAS scan)**
@@ -448,8 +448,8 @@ When a thread exits:
 
 Both the ring header and control ring header carry `proto_version`:
 
-- `memvis_ring_init` sets `ring->proto_version = MEMVIS_PROTO_VERSION`.
-- `memvis_ctl_init` sets `ctl->proto_version = MEMVIS_PROTO_VERSION`.
+- `rtmap_ring_init` sets `ring->proto_version = MEMVIS_PROTO_VERSION`.
+- `rtmap_ctl_init` sets `ctl->proto_version = MEMVIS_PROTO_VERSION`.
 - The engine's `ThreadRing::from_shm` validates `proto_version` on ring
   attach and rejects mismatches.
 - The engine's `try_attach_ctl` validates `proto_version` on ctl attach
@@ -458,36 +458,36 @@ Both the ring header and control ring header carry `proto_version`:
 ### Structural ABI hash
 
 The control ring header carries `build_hash` (u32), computed by
-`memvis_build_hash_compute()`. This is a deterministic FNV-1a over
+`rtmap_build_hash_compute()`. This is a deterministic FNV-1a over
 `sizeof`/`offsetof` of the three ABI-critical structs:
-`memvis_event_v3_t`, `memvis_ring_header_t`, and `memvis_scratch_pad_t`.
+`rtmap_event_v3_t`, `rtmap_ring_header_t`, and `rtmap_scratch_pad_t`.
 
-The engine computes the same hash via `memvis_abi_hash()` and compares
+The engine computes the same hash via `rtmap_abi_hash()` and compares
 on ctl attach. If the hashes differ, the engine refuses to connect and
 prints a diagnostic:
 
 ```
-memvis: ABI MISMATCH: tracer hash=0x..., engine hash=0x...
-memvis: rebuild both tracer and engine from the same memvis_bridge.h
+rtmap: ABI MISMATCH: tracer hash=0x..., engine hash=0x...
+rtmap: rebuild both tracer and engine from the same rtmap_bridge.h
 ```
 
 This prevents silent data corruption when the tracer and engine are built
-against different versions of `memvis_bridge.h`.
+against different versions of `rtmap_bridge.h`.
 
 ## Shared memory lifecycle
 
 | Phase | Actor | Action |
 |---|---|---|
-| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` (legacy + PID-scoped) |
-| Startup | Tracer | Creates `/memvis_ctl_<pid>` (+ legacy `/memvis_ctl` for root), inits header (magic + proto + abi_hash + target_pid + parent_pid) |
-| Thread init | Tracer | Creates `/memvis_ring_<pid>_<tid>`, registers via CAS reclaim or alloc |
-| Attach | Engine | Opens `/memvis_ctl_<pid>` (or legacy `/memvis_ctl`), validates magic + proto + abi_hash |
-| Discovery | Engine | Opens `/memvis_ring_<pid>_<tid>`, validates magic + proto |
+| Startup | Engine | Best-effort cleanup of stale `/dev/shm/rtmap_*` (legacy + PID-scoped) |
+| Startup | Tracer | Creates `/rtmap_ctl_<pid>` (+ legacy `/rtmap_ctl` for root), inits header (magic + proto + abi_hash + target_pid + parent_pid) |
+| Thread init | Tracer | Creates `/rtmap_ring_<pid>_<tid>`, registers via CAS reclaim or alloc |
+| Attach | Engine | Opens `/rtmap_ctl_<pid>` (or legacy `/rtmap_ctl`), validates magic + proto + abi_hash |
+| Discovery | Engine | Opens `/rtmap_ring_<pid>_<tid>`, validates magic + proto |
 | Fork | Tracer | `event_fork_init`: detach inherited SHM, create child-scoped ctl + ring, emit PROCESS_FORK event |
 | Fork | Engine | `ChildProcessTracker`: discovers child ctl via `try_attach_ctl_pid`, drains child rings |
 | Runtime | Both | Producer writes events, consumer drains them (parent + child orchestrators) |
 | Thread exit | Tracer | Terminal flush, marks DEAD in ctl. Ring SHM persists for post-mortem drain |
-| Shutdown | Tracer | Unmaps and unlinks `/memvis_ctl_<pid>` (+ legacy) |
+| Shutdown | Tracer | Unmaps and unlinks `/rtmap_ctl_<pid>` (+ legacy) |
 | Shutdown | Engine | Unmaps all rings |
 
 All shared memory objects are created with mode 0600 (owner read/write only).

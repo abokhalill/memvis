@@ -107,7 +107,7 @@ impl LocationTable {
     }
 }
 
-// x86-64 DWARF register number -> memvis reg_file index.
+// x86-64 DWARF register number -> rtmap reg_file index.
 // DWARF reg 0=rax,1=rdx,2=rcx,3=rbx,4=rsi,5=rdi,6=rbp,7=rsp,8-15=r8-r15,16=rip
 // our layout: 0=rax,1=rbx,2=rcx,3=rdx,4=rsi,5=rdi,6=rbp,7=rsp,8-15=r8-r15,16=rip
 const DWARF_TO_REGFILE: [Option<usize>; 17] = [

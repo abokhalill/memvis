@@ -9,7 +9,7 @@ const CALLEE_SAVED: [usize; 6] = [1, 6, 12, 13, 14, 15];
 const CALLER_SAVED: [usize; 9] = [0, 2, 3, 4, 5, 8, 9, 10, 11];
 const ARG_REGS: [usize; 6] = [5, 4, 3, 2, 8, 9]; // rdi,rsi,rdx,rcx,r8,r9
 
-// dwarf reg# -> memvis reg_file index. note: dwarf 1=rdx(3), 2=rcx(2), 3=rbx(1)
+// dwarf reg# -> rtmap reg_file index. note: dwarf 1=rdx(3), 2=rcx(2), 3=rbx(1)
 const DWARF_TO_IDX: [Option<usize>; 17] = [
     Some(0),
     Some(3),

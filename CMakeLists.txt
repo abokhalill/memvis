@@ -1,18 +1,18 @@
 cmake_minimum_required(VERSION 3.7)
-project(memvis-tracer C)
+project(rtmap-tracer C)
 
 find_package(DynamoRIO REQUIRED)
 
-add_library(memvis_tracer SHARED tracer.c)
-target_include_directories(memvis_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
+add_library(rtmap_tracer SHARED tracer.c)
+target_include_directories(rtmap_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 
-use_DynamoRIO_extension(memvis_tracer drmgr)
-use_DynamoRIO_extension(memvis_tracer drutil)
-use_DynamoRIO_extension(memvis_tracer drreg)
-use_DynamoRIO_extension(memvis_tracer drwrap)
-use_DynamoRIO_extension(memvis_tracer drsyms)
+use_DynamoRIO_extension(rtmap_tracer drmgr)
+use_DynamoRIO_extension(rtmap_tracer drutil)
+use_DynamoRIO_extension(rtmap_tracer drreg)
+use_DynamoRIO_extension(rtmap_tracer drwrap)
+use_DynamoRIO_extension(rtmap_tracer drsyms)
 
-configure_DynamoRIO_client(memvis_tracer)
+configure_DynamoRIO_client(rtmap_tracer)
 
-target_link_libraries(memvis_tracer rt)
+target_link_libraries(rtmap_tracer rt)
 

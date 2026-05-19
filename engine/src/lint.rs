@@ -2,7 +2,7 @@
 
 // This binary reads DWARF, maps struct fields to cacheline boundaries, and warns on cross group sharing.
 
-use memvis::dwarf::{parse_elf, FieldInfo, TypeInfo};
+use rtmap::dwarf::{parse_elf, FieldInfo, TypeInfo};
 use std::collections::{BTreeMap, HashMap};
 use std::env;
 use std::fs;
@@ -698,7 +698,7 @@ fn check_union_overlaps(layouts: &[FieldLayout], cl_size: u64) -> Vec<Diagnostic
 }
 
 fn usage() -> ! {
-    eprintln!("usage: memvis-lint <binary> --struct <name> [--cacheline N] [--annotations file]");
+    eprintln!("usage: rtmap-lint <binary> --struct <name> [--cacheline N] [--annotations file]");
     eprintln!("       [--all] [--diff] [--json] [--list] [--heatmap file.tsv]");
     process::exit(1);
 }

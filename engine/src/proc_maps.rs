@@ -166,12 +166,12 @@ mod tests {
 
     #[test]
     fn test_parse_map_line_shared() {
-        let line = "7f0000000000-7f0000100000 rw-s 00000000 00:05 99999                      /dev/shm/memvis_ctl_1234";
+        let line = "7f0000000000-7f0000100000 rw-s 00000000 00:05 99999                      /dev/shm/rtmap_ctl_1234";
         let entry = parse_map_line(line).unwrap();
         assert!(entry.is_writable());
         assert!(entry.is_shared());
         assert_eq!(entry.dev_inode.inode, 99999);
-        assert!(entry.path.contains("memvis_ctl"));
+        assert!(entry.path.contains("rtmap_ctl"));
     }
 
     #[test]

@@ -1,27 +1,27 @@
 # Usage
 
-Full flag reference and invocation examples for all memvis binaries.
+Full flag reference and invocation examples for all rtmap binaries.
 
 ## First-time setup
 
 ```sh
-memvis setup
+rtmap setup
 ```
 
-Auto-detects DynamoRIO, locates `drrun` and `libmemvis_tracer.so`, and
-writes `~/.config/memvis/config`. Run once after installation.
+Auto-detects DynamoRIO, locates `drrun` and `librtmap_tracer.so`, and
+writes `~/.config/rtmap/config`. Run once after installation.
 
 ## Project profiles
 
 ```sh
-memvis init /path/to/my_server
+rtmap init /path/to/my_server
 ```
 
-Creates a `.memvis` file in the current directory with auto-detected settings
+Creates a `.rtmap` file in the current directory with auto-detected settings
 for the target binary. Auto-detects the tripwire symbol (event-loop function)
 for servers, and enables topology + heatmap export by default.
 
-The `.memvis` file is a flat key-value config:
+The `.rtmap` file is a flat key-value config:
 
 ```ini
 target.nginx.tripwire = ngx_epoll_process_events
@@ -31,50 +31,50 @@ target.nginx.heatmap = nginx.heatmap.tsv
 # target.nginx.no_bb = false
 ```
 
-Resolution order: **CLI flags > `.memvis` project > `~/.config/memvis/config` > auto-detect**.
+Resolution order: **CLI flags > `.rtmap` project > `~/.config/rtmap/config` > auto-detect**.
 
-## memvis
+## rtmap
 
 ### Instrument and run
 
 ```sh
 # headless (default): print snapshot to stdout, exit on idle
-memvis run ./my_program [args...]
+rtmap run ./my_program [args...]
 
 # interactive TUI (20 Hz refresh, time-travel, 6 panels)
-memvis run ./my_program --live [args...]
+rtmap run ./my_program --live [args...]
 
 # server mode: defer tracing until event loop starts, auto-exit after traffic
-memvis run --tripwire aeProcessEvents ./redis-server --port 6399
+rtmap run --tripwire aeProcessEvents ./redis-server --port 6399
 
-# with project profile (reads .memvis, no flags needed)
-memvis run ./my_server
+# with project profile (reads .rtmap, no flags needed)
+rtmap run ./my_server
 
 # override profile args on CLI
-memvis run ./my_server -- --port 7399
+rtmap run ./my_server -- --port 7399
 
 # record events for offline analysis
-memvis record -o trace.bin ./my_program
+rtmap record -o trace.bin ./my_program
 
 # export topology, heatmap, and BB coverage
-memvis run ./my_program --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
+rtmap run ./my_program --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
 
 # skip BB_ENTRY events (reduces ring volume, no topology impact)
-memvis run ./my_program --no-bb
+rtmap run ./my_program --no-bb
 ```
 
 ### Replay
 
 ```sh
-memvis replay trace.bin --dwarf ./my_program
-memvis replay trace.bin --no-bb
+rtmap replay trace.bin --dwarf ./my_program
+rtmap replay trace.bin --no-bb
 ```
 
 ### Attach to running tracer
 
 ```sh
-memvis attach --dwarf ./my_program
-memvis attach --live
+rtmap attach --dwarf ./my_program
+rtmap attach --live
 ```
 
 ### Flags
@@ -95,7 +95,7 @@ memvis attach --live
 
 ### Server mode idle timeout
 
-When `--tripwire` is set (or resolved from `.memvis`), the engine enters
+When `--tripwire` is set (or resolved from `.rtmap`), the engine enters
 server mode. The idle timeout is armed only after the tracer confirms the
 tripwire has fired (via an atomic `tripwire_hit` flag in the shared ctl
 header). This prevents premature exit during DynamoRIO's JIT compilation
@@ -108,24 +108,24 @@ phase.
 
 Tracer death always triggers immediate exit regardless of arming state.
 
-## memvis-diff
+## rtmap-diff
 
 Offline differential topology comparison of two recorded traces.
 
 ```sh
-memvis-diff --baseline a.bin --subject b.bin --dwarf ./my_program \
+rtmap-diff --baseline a.bin --subject b.bin --dwarf ./my_program \
     --interval 500000 --output diff.jsonl
 
 # --dwarf is optional; without it, diff compares alloc/hazard topology only
-memvis-diff --baseline a.bin --subject b.bin --interval 50000
+rtmap-diff --baseline a.bin --subject b.bin --interval 50000
 ```
 
-## memvis-check
+## rtmap-check
 
 CI/CD structural assertion engine over JSONL topology files.
 
 ```sh
-memvis-check topo.jsonl assertions.txt
+rtmap-check topo.jsonl assertions.txt
 ```
 
 Exit code 0 = all assertions pass. Non-zero = at least one failure.
@@ -170,31 +170,31 @@ assert type_stable(global("head"), "node*")
 assert no_false_sharing("counter_a", "counter_b")
 ```
 
-## memvis-lint
+## rtmap-lint
 
 Static cacheline false-sharing detector.
 
 ```sh
 # analyze a single struct
-memvis-lint ./my_program --struct my_struct
+rtmap-lint ./my_program --struct my_struct
 
 # all structs with warnings
-memvis-lint ./my_program --all
+rtmap-lint ./my_program --all
 
 # list available struct types
-memvis-lint ./my_program --list
+rtmap-lint ./my_program --list
 
 # field migration diff between two builds
-memvis-lint ./old_binary ./new_binary --struct my_struct --diff
+rtmap-lint ./old_binary ./new_binary --struct my_struct --diff
 
 # divergence report: overlay lint predictions with runtime heatmap
-memvis-lint ./my_program --struct my_struct --heatmap heat.tsv
+rtmap-lint ./my_program --struct my_struct --heatmap heat.tsv
 
 # annotation-based analysis
-memvis-lint ./my_program --struct my_struct --annotations ann.txt --cacheline 64
+rtmap-lint ./my_program --struct my_struct --annotations ann.txt --cacheline 64
 
 # JSON output for CI/CD
-memvis-lint ./my_program --struct my_struct --json
+rtmap-lint ./my_program --struct my_struct --json
 ```
 
 Exit code 1 if any warnings are emitted.
@@ -205,7 +205,7 @@ Exit code 1 if any warnings are emitted.
 |---|---|
 | `DYNAMORIO_HOME` | DynamoRIO installation directory |
 | `MEMVIS_DRRUN` | Explicit path to `drrun` binary |
-| `MEMVIS_TRACER` | Explicit path to `libmemvis_tracer.so` |
+| `MEMVIS_TRACER` | Explicit path to `librtmap_tracer.so` |
 
 ## TUI keybindings
 
@@ -227,10 +227,10 @@ Exit code 1 if any warnings are emitted.
 ## Docker
 
 ```sh
-DOCKER_BUILDKIT=1 docker build -t memvis .
+DOCKER_BUILDKIT=1 docker build -t rtmap .
 docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     -v /path/to/my_program:/app/my_program \
-    memvis /app/my_program
+    rtmap /app/my_program
 ```
 
 `--cap-add=SYS_PTRACE` and `--security-opt seccomp=unconfined` are required

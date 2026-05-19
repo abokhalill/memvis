@@ -53,13 +53,13 @@ jobs:
 
       - name: smoke test — binaries execute
         run: |
-          for bin in memvis memvis-lint memvis-diff memvis-check; do
+          for bin in rtmap rtmap-lint rtmap-diff rtmap-check; do
             test -x engine/target/release/$bin
             echo "ok: $bin exists and is executable"
           done
-          # memvis-check with no args should exit non-zero (no input) but not crash
-          engine/target/release/memvis-check 2>/dev/null && exit 1 || true
-          echo "ok: memvis-check exits non-zero on missing args"
+          # rtmap-check with no args should exit non-zero (no input) but not crash
+          engine/target/release/rtmap-check 2>/dev/null && exit 1 || true
+          echo "ok: rtmap-check exits non-zero on missing args"
 
   docker:
     name: docker build + verify
@@ -76,29 +76,29 @@ jobs:
           context: .
           load: true
           push: false
-          tags: memvis:ci
+          tags: rtmap:ci
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
       - name: Verify — all 4 binaries present and runnable
         run: |
-          for bin in memvis memvis-lint memvis-diff memvis-check; do
-            docker run --rm --entrypoint $bin memvis:ci --help 2>&1 || true
+          for bin in rtmap rtmap-lint rtmap-diff rtmap-check; do
+            docker run --rm --entrypoint $bin rtmap:ci --help 2>&1 || true
             echo "ok: $bin runs inside container"
           done
 
       - name: Verify — DR runtime tree intact
         run: |
-          docker run --rm --entrypoint ls memvis:ci \
+          docker run --rm --entrypoint ls rtmap:ci \
             /opt/dynamorio/bin64/drrun \
             /opt/dynamorio/lib64/release/libdynamorio.so \
             /opt/dynamorio/ext/lib64/release/libdrwrap.so \
             /opt/dynamorio/ext/lib64/release/libdrsyms.so \
-            /app/libmemvis_tracer.so
+            /app/librtmap_tracer.so
           echo "ok: DR runtime tree and tracer present"
 
       - name: Verify — image size sanity (<250MB)
         run: |
-          SIZE=$(docker image inspect memvis:ci --format '{{.Size}}')
+          SIZE=$(docker image inspect rtmap:ci --format '{{.Size}}')
           echo "Image size: $((SIZE / 1048576)) MB"
           test "$SIZE" -lt 262144000  # 250MB

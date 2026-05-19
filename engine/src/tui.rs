@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// ratatui interactive TUI for memvis
+// ratatui interactive TUI for rtmap
 
 use std::collections::{HashMap, VecDeque};
 use std::io;

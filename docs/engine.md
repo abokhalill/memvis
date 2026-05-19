@@ -4,10 +4,10 @@ The engine is a Rust crate (`engine/`) that produces four binaries:
 
 | Binary | Entry point | Purpose |
 |---|---|---|
-| `memvis` | `main.rs` | Live instrumentation (TUI/headless), event recording, event replay |
-| `memvis-lint` | `lint.rs` | Static cacheline false-sharing detector with divergence report |
-| `memvis-diff` | `diff.rs` | Offline ASLR-invariant differential topology comparison |
-| `memvis-check` | `check.rs` | CI/CD structural assertion engine over JSONL topology files |
+| `rtmap` | `main.rs` | Live instrumentation (TUI/headless), event recording, event replay |
+| `rtmap-lint` | `lint.rs` | Static cacheline false-sharing detector with divergence report |
+| `rtmap-diff` | `diff.rs` | Offline ASLR-invariant differential topology comparison |
+| `rtmap-check` | `check.rs` | CI/CD structural assertion engine over JSONL topology files |
 
 All four share the same library modules via `lib.rs`. This document covers
 each subsystem. All claims are derived from the current `engine/src/` source.
@@ -34,10 +34,10 @@ each subsystem. All claims are derived from the current `engine/src/` source.
    record.rs         AddressIndex  ShadowRegs          |
          |           index.rs     shadow_regs.rs       v
          v                  |         |       +------------------+
-   memvis-diff       HeapGraph    HeapOracle  |  Renderer        |
+   rtmap-diff       HeapGraph    HeapOracle  |  Renderer        |
    diff.rs           heap_graph.rs            |  tui.rs (TUI)    |
          |                  |                 |  main.rs (text)  |
-   memvis-check      ShadowTypeMap (STM)      +------------------+
+   rtmap-check      ShadowTypeMap (STM)      +------------------+
    check.rs          HeapAllocTracker                  |
          |           Visual ASan               EventRecorder
    topology.jsonl    world.rs                  record.rs
@@ -85,7 +85,7 @@ are marked `shallow: true`.
 Qualifier tracking: `DW_TAG_volatile_type` and `DW_TAG_atomic_type` set
 `is_volatile` / `is_atomic` on the resolved `TypeInfo` instead of discarding
 the qualifier. This provides ground-truth write-intent signals to downstream
-consumers (e.g., `memvis-lint`).
+consumers (e.g., `rtmap-lint`).
 
 ```rust
 pub struct TypeInfo {
@@ -240,9 +240,9 @@ Supported `LocationPiece` variants:
   `DW_OP_stack_value`. Cannot dereference target memory (separate address
   space), so `DW_OP_deref` preserves the address on the stack.
 
-DWARF-to-memvis register mapping is defined in `DWARF_TO_REGFILE[17]`,
+DWARF-to-rtmap register mapping is defined in `DWARF_TO_REGFILE[17]`,
 translating DWARF register numbers (0=RAX, 1=RDX, 2=RCX, 3=RBX, ...) to
-memvis indices (0=RAX, 1=RBX, 2=RCX, 3=RDX, ...).
+rtmap indices (0=RAX, 1=RBX, 2=RCX, 3=RDX, ...).
 
 ## Ring orchestrator (`ring.rs`)
 
@@ -263,7 +263,7 @@ The orchestrator manages all shared memory connections to the tracer.
 On attach, `try_attach_ctl` validates:
 1. `magic` matches the expected constant.
 2. `proto_version == MEMVIS_PROTO_VERSION` (currently 3).
-3. `build_hash == memvis_abi_hash()` — structural ABI hash over `sizeof`/`offsetof`
+3. `build_hash == rtmap_abi_hash()` — structural ABI hash over `sizeof`/`offsetof`
    of `Event`, `RingHeader`, and scratch pad offsets. Mismatches are rejected
    with `ABI MISMATCH` diagnostic and the engine refuses to attach.
 
@@ -823,7 +823,7 @@ paths, suppressing coverage tracking without affecting topology correctness.
 ## Event reconciler (`reconciler.rs`)
 
 Extracted from `main.rs` into a library module for consumption by both the
-live engine and `memvis-diff`. Public API:
+live engine and `rtmap-diff`. Public API:
 
 - **`process_event`**: Central dispatch for all event types.
 - **`populate_globals`**: Inserts DWARF globals into the address index.
@@ -1015,7 +1015,7 @@ Plain-text output to stdout. Exits via two conditions:
 | Normal | 50 rounds (~5s) | `total > 0` (any events received) |
 | Server | 200 rounds (~20s) | `ctl.tripwire_hit == 1` or `stm.len() > 0` |
 
-Server mode is activated by `--tripwire` or a `.memvis` profile with a
+Server mode is activated by `--tripwire` or a `.rtmap` profile with a
 tripwire symbol. The engine reads the `tripwire_hit` atomic flag from the
 shared ctl header to determine arming. This prevents premature exit during
 DynamoRIO's multi-second JIT compilation pause.
@@ -1068,7 +1068,7 @@ Each event on disk: `addr(8) + size(4) + tid(2) + seq(2) + value(8) + kind_flags
   - `size` = `regs[i*3+1]` (truncated to u32)
   - `value` = `regs[i*3+2]`
 
-This mirrors the ring protocol layout. The replayer (`memvis-diff`) detects
+This mirrors the ring protocol layout. The replayer (`rtmap-diff`) detects
 the header, reads 6 continuations, reconstructs the 18-register array, and
 calls `world.update_regs` + `srf.apply_snapshot`.
 
@@ -1095,9 +1095,9 @@ Each line is a self-contained JSON object.
 | `FALSE_SHARE` | seq, cl_addr, threads, names[] | Cache-line contention |
 | `SUMMARY` | total_events, nodes, edges, stm_projections, live_allocs, hazards | End of run |
 
-Consumed by `memvis-check` for structural assertions.
+Consumed by `rtmap-check` for structural assertions.
 
-## Differential topology (`diff.rs`, `memvis-diff`)
+## Differential topology (`diff.rs`, `rtmap-diff`)
 
 Replays two `.bin` recordings through `reconciler::process_event` with
 `RingOrchestrator::new_offline()`, checkpoints ASLR-invariant topology at
@@ -1106,7 +1106,7 @@ configurable intervals, and reports structural divergence.
 ### Usage
 
 ```sh
-memvis-diff --baseline a.bin --subject b.bin [--dwarf <elf>] \
+rtmap-diff --baseline a.bin --subject b.bin [--dwarf <elf>] \
     [--interval N] [--output diff.jsonl]
 ```
 
@@ -1158,13 +1158,13 @@ consecutive continuation events, reconstructs the 18-register array, and
 calls `world.update_regs` + `srf.apply_snapshot`. This provides full CPU
 context for hazard analysis during offline replay.
 
-## Structural assertions (`check.rs`, `memvis-check`)
+## Structural assertions (`check.rs`, `rtmap-check`)
 
 Reads a JSONL topology file and a `.assertions` file. Evaluates invariants
 against the recorded structural events. Intended for CI/CD integration.
 
 ```sh
-memvis-check topo.jsonl assertions.txt
+rtmap-check topo.jsonl assertions.txt
 ```
 
 Exit code 0 = all assertions pass. Non-zero = at least one failure.
@@ -1192,9 +1192,9 @@ an assertion of the form `assert <predicate>`. Supported predicates:
 assertion compares STAMP/LINK `seq` against `free_seq`, not `seq`. This
 prevents false positives where a STAMP occurs after ALLOC but before FREE.
 
-## Static cacheline lint (`lint.rs`, `memvis-lint`)
+## Static cacheline lint (`lint.rs`, `rtmap-lint`)
 
-`memvis-lint` is a pure static analysis tool. It reads DWARF from a compiled
+`rtmap-lint` is a pure static analysis tool. It reads DWARF from a compiled
 binary and maps struct fields to cacheline boundaries, warning on layouts
 likely to cause false-sharing.
 
@@ -1236,7 +1236,7 @@ path first, then falls back to the leaf field name.
 ### Divergence report (`--heatmap`)
 
 Overlays lint predictions with runtime observations from a heatmap TSV
-(exported by `memvis --export-heatmap`). Classifies each cacheline:
+(exported by `rtmap --export-heatmap`). Classifies each cacheline:
 
 | Class | Lint | Heatmap | Meaning |
 |---|---|---|---|
@@ -1247,20 +1247,20 @@ Overlays lint predictions with runtime observations from a heatmap TSV
 ### CLI
 
 ```sh
-memvis-lint <binary> --struct <name>           # single struct analysis
-memvis-lint <binary> --all                     # all structs with warnings
-memvis-lint <binary> --list                    # list available struct types
-memvis-lint <binary> --struct <name> --json    # JSON output for CI/CD
-memvis-lint <old> <new> --struct <name> --diff # field migration diff
-memvis-lint <binary> --struct <name> --heatmap heat.tsv  # divergence report
-memvis-lint <binary> --struct <name> --annotations ann.txt --cacheline 64
+rtmap-lint <binary> --struct <name>           # single struct analysis
+rtmap-lint <binary> --all                     # all structs with warnings
+rtmap-lint <binary> --list                    # list available struct types
+rtmap-lint <binary> --struct <name> --json    # JSON output for CI/CD
+rtmap-lint <old> <new> --struct <name> --diff # field migration diff
+rtmap-lint <binary> --struct <name> --heatmap heat.tsv  # divergence report
+rtmap-lint <binary> --struct <name> --annotations ann.txt --cacheline 64
 ```
 
 Exit code 1 if any warnings are emitted (CI/CD gatekeeper).
 
 ## Startup sequence
 
-Full startup when the user runs `memvis run <target>`:
+Full startup when the user runs `rtmap run <target>`:
 
 1. Parse CLI: subcommand routing (`setup`, `init`, `record`, `replay`,
    `attach`, or default `run`). Legacy flags (`--once`, `--record`,
@@ -1270,7 +1270,7 @@ Full startup when the user runs `memvis run <target>`:
    `server_mode`, `min_events`, `record_path`, `topo_path`, `heatmap_path`,
    `coverage_path`.
 2. Load configuration: `resolve_config()` merges global config
-   (`~/.config/memvis/config`) with project config (`.memvis` found by
+   (`~/.config/rtmap/config`) with project config (`.rtmap` found by
    walking cwd upward). `resolve_target_profile` matches the target
    binary name to a `TargetProfile` and applies tripwire, args, topology,
    heatmap, coverage, no_bb settings (CLI flags take precedence).
@@ -1279,14 +1279,14 @@ Full startup when the user runs `memvis run <target>`:
 5. Otherwise (launch mode):
    a. Locate `drrun` (via config `paths.dynamorio_home`, `DYNAMORIO_HOME`,
       `MEMVIS_DRRUN`, `--dr-home`, or glob auto-detect).
-   b. Locate `libmemvis_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
+   b. Locate `librtmap_tracer.so` (via `MEMVIS_TRACER` or relative to binary).
    c. Resolve tripwire symbol to ELF offset via `resolve_elf_symbol_offset`.
-   d. Clean up stale `/dev/shm/memvis_*` from previous runs.
+   d. Clean up stale `/dev/shm/rtmap_*` from previous runs.
    e. Install signal handlers (SIGINT, SIGTERM) to forward to the tracer.
-   f. Spawn: `drrun -c libmemvis_tracer.so [tripwire_offset_hex] -- <target> [args]`.
+   f. Spawn: `drrun -c librtmap_tracer.so [tripwire_offset_hex] -- <target> [args]`.
 6. Parse DWARF from the target ELF binary (globals, functions, locals, types,
    type_registry). ELF symtab fallback for `DW_AT_specification` globals.
-7. Poll for `/memvis_ctl` (up to 30 seconds, validating magic + proto).
+7. Poll for `/rtmap_ctl` (up to 30 seconds, validating magic + proto).
 8. Discover the first thread ring and attach (validating magic + proto).
 9. Spawn the consumer on a 64 MB stack thread (deep DWARF resolution).
 10. Consumer enters the main event loop (TUI or headless).

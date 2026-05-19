@@ -1,12 +1,12 @@
 # Architecture
 
-Authoritative reference for the memvis system architecture. All claims are
-derived from the current implementation in `tracer.c`, `memvis_bridge.h`, and
+Authoritative reference for the rtmap system architecture. All claims are
+derived from the current implementation in `tracer.c`, `rtmap_bridge.h`, and
 `engine/src/`. Protocol version: **3**.
 
 ## System overview
 
-memvis consists of two cooperating OS processes connected by POSIX shared
+rtmap consists of two cooperating OS processes connected by POSIX shared
 memory, plus offline analysis tools that operate on recorded traces:
 
 ```
@@ -14,10 +14,10 @@ memory, plus offline analysis tools that operate on recorded traces:
  │         TRACER            │ =============> │             ENGINE                │
  │  (DynamoRIO client, C)    │  SPSC rings    │        (Rust, 4 binaries)         │
  │                           │  control ring  │                                   │
- │  tracer.c                 │                │  memvis       main.rs  (live)     │
- │  memvis_bridge.h          │                │  memvis-lint  lint.rs  (static)   │
- │                           │                │  memvis-diff  diff.rs  (offline)  │
- │  inline pre/post write    │                │  memvis-check check.rs (CI/CD)    │
+ │  tracer.c                 │                │  rtmap       main.rs  (live)     │
+ │  rtmap_bridge.h          │                │  rtmap-lint  lint.rs  (static)   │
+ │                           │                │  rtmap-diff  diff.rs  (offline)  │
+ │  inline pre/post write    │                │  rtmap-check check.rs (CI/CD)    │
  │  clean-call value capture │                │                                   │
  │  per-thread raw TLS       │                │  reconciler.rs  (event dispatch)  │
  │  adaptive backpressure    │                │  config.rs     (configuration)    │
@@ -34,19 +34,19 @@ memory, plus offline analysis tools that operate on recorded traces:
        address space (DBI)
 ```
 
-The **tracer** is a shared library (`libmemvis_tracer.so`) loaded into the
+The **tracer** is a shared library (`librtmap_tracer.so`) loaded into the
 target by DynamoRIO. The **engine** is a Rust crate producing four binaries:
 
 | Binary | Entry point | Purpose |
 |---|---|---|
-| `memvis` | `main.rs` | CLI shell with subcommands (`setup`, `init`, `record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` carries `--live`, `--no-bb`, `--tripwire`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path, `server_mode`. |
-| `memvis-lint` | `lint.rs` | Static cacheline lint: struct analysis, divergence report, diff mode |
-| `memvis-diff` | `diff.rs` | Replay two `.bin` traces, diff ASLR-invariant topology |
-| `memvis-check` | `check.rs` | Evaluate `.assertions` against JSONL topology |
+| `rtmap` | `main.rs` | CLI shell with subcommands (`setup`, `init`, `record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` carries `--live`, `--no-bb`, `--tripwire`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path, `server_mode`. |
+| `rtmap-lint` | `lint.rs` | Static cacheline lint: struct analysis, divergence report, diff mode |
+| `rtmap-diff` | `diff.rs` | Replay two `.bin` traces, diff ASLR-invariant topology |
+| `rtmap-check` | `check.rs` | Evaluate `.assertions` against JSONL topology |
 
 ## Components
 
-### Tracer (`tracer.c`, `memvis_bridge.h`)
+### Tracer (`tracer.c`, `rtmap_bridge.h`)
 
 The tracer is a DynamoRIO client. It uses a **hybrid inline/clean-call**
 strategy. See [Tracer](tracer.md) for the full specification.
@@ -65,8 +65,8 @@ Summary of instrumented event types:
 | Fork | `dr_register_fork_init_event` | PROCESS_FORK event (kind 13) |
 
 Each thread gets its own SPSC ring buffer via `shm_open(3)`. Thread metadata
-is published to a PID-scoped control ring (`/memvis_ctl_<pid>`). The root
-process also creates a legacy `/memvis_ctl` for backward compatibility.
+is published to a PID-scoped control ring (`/rtmap_ctl_<pid>`). The root
+process also creates a legacy `/rtmap_ctl` for backward compatibility.
 See [Ring Protocol](ring-protocol.md).
 
 ### Engine (`engine/`)
@@ -79,7 +79,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
 | File | Module | Role |
 |---|---|---|
 | `reconciler.rs` | `reconciler` | Event dispatch: `process_event`, `populate_globals`, `warm_scan` (legacy one-shot), `WarmScanner` (continuous BFS with `seed()`/`step(budget)`) |
-| `config.rs` | `config` | Configuration resolution: `.memvis` project profiles, `~/.config/memvis/config`, `TargetProfile` (tripwire, args, export paths), auto-detect |
+| `config.rs` | `config` | Configuration resolution: `.rtmap` project profiles, `~/.config/rtmap/config`, `TargetProfile` (tripwire, args, export paths), auto-detect |
 | `dwarf.rs` | `dwarf` | DWARF parser + ELF symtab fallback + CFI table + JIT deep resolution: globals, functions, locals, types, type_registry, `.eh_frame` |
 | `ring.rs` | `ring` | SHM mapping, ring consumer, orchestrator, `new_offline()` for replay |
 | `index.rs` | `index` | Two-tier interval map. O(log N) address-to-variable lookup |
@@ -96,10 +96,10 @@ modules re-exported from `lib.rs`, with four binary entry points.
 
 | File | Binary | Role |
 |---|---|---|
-| `main.rs` | `memvis` | CLI shell with subcommands (`setup`, `init`, `record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` carries `--live`, `--no-bb`, `--tripwire`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path, `server_mode`. |
-| `lint.rs` | `memvis-lint` | Static cacheline lint: struct analysis, divergence report, diff mode |
-| `diff.rs` | `memvis-diff` | Replay two `.bin` traces, diff ASLR-invariant topology |
-| `check.rs` | `memvis-check` | Evaluate `.assertions` against JSONL topology |
+| `main.rs` | `rtmap` | CLI shell with subcommands (`setup`, `init`, `record`, `replay`, `attach`; default: instrument+run headless). `RunConfig` carries `--live`, `--no-bb`, `--tripwire`, `--coverage`, `--topology`, `--heatmap`, `--min-events`, record path, `server_mode`. |
+| `lint.rs` | `rtmap-lint` | Static cacheline lint: struct analysis, divergence report, diff mode |
+| `diff.rs` | `rtmap-diff` | Replay two `.bin` traces, diff ASLR-invariant topology |
+| `check.rs` | `rtmap-check` | Evaluate `.assertions` against JSONL topology |
 
 #### Engine subsystem summary
 
@@ -150,7 +150,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
    `patch_shallow_fields`, then stamps with the patched version.
 
 4. **Event reconciler** (`reconciler.rs`). Extracted from `main.rs` for
-   library consumption by `memvis-diff`. Contains `process_event` (central
+   library consumption by `rtmap-diff`. Contains `process_event` (central
    dispatch for all 14 event types including PROCESS_FORK),
    `populate_globals`, and `warm_scan`. `process_event` takes
    `dwarf_info: &mut Option<DwarfInfo>` to allow mutable access for
@@ -241,7 +241,7 @@ modules re-exported from `lib.rs`, with four binary entry points.
     FALSE_SHARE, PROCESS_FORK, CROSS_PROCESS_WRITE, TYPE_SCHISM,
     TYPE_EPOCH_CLOSE, SEQ_GAP, SUMMARY. `TYPE_SCHISM` events carry a
     `pool_reuse` boolean distinguishing allocator recycling from genuine
-    type confusion. Consumed by `memvis-check`.
+    type confusion. Consumed by `rtmap-check`.
 
 16. **Cross-process topology** (`main.rs`, `proc_maps.rs`).
     `ChildProcessTracker` manages fork-discovered child processes:
@@ -299,7 +299,7 @@ On exit, the engine performs a final `poll_new_rings()` sweep to discover
 rings from short-lived threads that spawned and died between poll
 intervals, drains all remaining events, then renders the final snapshot.
 
-### Shared memory protocol (`memvis_bridge.h`)
+### Shared memory protocol (`rtmap_bridge.h`)
 
 See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 
@@ -307,7 +307,7 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
   + `rip_lo` (u32: app PC offset). Extended 32-bit sequence numbers.
 - **Ring header**: 192 bytes (3 cache lines). Head and tail on separate lines.
 - **Control ring**: 256 thread slots. Dead-slot reclamation via CAS.
-- **Build hash**: structural FNV-1a over `sizeof`/`offsetof` of `memvis_event_v3_t`, `memvis_ring_header_t`, and `memvis_scratch_pad_t`. Engine refuses to attach on mismatch.
+- **Build hash**: structural FNV-1a over `sizeof`/`offsetof` of `rtmap_event_v3_t`, `rtmap_ring_header_t`, and `rtmap_scratch_pad_t`. Engine refuses to attach on mismatch.
 
 ## Data flow
 
@@ -383,15 +383,15 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 ### Recording path (live → `.bin` → replay)
 
 ```
- live run (memvis record -o trace.bin ./target)
+ live run (rtmap record -o trace.bin ./target)
          │
          ▼
  EventRecorder writes events to .bin (32 bytes each)
  REG_SNAPSHOT: header + 6 continuations = 7 events (18 registers)
          │
          ▼
- offline replay (memvis replay trace.bin [--no-bb])
-   or    offline diff (memvis-diff --baseline a.bin --subject b.bin)
+ offline replay (rtmap replay trace.bin [--no-bb])
+   or    offline diff (rtmap-diff --baseline a.bin --subject b.bin)
          │
          ▼
  EventPlayer reads events → reconciler::process_event
@@ -421,38 +421,38 @@ See [Ring Protocol](ring-protocol.md) for the full specification. Summary:
 
 ```
 # Root process (PID-scoped + legacy for backward compat)
-/dev/shm/memvis_ctl           Legacy control ring (root process only)
-/dev/shm/memvis_ctl_<pid>     PID-scoped control ring (~14 KB)
-/dev/shm/memvis_ring_<pid>_0  Thread 0 data ring (1M entries, ~32 MB)
-/dev/shm/memvis_ring_<pid>_1  Thread 1 data ring
+/dev/shm/rtmap_ctl           Legacy control ring (root process only)
+/dev/shm/rtmap_ctl_<pid>     PID-scoped control ring (~14 KB)
+/dev/shm/rtmap_ring_<pid>_0  Thread 0 data ring (1M entries, ~32 MB)
+/dev/shm/rtmap_ring_<pid>_1  Thread 1 data ring
 ...
-/dev/shm/memvis_ring_<pid>_N  Thread N data ring (max N = 255)
+/dev/shm/rtmap_ring_<pid>_N  Thread N data ring (max N = 255)
 
 # Forked child process (PID-scoped only, no legacy)
-/dev/shm/memvis_ctl_<child_pid>
-/dev/shm/memvis_ring_<child_pid>_0
+/dev/shm/rtmap_ctl_<child_pid>
+/dev/shm/rtmap_ring_<child_pid>_0
 ...
 ```
 
-Each data ring is `sizeof(memvis_ring_header_t) + capacity * 32` bytes.
+Each data ring is `sizeof(rtmap_ring_header_t) + capacity * 32` bytes.
 Default capacity: 2^20 (1,048,576 entries), ~32 MB per ring.
 
 ## Shared memory lifecycle
 
 | Phase | Actor | Action |
 |---|---|---|
-| Startup | Engine | Best-effort cleanup of stale `/dev/shm/memvis_*` (legacy + PID-scoped) |
-| Startup | Tracer | Creates `/memvis_ctl_<pid>` (+ legacy `/memvis_ctl` for root), inits header (magic + proto + abi_hash + parent_pid) |
-| Thread init | Tracer | Creates `/memvis_ring_<pid>_<tid>`, registers via CAS reclaim or alloc |
-| Attach | Engine | Opens `/memvis_ctl` (legacy) or `/memvis_ctl_<pid>`, validates magic + proto + abi_hash |
-| Discovery | Engine | Opens `/memvis_ring_<pid>_<tid>`, validates magic + proto |
+| Startup | Engine | Best-effort cleanup of stale `/dev/shm/rtmap_*` (legacy + PID-scoped) |
+| Startup | Tracer | Creates `/rtmap_ctl_<pid>` (+ legacy `/rtmap_ctl` for root), inits header (magic + proto + abi_hash + parent_pid) |
+| Thread init | Tracer | Creates `/rtmap_ring_<pid>_<tid>`, registers via CAS reclaim or alloc |
+| Attach | Engine | Opens `/rtmap_ctl` (legacy) or `/rtmap_ctl_<pid>`, validates magic + proto + abi_hash |
+| Discovery | Engine | Opens `/rtmap_ring_<pid>_<tid>`, validates magic + proto |
 | Fork | Tracer | `event_fork_init`: detach inherited SHM, create child-scoped ctl + ring, emit PROCESS_FORK event |
 | Fork | Engine | `ChildProcessTracker`: discovers child ctl via `try_attach_ctl_pid`, polls child rings, detects shared regions |
 | Runtime | Both | Producer writes events, consumer drains them (parent + child orchestrators) |
 | Pre-syscall | Tracer | Flushes cached head; marks terminal on exit/exit_group |
 | Thread exit | Tracer | Terminal flush: sets `status = MV_STATUS_TERMINAL`, marks DEAD, unmaps/unlinks |
 | Ring drain | Engine | `batch_drain`: consumes events, retires terminal rings when `head == tail` |
-| Shutdown | Tracer | Unmaps and unlinks `/memvis_ctl` |
+| Shutdown | Tracer | Unmaps and unlinks `/rtmap_ctl` |
 | Shutdown | Engine | Unmaps all rings |
 
 All shared memory objects: mode 0600 (owner read/write only).
@@ -479,7 +479,7 @@ No shared mutable state. All communication via SPSC ring buffers.
 - Cross-cursor reads: acquire ordering.
 
 No mutex, spinlock, or CAS in the hot path. CAS only in:
-- `memvis_ctl_register_thread` (once per thread lifetime).
+- `rtmap_ctl_register_thread` (once per thread lifetime).
 - `g_module_base_phase` CAS 1→2 (once per process lifetime).
 
 ### Head caching
@@ -509,10 +509,10 @@ Cached in raw TLS (`MEMVIS_RAW_SLOT_HEAD`). Flushed to ring header:
 ### Docker
 
 ```sh
-DOCKER_BUILDKIT=1 docker build -t memvis .
+DOCKER_BUILDKIT=1 docker build -t rtmap .
 docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
     -v /path/to/my_program:/app/my_program \
-    memvis /app/my_program
+    rtmap /app/my_program
 ```
 
 `--cap-add=SYS_PTRACE` required for DynamoRIO process attachment.
@@ -524,7 +524,7 @@ docker run --cap-add=SYS_PTRACE --security-opt seccomp=unconfined \
 cmake -B build -DDynamoRIO_DIR=/path/to/DynamoRIO/cmake
 cmake --build build -j$(nproc)
 
-# engine (produces memvis, memvis-lint, memvis-diff, memvis-check)
+# engine (produces rtmap, rtmap-lint, rtmap-diff, rtmap-check)
 cd engine && cargo build --release
 ```
 
@@ -532,39 +532,39 @@ cd engine && cargo build --release
 
 ```sh
 # default: headless instrumentation, print snapshot, exit on 500ms idle
-memvis <target> [args...]
+rtmap <target> [args...]
 
 # interactive TUI (20 Hz)
-memvis <target> --live
+rtmap <target> --live
 
 # explicit DWARF source
-memvis <target> --dwarf <elf>
+rtmap <target> --dwarf <elf>
 
 # record events for offline analysis
-memvis record -o trace.bin <target>
+rtmap record -o trace.bin <target>
 
 # replay (with optional --no-bb filter)
-memvis replay trace.bin [--no-bb] [--dwarf <elf>]
+rtmap replay trace.bin [--no-bb] [--dwarf <elf>]
 
 # attach to running tracer
-memvis attach [--dwarf <elf>] [--live]
+rtmap attach [--dwarf <elf>] [--live]
 
 # export topology, heatmap, BB coverage
-memvis <target> --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
+rtmap <target> --topology topo.jsonl --heatmap heat.tsv --coverage cov.tsv
 
 # skip BB_ENTRY events (reduces volume, no topology impact)
-memvis <target> --no-bb
+rtmap <target> --no-bb
 
 # static cacheline lint
-memvis-lint <binary> --struct <name>
-memvis-lint <binary> --struct <name> --heatmap heat.tsv
+rtmap-lint <binary> --struct <name>
+rtmap-lint <binary> --struct <name> --heatmap heat.tsv
 
 # differential comparison (--dwarf optional)
-memvis-diff --baseline a.bin --subject b.bin [--dwarf <elf>] \
+rtmap-diff --baseline a.bin --subject b.bin [--dwarf <elf>] \
     [--interval N] [--output diff.jsonl]
 
 # structural assertions (CI/CD)
-memvis-check <topology.jsonl> <assertions.txt>
+rtmap-check <topology.jsonl> <assertions.txt>
 ```
 
 Legacy flags `--once`, `--record`, `--replay`, `--consumer-only` are accepted
@@ -574,4 +574,4 @@ via compatibility shims.
 |---|---|
 | `DYNAMORIO_HOME` | Path to DynamoRIO installation directory |
 | `MEMVIS_DRRUN` | Explicit path to `drrun` binary |
-| `MEMVIS_TRACER` | Explicit path to `libmemvis_tracer.so` |
+| `MEMVIS_TRACER` | Explicit path to `librtmap_tracer.so` |

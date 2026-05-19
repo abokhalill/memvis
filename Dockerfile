@@ -25,7 +25,7 @@ RUN mkdir -p /opt/dynamorio && \
         /opt/dynamorio/drmemory/drmf/DrMemoryFrameworkConfig.cmake
 
 WORKDIR /src
-COPY CMakeLists.txt tracer.c memvis_bridge.h /src/
+COPY CMakeLists.txt tracer.c rtmap_bridge.h /src/
 RUN cmake -B build -DCMAKE_BUILD_TYPE=Release \
         -DDynamoRIO_DIR=/opt/dynamorio/cmake && \
     cmake --build build -j"$(nproc)"
@@ -46,10 +46,10 @@ COPY engine/ /src/engine/
 RUN --mount=type=cache,target=/usr/local/cargo/registry \
     --mount=type=cache,target=/usr/local/cargo/git \
     cargo build --release --manifest-path /src/engine/Cargo.toml && \
-    strip /src/engine/target/release/memvis \
-          /src/engine/target/release/memvis-lint \
-          /src/engine/target/release/memvis-diff \
-          /src/engine/target/release/memvis-check
+    strip /src/engine/target/release/rtmap \
+          /src/engine/target/release/rtmap-lint \
+          /src/engine/target/release/rtmap-diff \
+          /src/engine/target/release/rtmap-check
 
 # minimal DR runtime tree: drrun + libs the tracer links
 RUN mkdir -p /rt/dr/bin64 /rt/dr/lib64/release /rt/dr/ext/lib64/release && \
@@ -68,23 +68,23 @@ FROM ubuntu:24.04 AS runtime
 RUN apt-get update && apt-get install -y --no-install-recommends \
         ca-certificates zlib1g \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd -m -U -s /usr/sbin/nologin memvis
+    && useradd -m -U -s /usr/sbin/nologin rtmap
 
-COPY --from=builder --chown=memvis:memvis /rt/dr /opt/dynamorio
-COPY --from=builder --chown=memvis:memvis /src/build/libmemvis_tracer.so /app/
-COPY --from=builder --chown=memvis:memvis \
-    /src/engine/target/release/memvis \
-    /src/engine/target/release/memvis-lint \
-    /src/engine/target/release/memvis-diff \
-    /src/engine/target/release/memvis-check \
+COPY --from=builder --chown=rtmap:rtmap /rt/dr /opt/dynamorio
+COPY --from=builder --chown=rtmap:rtmap /src/build/librtmap_tracer.so /app/
+COPY --from=builder --chown=rtmap:rtmap \
+    /src/engine/target/release/rtmap \
+    /src/engine/target/release/rtmap-lint \
+    /src/engine/target/release/rtmap-diff \
+    /src/engine/target/release/rtmap-check \
     /usr/local/bin/
 
-USER memvis
+USER rtmap
 WORKDIR /app
 
 ENV DYNAMORIO_HOME=/opt/dynamorio \
-    MEMVIS_TRACER=/app/libmemvis_tracer.so \
+    MEMVIS_TRACER=/app/librtmap_tracer.so \
     LD_LIBRARY_PATH=/opt/dynamorio/ext/lib64/release
 
 STOPSIGNAL SIGTERM
-ENTRYPOINT ["/usr/local/bin/memvis"]
+ENTRYPOINT ["/usr/local/bin/rtmap"]

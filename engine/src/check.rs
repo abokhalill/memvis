@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: Apache-2.0
-// memvis-check: structural assertion engine for CI/CD pipelines.
+// rtmap-check: structural assertion engine for CI/CD pipelines.
 // reads a JSONL topology file + .assertions file, evaluates invariants.
 
 use std::collections::{HashMap, HashSet};
@@ -674,7 +674,7 @@ fn json_hex(line: &str, key: &str) -> u64 {
 fn main() {
     let args: Vec<String> = env::args().collect();
     if args.len() < 3 {
-        eprintln!("Usage: memvis-check <topology.jsonl> <assertions.txt>");
+        eprintln!("Usage: rtmap-check <topology.jsonl> <assertions.txt>");
         eprintln!();
         eprintln!("Assertion DSL:");
         eprintln!("  assert no_hazards");
@@ -694,36 +694,36 @@ fn main() {
     let topo_path = &args[1];
     let assert_path = &args[2];
 
-    eprintln!("memvis-check: loading topology from {}", topo_path);
+    eprintln!("rtmap-check: loading topology from {}", topo_path);
     let graph = match TopoGraph::build(topo_path) {
         Ok(g) => g,
         Err(e) => {
-            eprintln!("memvis-check: failed to load topology: {}", e);
+            eprintln!("rtmap-check: failed to load topology: {}", e);
             process::exit(1);
         }
     };
     eprintln!(
-        "memvis-check: {} allocs, {} stamps, {} links, {} hazards",
+        "rtmap-check: {} allocs, {} stamps, {} links, {} hazards",
         graph.allocs.len(),
         graph.stamps.len(),
         graph.links.len(),
         graph.hazards.len()
     );
 
-    eprintln!("memvis-check: loading assertions from {}", assert_path);
+    eprintln!("rtmap-check: loading assertions from {}", assert_path);
     let assertions = match parse_assertions(assert_path) {
         Ok(a) => a,
         Err(e) => {
-            eprintln!("memvis-check: failed to parse assertions: {}", e);
+            eprintln!("rtmap-check: failed to parse assertions: {}", e);
             process::exit(1);
         }
     };
-    eprintln!("memvis-check: {} assertions loaded", assertions.len());
+    eprintln!("rtmap-check: {} assertions loaded", assertions.len());
 
     println!();
     let (pass, fail) = evaluate(&graph, &assertions);
     println!();
-    println!("memvis-check: {} passed, {} failed", pass, fail);
+    println!("rtmap-check: {} passed, {} failed", pass, fail);
 
     if fail > 0 {
         process::exit(1);

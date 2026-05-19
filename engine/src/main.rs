@@ -5,17 +5,17 @@ use std::io;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering as AtomicOrdering};
 use std::{env, thread, time};
 
-use memvis::dwarf::{self, DwarfInfo};
-use memvis::heap_graph::{HeapGraph, HeapOracle};
-use memvis::index::{AddressIndex, FrameId, NodeId};
-use memvis::proc_maps::{self, SharedRegion};
-use memvis::reconciler::{self, EVENT_BB_ENTRY, EVENT_CALL, EVENT_PROCESS_FORK, EVENT_REG_SNAPSHOT};
-use memvis::record::{EventPlayer, EventRecorder};
-use memvis::ring::{Event, RingOrchestrator};
-use memvis::shadow_regs::ShadowRegisterFile;
-use memvis::topology::TopologyStream;
-use memvis::tui::{self, AppState, JournalEntry};
-use memvis::world::{ShadowStack, SnapshotRing, WorldState};
+use rtmap::dwarf::{self, DwarfInfo};
+use rtmap::heap_graph::{HeapGraph, HeapOracle};
+use rtmap::index::{AddressIndex, FrameId, NodeId};
+use rtmap::proc_maps::{self, SharedRegion};
+use rtmap::reconciler::{self, EVENT_BB_ENTRY, EVENT_CALL, EVENT_PROCESS_FORK, EVENT_REG_SNAPSHOT};
+use rtmap::record::{EventPlayer, EventRecorder};
+use rtmap::ring::{Event, RingOrchestrator};
+use rtmap::shadow_regs::ShadowRegisterFile;
+use rtmap::topology::TopologyStream;
+use rtmap::tui::{self, AppState, JournalEntry};
+use rtmap::world::{ShadowStack, SnapshotRing, WorldState};
 
 struct RunConfig {
     once: bool,
@@ -125,7 +125,7 @@ impl ChildProcessTracker {
         while i < self.pending_pids.len() {
             if now.duration_since(self.pending_since[i]) > ttl {
                 eprintln!(
-                    "memvis: pending child pid {} expired after {}s (ctl never appeared)",
+                    "rtmap: pending child pid {} expired after {}s (ctl never appeared)",
                     self.pending_pids[i], PENDING_PID_TTL_SECS
                 );
                 self.pending_pids.swap_remove(i);
@@ -141,7 +141,7 @@ impl ChildProcessTracker {
             let pid = self.pending_pids[j];
             let mut orch = RingOrchestrator::new();
             if orch.try_attach_ctl_pid(pid) {
-                eprintln!("memvis: child process {} ctl attached", pid);
+                eprintln!("rtmap: child process {} ctl attached", pid);
                 self.child_orchs.push(orch);
                 self.child_empty_ticks.push(0);
                 self.pending_pids.swap_remove(j);
@@ -161,7 +161,7 @@ impl ChildProcessTracker {
             if pid_gone && self.child_empty_ticks[k] >= CHILD_EMPTY_TICK_RETIRE {
                 let pid = self.child_orchs[k].target_pid().unwrap_or(0);
                 eprintln!(
-                    "memvis: retiring dead child orchestrator pid={} after {} empty ticks",
+                    "rtmap: retiring dead child orchestrator pid={} after {} empty ticks",
                     pid, self.child_empty_ticks[k]
                 );
                 self.child_orchs.swap_remove(k);
@@ -200,13 +200,13 @@ impl ChildProcessTracker {
             Ok(regions) => {
                 if !regions.is_empty() {
                     eprintln!(
-                        "memvis: detected {} shared regions across {} processes",
+                        "rtmap: detected {} shared regions across {} processes",
                         regions.len(),
                         all_pids.len()
                     );
                     for r in &regions {
                         eprintln!(
-                            "memvis:   inode={} path='{}' mappings={}",
+                            "rtmap:   inode={} path='{}' mappings={}",
                             r.dev_inode.inode,
                             r.path,
                             r.mappings.len()
@@ -217,7 +217,7 @@ impl ChildProcessTracker {
                 self.shared_regions = regions;
             }
             Err(e) => {
-                eprintln!("memvis: shared region detection failed: {}", e);
+                eprintln!("rtmap: shared region detection failed: {}", e);
             }
         }
         self.shared_regions_stale = false;
@@ -297,11 +297,11 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
             .as_ref()
             .and_then(|p| match EventRecorder::create(std::path::Path::new(p)) {
                 Ok(r) => {
-                    eprintln!("memvis: recording to {}", p);
+                    eprintln!("rtmap: recording to {}", p);
                     Some(r)
                 }
                 Err(e) => {
-                    eprintln!("memvis: failed to create recording: {}", e);
+                    eprintln!("rtmap: failed to create recording: {}", e);
                     None
                 }
             });
@@ -311,11 +311,11 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
             .as_ref()
             .and_then(|p| match TopologyStream::create(std::path::Path::new(p)) {
                 Ok(t) => {
-                    eprintln!("memvis: topology stream → {}", p);
+                    eprintln!("rtmap: topology stream → {}", p);
                     Some(t)
                 }
                 Err(e) => {
-                    eprintln!("memvis: failed to create topology stream: {}", e);
+                    eprintln!("rtmap: failed to create topology stream: {}", e);
                     None
                 }
             });
@@ -340,7 +340,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
             &mut topo,
             no_bb,
         );
-        eprintln!("memvis: indirect registrations={} stamps={} map_size={}",
+        eprintln!("rtmap: indirect registrations={} stamps={} map_size={}",
             world.stm.indirect_registrations, world.stm.indirect_stamps, world.stm.indirect_len());
         if let Some(ref mut ts) = topo {
             ts.emit_summary(
@@ -354,20 +354,20 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
         }
         if let Some(rec) = recorder {
             match rec.finish() {
-                Ok(n) => eprintln!("memvis: recorded {} events", n),
-                Err(e) => eprintln!("memvis: recording finalize error: {}", e),
+                Ok(n) => eprintln!("rtmap: recorded {} events", n),
+                Err(e) => eprintln!("rtmap: recording finalize error: {}", e),
             }
         }
         if let Some(ts) = topo {
             match ts.finish() {
-                Ok(n) => eprintln!("memvis: topology: {} lines", n),
-                Err(e) => eprintln!("memvis: topology finalize error: {}", e),
+                Ok(n) => eprintln!("rtmap: topology: {} lines", n),
+                Err(e) => eprintln!("rtmap: topology finalize error: {}", e),
             }
         }
         if let Some(ref hp) = heatmap_path {
             match world.field_heatmap.export_tsv(std::path::Path::new(hp)) {
-                Ok(()) => eprintln!("memvis: heatmap exported to {}", hp),
-                Err(e) => eprintln!("memvis: heatmap export error: {}", e),
+                Ok(()) => eprintln!("rtmap: heatmap exported to {}", hp),
+                Err(e) => eprintln!("rtmap: heatmap export error: {}", e),
             }
         }
         if let Some(ref cp) = coverage_path {
@@ -379,7 +379,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     let mut terminal = match tui::init_terminal() {
         Ok(t) => t,
         Err(e) => {
-            eprintln!("memvis: failed to init terminal: {}", e);
+            eprintln!("rtmap: failed to init terminal: {}", e);
             return;
         }
     };
@@ -389,7 +389,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     let refresh = time::Duration::from_millis(50);
     let mut last_render = time::Instant::now();
     let mut last_discovery = time::Instant::now();
-    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
+    let mut batch_buf: Vec<(usize, rtmap::ring::Event)> = Vec::with_capacity(128_000);
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
     let mut last_reseed_total: u64 = 0;
     let mut child_tracker = ChildProcessTracker::new();
@@ -443,8 +443,8 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
 
                     if ev_kind == EVENT_REG_SNAPSHOT {
                         let slice_end = (i + 7).min(batch_buf.len());
-                        let mut events7: [memvis::ring::Event; 7] =
-                            [memvis::ring::Event::zero(); 7];
+                        let mut events7: [rtmap::ring::Event; 7] =
+                            [rtmap::ring::Event::zero(); 7];
                         let take = slice_end - i;
                         for s in 0..take {
                             events7[s] = batch_buf[i + s].1;
@@ -468,7 +468,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                                 seq_gaps += 1;
                                 if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                                     eprintln!(
-                                        "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                        "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
                                         seq_gaps, ev.thread_id, *exp, s32, gap_size
                                     );
                                 }
@@ -497,7 +497,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                             seq_gaps += 1;
                             if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                                 eprintln!(
-                                    "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                    "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
                                     seq_gaps, ev.thread_id, *exp, s32, gap_size
                                 );
                             }
@@ -572,8 +572,8 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
 
                         if ck == EVENT_REG_SNAPSHOT {
                             let cslice_end = (j + 7).min(batch_buf.len());
-                            let mut cev7: [memvis::ring::Event; 7] =
-                                [memvis::ring::Event::zero(); 7];
+                            let mut cev7: [rtmap::ring::Event; 7] =
+                                [rtmap::ring::Event::zero(); 7];
                             let ctake = cslice_end - j;
                             for s in 0..ctake {
                                 cev7[s] = batch_buf[j + s].1;
@@ -669,7 +669,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     } else {
                         let (ng, nf) = reconciler::populate_lib_globals(info, pid, &mut addr_index, &mut world);
                         if ng > 0 || nf > 0 {
-                            eprintln!("memvis: {} library globals, {} functions relocated", ng, nf);
+                            eprintln!("rtmap: {} library globals, {} functions relocated", ng, nf);
                             lib_globals_done = true;
                         }
                     }
@@ -684,7 +684,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                         match reconciler::WarmScanner::new(pid, 12) {
                             Ok(s) => s,
                             Err(e) => {
-                                eprintln!("memvis: warm-scan init failed: {}", e);
+                                eprintln!("rtmap: warm-scan init failed: {}", e);
                                 std::process::exit(1);
                             }
                         }
@@ -692,12 +692,12 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     scanner.seed(info, delta, &heap_oracle, &mut topo, &mut world.stm, &world.heap_allocs);
                     let _ = scanner.step(2000, info, &mut world, &heap_oracle, &mut topo);
                     eprintln!(
-                        "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
+                        "rtmap: warm-scan seed: {} stamps, {} reads, {} queued",
                         scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
                     );
                     if scanner.stats.queue_cap_hits > 0 {
                         eprintln!(
-                            "memvis: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
+                            "rtmap: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
                             scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP
                         );
                     }
@@ -721,7 +721,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     let new_stamps = scanner.stats.stamps_applied - prev_stamps;
                     if new_stamps > 0 {
                         eprintln!(
-                            "memvis: warm-scan reseed @{}: +{} stamps, {} reads, {} dropped",
+                            "rtmap: warm-scan reseed @{}: +{} stamps, {} reads, {} dropped",
                             total, new_stamps, scanner.stats.reads, scanner.stats.queue_cap_hits,
                         );
                     }
@@ -784,14 +784,14 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
     }
     if let Some(rec) = recorder {
         match rec.finish() {
-            Ok(n) => eprintln!("memvis: recorded {} events", n),
-            Err(e) => eprintln!("memvis: recording finalize error: {}", e),
+            Ok(n) => eprintln!("rtmap: recorded {} events", n),
+            Err(e) => eprintln!("rtmap: recording finalize error: {}", e),
         }
     }
     if let Some(ts) = topo {
         match ts.finish() {
-            Ok(n) => eprintln!("memvis: topology: {} lines", n),
-            Err(e) => eprintln!("memvis: topology finalize error: {}", e),
+            Ok(n) => eprintln!("rtmap: topology: {} lines", n),
+            Err(e) => eprintln!("rtmap: topology finalize error: {}", e),
         }
     }
     tui::restore_terminal(&mut terminal);
@@ -821,7 +821,7 @@ fn run_headless(
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
     let mut last_discovery = time::Instant::now();
-    let mut batch_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(128_000);
+    let mut batch_buf: Vec<(usize, rtmap::ring::Event)> = Vec::with_capacity(128_000);
     let mut idle_rounds: u32 = 0;
     let mut warm_scanner: Option<reconciler::WarmScanner> = None;
     let mut last_reseed_total: u64 = 0;
@@ -876,7 +876,7 @@ fn run_headless(
 
                 if ev_kind == EVENT_REG_SNAPSHOT {
                     let slice_end = (i + 7).min(batch_buf.len());
-                    let mut events7: [memvis::ring::Event; 7] = [memvis::ring::Event::zero(); 7];
+                    let mut events7: [rtmap::ring::Event; 7] = [rtmap::ring::Event::zero(); 7];
                     let take = slice_end - i;
                     for s in 0..take {
                         events7[s] = batch_buf[i + s].1;
@@ -896,7 +896,7 @@ fn run_headless(
                             seq_gaps += 1;
                             if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                                 eprintln!(
-                                    "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                    "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
                                     seq_gaps, ev.thread_id, *exp, s32, gap_size
                                 );
                             }
@@ -924,7 +924,7 @@ fn run_headless(
                         seq_gaps += 1;
                         if seq_gaps <= 10 || seq_gaps.is_power_of_two() {
                             eprintln!(
-                                "memvis: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
+                                "rtmap: SEQ_GAP #{} tid={} expected={} got={} (dropped ~{} events)",
                                 seq_gaps, ev.thread_id, *exp, s32, gap_size
                             );
                         }
@@ -1000,8 +1000,8 @@ fn run_headless(
 
                     if ck == EVENT_REG_SNAPSHOT {
                         let cslice_end = (j + 7).min(batch_buf.len());
-                        let mut cev7: [memvis::ring::Event; 7] =
-                            [memvis::ring::Event::zero(); 7];
+                        let mut cev7: [rtmap::ring::Event; 7] =
+                            [rtmap::ring::Event::zero(); 7];
                         let ctake = cslice_end - j;
                         for s in 0..ctake {
                             cev7[s] = batch_buf[j + s].1;
@@ -1098,7 +1098,7 @@ fn run_headless(
                 // final ring discovery sweep: catch rings from short-lived
                 // threads that spawned and died between poll intervals.
                 orch.poll_new_rings();
-                let mut final_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(4096);
+                let mut final_buf: Vec<(usize, rtmap::ring::Event)> = Vec::with_capacity(4096);
                 loop {
                     final_buf.clear();
                     let got = orch.batch_drain(4096, &mut final_buf);
@@ -1135,13 +1135,13 @@ fn run_headless(
                 }
                 if seq_gaps > 0 {
                     eprintln!(
-                        "memvis: WARNING: {} sequence gaps detected — ring overflow or event loss occurred",
+                        "rtmap: WARNING: {} sequence gaps detected — ring overflow or event loss occurred",
                         seq_gaps
                     );
                 }
                 eprintln!(
-                    "memvis: {} events processed, rendering snapshot\n\
-                     memvis: STM projections={} indirect_reg={} indirect_stamps={} schisms={} pool_reuse={} deferred_replays={} deferred_pending={}",
+                    "rtmap: {} events processed, rendering snapshot\n\
+                     rtmap: STM projections={} indirect_reg={} indirect_stamps={} schisms={} pool_reuse={} deferred_replays={} deferred_pending={}",
                     total,
                     world.stm.len(),
                     world.stm.indirect_registrations,
@@ -1177,7 +1177,7 @@ fn run_headless(
                 // the tracer may have produced events before exiting;
                 // attempt a final poll + drain before declaring failure
                 orch.poll_new_rings();
-                let mut rescue_buf: Vec<(usize, memvis::ring::Event)> = Vec::with_capacity(4096);
+                let mut rescue_buf: Vec<(usize, rtmap::ring::Event)> = Vec::with_capacity(4096);
                 loop {
                     rescue_buf.clear();
                     let got = orch.batch_drain(4096, &mut rescue_buf);
@@ -1204,15 +1204,15 @@ fn run_headless(
                     continue;
                 }
                 let status = TRACER_EXIT_STATUS.load(AtomicOrdering::Relaxed);
-                eprintln!("memvis: error: tracer exited before any events were received.");
+                eprintln!("rtmap: error: tracer exited before any events were received.");
                 if libc::WIFEXITED(status) {
                     let code = libc::WEXITSTATUS(status);
-                    eprintln!("memvis: tracer exit code: {}", code);
+                    eprintln!("rtmap: tracer exit code: {}", code);
                 } else if libc::WIFSIGNALED(status) {
                     let sig = libc::WTERMSIG(status);
-                    eprintln!("memvis: tracer killed by signal: {}", sig);
+                    eprintln!("rtmap: tracer killed by signal: {}", sig);
                 }
-                eprintln!("memvis: possible causes:");
+                eprintln!("rtmap: possible causes:");
                 eprintln!("  - target program exited before tracer could instrument it");
                 eprintln!(
                     "  - DynamoRIO injection failed (missing --cap-add=SYS_PTRACE in Docker?)"
@@ -1224,9 +1224,9 @@ fn run_headless(
 
             // zero events but tracer still running; keep waiting, but warn after 5s
             if *total == 0 && idle_rounds == 500 {
-                eprintln!("memvis: warning: 5s elapsed with no events from tracer");
+                eprintln!("rtmap: warning: 5s elapsed with no events from tracer");
                 eprintln!(
-                    "memvis: still waiting... (tracer pid {} is alive)",
+                    "rtmap: still waiting... (tracer pid {} is alive)",
                     TRACER_PID.load(AtomicOrdering::Relaxed)
                 );
             }
@@ -1246,7 +1246,7 @@ fn run_headless(
                 } else {
                     let (ng, nf) = reconciler::populate_lib_globals(info, pid, addr_index, world);
                     if ng > 0 || nf > 0 {
-                        eprintln!("memvis: {} library globals, {} functions relocated", ng, nf);
+                        eprintln!("rtmap: {} library globals, {} functions relocated", ng, nf);
                         lib_globals_done = true;
                     }
                 }
@@ -1261,7 +1261,7 @@ fn run_headless(
                     match reconciler::WarmScanner::new(pid, 12) {
                         Ok(s) => s,
                         Err(e) => {
-                            eprintln!("memvis: warm-scan init failed: {}", e);
+                            eprintln!("rtmap: warm-scan init failed: {}", e);
                             std::process::exit(1);
                         }
                     }
@@ -1269,12 +1269,12 @@ fn run_headless(
                 scanner.seed(info, delta, heap_oracle, recorder_topo, &mut world.stm, &world.heap_allocs);
                 let _ = scanner.step(2000, info, world, heap_oracle, recorder_topo);
                 eprintln!(
-                    "memvis: warm-scan seed: {} stamps, {} reads, {} queued",
+                    "rtmap: warm-scan seed: {} stamps, {} reads, {} queued",
                     scanner.stats.stamps_applied, scanner.stats.reads, scanner.stats.enqueued
                 );
                 if scanner.stats.queue_cap_hits > 0 {
                     eprintln!(
-                        "memvis: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
+                        "rtmap: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
                         scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP
                     );
                 }
@@ -1303,7 +1303,7 @@ fn run_headless(
                 let new_stamps = scanner.stats.stamps_applied - prev_stamps;
                 if new_stamps > 0 {
                     eprintln!(
-                        "memvis: warm-scan reseed: +{} stamps, {} reads, {} dropped",
+                        "rtmap: warm-scan reseed: +{} stamps, {} reads, {} dropped",
                         new_stamps, scanner.stats.reads, scanner.stats.queue_cap_hits,
                     );
                 }
@@ -1312,7 +1312,7 @@ fn run_headless(
 
         // safety valve: user sent SIGINT/SIGTERM
         if GOT_SIGNAL.load(AtomicOrdering::Relaxed) {
-            eprintln!("memvis: interrupted, {} events processed", total);
+            eprintln!("rtmap: interrupted, {} events processed", total);
             break;
         }
     }
@@ -1321,14 +1321,14 @@ fn run_headless(
 #[allow(clippy::too_many_arguments)]
 fn headless_render(
     out: &mut impl std::io::Write,
-    world: &memvis::world::WorldInner,
-    cl_tracker: &memvis::world::CacheLineTracker,
-    stm: &memvis::world::ShadowTypeMap,
-    heap_allocs: &memvis::world::HeapAllocTracker,
-    hazards: &[memvis::world::HeapHazard],
-    field_heatmap: &memvis::world::FieldHeatmap,
-    type_stability: &memvis::world::TypeStabilityMonitor,
-    type_epochs: &memvis::world::TypeEpochLog,
+    world: &rtmap::world::WorldInner,
+    cl_tracker: &rtmap::world::CacheLineTracker,
+    stm: &rtmap::world::ShadowTypeMap,
+    heap_allocs: &rtmap::world::HeapAllocTracker,
+    hazards: &[rtmap::world::HeapHazard],
+    field_heatmap: &rtmap::world::FieldHeatmap,
+    type_stability: &rtmap::world::TypeStabilityMonitor,
+    type_epochs: &rtmap::world::TypeEpochLog,
     journal: &VecDeque<JournalEntry>,
     total: u64,
     orch: &RingOrchestrator,
@@ -1524,7 +1524,7 @@ fn headless_render(
     }
 
     if !hazards.is_empty() {
-        use memvis::world::HazardKind;
+        use rtmap::world::HazardKind;
         let oob = hazards
             .iter()
             .filter(|h| matches!(h.kind, HazardKind::OutOfBounds))
@@ -1568,7 +1568,7 @@ fn headless_render(
 
     // type stability: per-type tally of field boundary violations
     if !type_stability.is_empty() {
-        use memvis::world::ViolationKind;
+        use rtmap::world::ViolationKind;
         let _ = writeln!(
             out,
             "\n\u{26a0}\u{fe0f}  TYPE STABILITY ({} violations across {} checked writes)",
@@ -1771,7 +1771,7 @@ fn export_bb_coverage(path: &std::path::Path, bb_hits: &HashMap<u32, u64>) {
     let file = match std::fs::File::create(path) {
         Ok(f) => f,
         Err(e) => {
-            eprintln!("memvis: failed to create coverage file: {}", e);
+            eprintln!("rtmap: failed to create coverage file: {}", e);
             return;
         }
     };
@@ -1783,7 +1783,7 @@ fn export_bb_coverage(path: &std::path::Path, bb_hits: &HashMap<u32, u64>) {
         let _ = writeln!(out, "0x{:x}\t{}", rip, count);
     }
     eprintln!(
-        "memvis: coverage exported to {} ({} BBs)",
+        "rtmap: coverage exported to {} ({} BBs)",
         path.display(),
         sorted.len()
     );
@@ -1799,18 +1799,18 @@ fn run_replay(
     use std::io::Write;
 
     let mut dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
-        eprintln!("memvis: parsing DWARF from {}", path);
+        eprintln!("rtmap: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
             Ok(info) => {
                 eprintln!(
-                    "memvis: {} globals, {} functions",
+                    "rtmap: {} globals, {} functions",
                     info.globals.len(),
                     info.functions.len()
                 );
                 Some(info)
             }
             Err(e) => {
-                eprintln!("memvis: DWARF parse failed: {}", e);
+                eprintln!("rtmap: DWARF parse failed: {}", e);
                 None
             }
         }
@@ -1819,12 +1819,12 @@ fn run_replay(
     let mut player = match EventPlayer::open(std::path::Path::new(replay_path)) {
         Ok(p) => p,
         Err(e) => {
-            eprintln!("memvis: failed to open recording: {}", e);
+            eprintln!("rtmap: failed to open recording: {}", e);
             return;
         }
     };
     eprintln!(
-        "memvis: replaying {} events from {}",
+        "rtmap: replaying {} events from {}",
         player.event_count(),
         replay_path
     );
@@ -1851,11 +1851,11 @@ fn run_replay(
             .as_ref()
             .and_then(|p| match TopologyStream::create(std::path::Path::new(p)) {
                 Ok(t) => {
-                    eprintln!("memvis: topology stream → {}", p);
+                    eprintln!("rtmap: topology stream → {}", p);
                     Some(t)
                 }
                 Err(e) => {
-                    eprintln!("memvis: failed to create topology stream: {}", e);
+                    eprintln!("rtmap: failed to create topology stream: {}", e);
                     None
                 }
             });
@@ -1870,7 +1870,7 @@ fn run_replay(
         let got = match player.read_batch(&mut event_buf, 4096) {
             Ok(n) => n,
             Err(e) => {
-                eprintln!("memvis: replay read error: {}", e);
+                eprintln!("rtmap: replay read error: {}", e);
                 break;
             }
         };
@@ -1960,12 +1960,12 @@ fn run_replay(
     }
     if let Some(ts) = topo {
         match ts.finish() {
-            Ok(n) => eprintln!("memvis: topology: {} lines", n),
-            Err(e) => eprintln!("memvis: topology finalize error: {}", e),
+            Ok(n) => eprintln!("rtmap: topology: {} lines", n),
+            Err(e) => eprintln!("rtmap: topology finalize error: {}", e),
         }
     }
 
-    eprintln!("memvis: replay complete, {} events processed", total);
+    eprintln!("rtmap: replay complete, {} events processed", total);
     let snap = world.snapshot();
     let stdout = io::stdout();
     let mut out = io::BufWriter::new(stdout.lock());
@@ -1989,12 +1989,12 @@ fn run_replay(
 }
 
 fn cleanup_shm_for_pid(pid: u32) {
-    let ctl_name = format!("/memvis_ctl_{}\0", pid);
+    let ctl_name = format!("/rtmap_ctl_{}\0", pid);
     unsafe {
         libc::shm_unlink(ctl_name.as_ptr() as *const libc::c_char);
     }
     for i in 0..256u32 {
-        let name = format!("/memvis_ring_{}_{}\0", pid, i);
+        let name = format!("/rtmap_ring_{}_{}\0", pid, i);
         unsafe {
             libc::shm_unlink(name.as_ptr() as *const libc::c_char);
         }
@@ -2003,24 +2003,24 @@ fn cleanup_shm_for_pid(pid: u32) {
 
 fn cleanup_shm() {
     unsafe {
-        libc::shm_unlink(c"/memvis_ctl".as_ptr());
+        libc::shm_unlink(c"/rtmap_ctl".as_ptr());
     }
     for i in 0..256u32 {
-        let name = format!("/memvis_ring_{}\0", i);
+        let name = format!("/rtmap_ring_{}\0", i);
         unsafe {
             libc::shm_unlink(name.as_ptr() as *const libc::c_char);
         }
     }
 }
 
-fn find_drrun(cfg: &memvis::config::Config) -> Option<std::path::PathBuf> {
+fn find_drrun(cfg: &rtmap::config::Config) -> Option<std::path::PathBuf> {
     if let Some(ref p) = cfg.drrun_path {
         let path = std::path::PathBuf::from(p);
         if path.exists() {
             return Some(path);
         }
     }
-    if let Ok(p) = env::var("MEMVIS_DRRUN") {
+    if let Ok(p) = env::var("RTMAP_DRRUN") {
         let path = std::path::PathBuf::from(&p);
         if path.exists() {
             return Some(path);
@@ -2046,7 +2046,7 @@ fn find_drrun(cfg: &memvis::config::Config) -> Option<std::path::PathBuf> {
             }
         }
     }
-    if let Some(dr_home) = memvis::config::discover_dynamorio() {
+    if let Some(dr_home) = rtmap::config::discover_dynamorio() {
         let path = dr_home.join("bin64/drrun");
         if path.exists() {
             return Some(path);
@@ -2055,14 +2055,14 @@ fn find_drrun(cfg: &memvis::config::Config) -> Option<std::path::PathBuf> {
     None
 }
 
-fn find_tracer(cfg: &memvis::config::Config) -> Option<std::path::PathBuf> {
+fn find_tracer(cfg: &rtmap::config::Config) -> Option<std::path::PathBuf> {
     if let Some(ref p) = cfg.tracer_path {
         let path = std::path::PathBuf::from(p);
         if path.exists() {
             return Some(path);
         }
     }
-    if let Ok(p) = env::var("MEMVIS_TRACER") {
+    if let Ok(p) = env::var("RTMAP_TRACER") {
         let path = std::path::PathBuf::from(&p);
         if path.exists() {
             return Some(path);
@@ -2071,9 +2071,9 @@ fn find_tracer(cfg: &memvis::config::Config) -> Option<std::path::PathBuf> {
     if let Ok(exe) = env::current_exe() {
         if let Some(dir) = exe.parent() {
             for candidate in &[
-                dir.join("../../build/libmemvis_tracer.so"),
-                dir.join("../../../build/libmemvis_tracer.so"),
-                dir.join("libmemvis_tracer.so"),
+                dir.join("../../build/librtmap_tracer.so"),
+                dir.join("../../../build/librtmap_tracer.so"),
+                dir.join("librtmap_tracer.so"),
             ] {
                 if let Ok(canon) = candidate.canonicalize() {
                     if canon.exists() {
@@ -2110,29 +2110,29 @@ fn install_signal_handlers() {
 
 fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
     let dwarf_info: Option<DwarfInfo> = elf_path.and_then(|path| {
-        eprintln!("memvis: parsing DWARF from {}", path);
+        eprintln!("rtmap: parsing DWARF from {}", path);
         match dwarf::parse_elf(path) {
             Ok(info) => {
                 eprintln!(
-                    "memvis: {} globals, {} functions",
+                    "rtmap: {} globals, {} functions",
                     info.globals.len(),
                     info.functions.len()
                 );
                 Some(info)
             }
             Err(e) => {
-                eprintln!("memvis: DWARF parse failed: {}", e);
+                eprintln!("rtmap: DWARF parse failed: {}", e);
                 None
             }
         }
     });
 
     let mut orch = RingOrchestrator::new();
-    eprintln!("memvis: waiting for tracer...");
+    eprintln!("rtmap: waiting for tracer...");
     let deadline = time::Instant::now() + time::Duration::from_secs(30);
     loop {
         if GOT_SIGNAL.load(AtomicOrdering::Relaxed) {
-            eprintln!("memvis: interrupted while waiting for tracer");
+            eprintln!("rtmap: interrupted while waiting for tracer");
             return;
         }
         if TRACER_EXITED.load(AtomicOrdering::Relaxed) {
@@ -2144,7 +2144,7 @@ fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
                 orch.poll_new_rings();
                 if orch.ring_count() > 0 {
                     eprintln!(
-                        "memvis: attached (tracer already exited), {} ring(s)",
+                        "rtmap: attached (tracer already exited), {} ring(s)",
                         orch.ring_count()
                     );
                     run(orch, dwarf_info, cfg);
@@ -2153,25 +2153,25 @@ fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
                 thread::sleep(time::Duration::from_millis(50));
             }
             let status = TRACER_EXIT_STATUS.load(AtomicOrdering::Relaxed);
-            eprintln!("memvis: error: tracer process exited before shared memory was created.");
+            eprintln!("rtmap: error: tracer process exited before shared memory was created.");
             if libc::WIFEXITED(status) {
-                eprintln!("memvis: tracer exit code: {}", libc::WEXITSTATUS(status));
+                eprintln!("rtmap: tracer exit code: {}", libc::WEXITSTATUS(status));
             } else if libc::WIFSIGNALED(status) {
                 eprintln!(
-                    "memvis: tracer killed by signal: {}",
+                    "rtmap: tracer killed by signal: {}",
                     libc::WTERMSIG(status)
                 );
             }
-            eprintln!("memvis: possible causes:");
+            eprintln!("rtmap: possible causes:");
             eprintln!("  - DynamoRIO injection failed (missing --cap-add=SYS_PTRACE in Docker?)");
             eprintln!("  - target binary not found or not executable");
             eprintln!("  - tracer .so not compatible with this DynamoRIO version");
             std::process::exit(1);
         }
         if time::Instant::now() > deadline {
-            eprintln!("memvis: timeout waiting for tracer (30s).");
-            eprintln!("memvis: the tracer process is still running but has not created the shared memory ring.");
-            eprintln!("memvis: possible causes:");
+            eprintln!("rtmap: timeout waiting for tracer (30s).");
+            eprintln!("rtmap: the tracer process is still running but has not created the shared memory ring.");
+            eprintln!("rtmap: possible causes:");
             eprintln!("  - DynamoRIO is still loading (very large binary)");
             eprintln!("  - tracer initialization is blocked or hung");
             std::process::exit(1);
@@ -2185,7 +2185,7 @@ fn run_consumer(elf_path: Option<&str>, cfg: RunConfig) {
         if attached {
             orch.poll_new_rings();
             if orch.ring_count() > 0 {
-                eprintln!("memvis: attached, {} thread ring(s)", orch.ring_count());
+                eprintln!("rtmap: attached, {} thread ring(s)", orch.ring_count());
                 run(orch, dwarf_info, cfg);
                 return;
             }
@@ -2213,49 +2213,49 @@ fn resolve_elf_symbol_offset(elf_path: &str, symbol_name: &str) -> Option<u64> {
             }
         }
     }
-    eprintln!("memvis: warning: tripwire symbol '{}' not found in {}", symbol_name, elf_path);
+    eprintln!("rtmap: warning: tripwire symbol '{}' not found in {}", symbol_name, elf_path);
     None
 }
 
-fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &memvis::config::Config) {
+fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &rtmap::config::Config) {
     let drrun = match find_drrun(resolved_cfg) {
         Some(p) => p,
         None => {
-            eprintln!("memvis: error: could not locate DynamoRIO.");
+            eprintln!("rtmap: error: could not locate DynamoRIO.");
             eprintln!();
             eprintln!("  To fix this, do ONE of the following:");
             eprintln!();
-            eprintln!("    1. Run 'memvis setup' to auto-discover and persist the path.");
+            eprintln!("    1. Run 'rtmap setup' to auto-discover and persist the path.");
             eprintln!("    2. Set the environment variable:");
             eprintln!("         export DYNAMORIO_HOME=/path/to/DynamoRIO-Linux-*");
-            eprintln!("    3. Add to ~/.config/memvis/config:");
+            eprintln!("    3. Add to ~/.config/rtmap/config:");
             eprintln!("         paths.dynamorio_home = /path/to/DynamoRIO-Linux-*");
             eprintln!();
-            eprintln!("  Searched: MEMVIS_DRRUN, DYNAMORIO_HOME, config file, PATH, ~/DynamoRIO-Linux-*, /opt/dynamorio");
+            eprintln!("  Searched: RTMAP_DRRUN, DYNAMORIO_HOME, config file, PATH, ~/DynamoRIO-Linux-*, /opt/dynamorio");
             std::process::exit(1);
         }
     };
     let tracer = match find_tracer(resolved_cfg) {
         Some(p) => p,
         None => {
-            eprintln!("memvis: error: could not locate libmemvis_tracer.so.");
+            eprintln!("rtmap: error: could not locate librtmap_tracer.so.");
             eprintln!();
             eprintln!("  To fix this, do ONE of the following:");
             eprintln!();
             eprintln!("    1. Build the tracer:");
             eprintln!("         cd build && cmake .. -DDynamoRIO_DIR=$DYNAMORIO_HOME/cmake && make");
-            eprintln!("    2. Run 'memvis setup' to auto-detect after building.");
+            eprintln!("    2. Run 'rtmap setup' to auto-detect after building.");
             eprintln!("    3. Set the environment variable:");
-            eprintln!("         export MEMVIS_TRACER=/path/to/libmemvis_tracer.so");
+            eprintln!("         export RTMAP_TRACER=/path/to/librtmap_tracer.so");
             eprintln!();
-            eprintln!("  Searched: config file, MEMVIS_TRACER, relative to memvis binary");
+            eprintln!("  Searched: config file, RTMAP_TRACER, relative to rtmap binary");
             std::process::exit(1);
         }
     };
 
-    eprintln!("memvis: drrun  = {}", drrun.display());
-    eprintln!("memvis: tracer = {}", tracer.display());
-    eprintln!("memvis: target = {}", target);
+    eprintln!("rtmap: drrun  = {}", drrun.display());
+    eprintln!("rtmap: tracer = {}", tracer.display());
+    eprintln!("rtmap: target = {}", target);
 
     cleanup_shm();
 
@@ -2270,7 +2270,7 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &m
     cmd.arg("-c").arg(&tracer);
     if let Some(off) = tripwire_offset {
         cmd.arg(format!("{:x}", off));
-        eprintln!("memvis: tripwire '{}' at ELF offset 0x{:x}",
+        eprintln!("rtmap: tripwire '{}' at ELF offset 0x{:x}",
                   cfg.tripwire_symbol.as_deref().unwrap_or("?"), off);
     }
     cmd.arg("--").arg(target);
@@ -2285,7 +2285,7 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &m
     let child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("memvis: failed to launch tracer: {}", e);
+            eprintln!("rtmap: failed to launch tracer: {}", e);
             cleanup_shm();
             std::process::exit(1);
         }
@@ -2293,7 +2293,7 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &m
 
     let child_pid = child.id() as i32;
     TRACER_PID.store(child_pid, AtomicOrdering::SeqCst);
-    eprintln!("memvis: tracer pid={}", child_pid);
+    eprintln!("rtmap: tracer pid={}", child_pid);
 
 
     let _reaper = thread::Builder::new()
@@ -2308,20 +2308,20 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &m
             if libc::WIFEXITED(status) {
                 let code = libc::WEXITSTATUS(status);
                 if code != 0 {
-                    eprintln!("memvis: tracer exited with code {}", code);
+                    eprintln!("rtmap: tracer exited with code {}", code);
                 }
             } else if libc::WIFSIGNALED(status) {
                 let sig = libc::WTERMSIG(status);
-                eprintln!("memvis: tracer killed by signal {}", sig);
+                eprintln!("rtmap: tracer killed by signal {}", sig);
             }
         })
-        .expect("memvis: failed to spawn reaper thread");
+        .expect("rtmap: failed to spawn reaper thread");
 
     let target_owned = target.to_string();
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || run_consumer(Some(&target_owned), cfg))
-        .expect("memvis: failed to spawn consumer thread");
+        .expect("rtmap: failed to spawn consumer thread");
     let _ = handle.join();
 
     if !TRACER_EXITED.load(AtomicOrdering::SeqCst) {
@@ -2334,21 +2334,21 @@ fn launch(target: &str, target_args: &[String], cfg: RunConfig, resolved_cfg: &m
     cleanup_shm();
     /* pid-scoped cleanup: target pid may differ from drrun pid */
     cleanup_shm_for_pid(child_pid as u32);
-    eprintln!("memvis: done.");
+    eprintln!("rtmap: done.");
 }
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 fn print_help() {
-    eprintln!("memvis {} — runtime memory topology analyzer", VERSION);
+    eprintln!("rtmap {} — runtime memory topology analyzer", VERSION);
     eprintln!();
     eprintln!("USAGE:");
-    eprintln!("  memvis <target> [-- target_args]    Instrument a binary");
-    eprintln!("  memvis <target> --live              Interactive TUI");
+    eprintln!("  rtmap <target> [-- target_args]    Instrument a binary");
+    eprintln!("  rtmap <target> --live              Interactive TUI");
     eprintln!();
     eprintln!("COMMANDS:");
     eprintln!("  setup                  One-time setup: locate DynamoRIO, persist config");
-    eprintln!("  init <target>          Create .memvis project profile with auto-detected tripwire");
+    eprintln!("  init <target>          Create .rtmap project profile with auto-detected tripwire");
     eprintln!("  record -o <f> <target> Record event trace for offline replay");
     eprintln!("  replay <file>          Replay a recorded trace");
     eprintln!("  attach                 Attach to an already-running tracer");
@@ -2362,15 +2362,15 @@ fn print_help() {
     eprintln!("  -V, --version          Print version");
     eprintln!();
     eprintln!("GETTING STARTED:");
-    eprintln!("  memvis setup                       Auto-detect DynamoRIO and write config");
-    eprintln!("  memvis ./my_server                 Headless snapshot");
-    eprintln!("  memvis ./my_server -- --port 9999  Override target args");
+    eprintln!("  rtmap setup                       Auto-detect DynamoRIO and write config");
+    eprintln!("  rtmap ./my_server                 Headless snapshot");
+    eprintln!("  rtmap ./my_server -- --port 9999  Override target args");
     eprintln!();
-    eprintln!("  Run 'memvis help advanced' for all options and tuning flags.");
+    eprintln!("  Run 'rtmap help advanced' for all options and tuning flags.");
 }
 
 fn print_help_advanced() {
-    eprintln!("memvis {} — advanced options", VERSION);
+    eprintln!("rtmap {} — advanced options", VERSION);
     eprintln!();
     eprintln!("INSTRUMENTATION:");
     eprintln!("  --tripwire <sym>       Defer tracing until function <sym> is entered");
@@ -2388,26 +2388,26 @@ fn print_help_advanced() {
     eprintln!("  --dwarf <elf>          Explicit DWARF source (if separate from target)");
     eprintln!();
     eprintln!("CONFIGURATION:");
-    eprintln!("  Global:  ~/.config/memvis/config   (created by 'memvis setup')");
-    eprintln!("  Project: .memvis                   (created by 'memvis init')");
+    eprintln!("  Global:  ~/.config/rtmap/config   (created by 'rtmap setup')");
+    eprintln!("  Project: .rtmap                   (created by 'rtmap init')");
     eprintln!();
-    eprintln!("  Resolution order: CLI > env var > .memvis > global config > auto-detect");
+    eprintln!("  Resolution order: CLI > env var > .rtmap > global config > auto-detect");
     eprintln!();
     eprintln!("ENVIRONMENT (optional — auto-detected if not set):");
     eprintln!("  DYNAMORIO_HOME         DynamoRIO installation directory");
-    eprintln!("  MEMVIS_DRRUN           Explicit path to drrun binary");
-    eprintln!("  MEMVIS_TRACER          Explicit path to libmemvis_tracer.so");
+    eprintln!("  RTMAP_DRRUN           Explicit path to drrun binary");
+    eprintln!("  RTMAP_TRACER          Explicit path to librtmap_tracer.so");
     eprintln!();
     eprintln!("ARGUMENT OVERRIDE SEMANTICS:");
-    eprintln!("  memvis [MEMVIS_FLAGS] <target> [-- TARGET_ARGS]");
+    eprintln!("  rtmap [RTMAP_FLAGS] <target> [-- TARGET_ARGS]");
     eprintln!();
-    eprintln!("  Args after '--' fully REPLACE any target.*.args from .memvis.");
+    eprintln!("  Args after '--' fully REPLACE any target.*.args from .rtmap.");
     eprintln!("  Without '--', target args come from the project profile (if defined).");
 }
 
 fn die(msg: &str) -> ! {
-    eprintln!("memvis: error: {}", msg);
-    eprintln!("  Run 'memvis --help' for usage.");
+    eprintln!("rtmap: error: {}", msg);
+    eprintln!("  Run 'rtmap --help' for usage.");
     std::process::exit(1);
 }
 
@@ -2417,7 +2417,7 @@ fn take_flag_value(args: &mut Vec<String>, flag: &str) -> Option<String> {
             args.remove(pos);
             return Some(args.remove(pos));
         } else {
-            eprintln!("memvis: error: {} requires a value", flag);
+            eprintln!("rtmap: error: {} requires a value", flag);
             std::process::exit(1);
         }
     }
@@ -2446,7 +2446,7 @@ fn main() {
         std::process::exit(0);
     }
     if take_flag(&mut args, "--version") || take_flag(&mut args, "-V") {
-        eprintln!("memvis {}", VERSION);
+        eprintln!("rtmap {}", VERSION);
         std::process::exit(0);
     }
 
@@ -2524,7 +2524,7 @@ fn cmd_run(args: &mut Vec<String>) {
     let dr_home_flag = take_flag_value(args, "--dr-home");
     let mut cfg = parse_common_flags(args);
 
-    let (mut resolved_cfg, proj_cfg) = memvis::config::resolve_config();
+    let (mut resolved_cfg, proj_cfg) = rtmap::config::resolve_config();
     if let Some(ref dr) = dr_home_flag {
         resolved_cfg.drrun_path = Some(format!("{}/bin64/drrun", dr));
         resolved_cfg.dynamorio_home = Some(dr.clone());
@@ -2544,7 +2544,7 @@ fn cmd_run(args: &mut Vec<String>) {
         let sep_pos = args[target_idx + 1..].iter().position(|a| a == "--").unwrap();
         args[target_idx + 1 + sep_pos + 1..].to_vec()
     } else {
-        let profile = memvis::config::resolve_target_profile(&proj_cfg, &target);
+        let profile = rtmap::config::resolve_target_profile(&proj_cfg, &target);
         if let Some(prof) = profile {
             if cfg.tripwire_symbol.is_none() {
                 cfg.tripwire_symbol = prof.tripwire.clone();
@@ -2575,14 +2575,14 @@ fn cmd_run(args: &mut Vec<String>) {
         let base = std::path::Path::new(&target)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("memvis");
+            .unwrap_or("rtmap");
         cfg.topo_path = Some(format!("{}.topo.jsonl", base));
     }
     if cfg.heatmap_path.is_none() && resolved_cfg.default_heatmap == Some(true) {
         let base = std::path::Path::new(&target)
             .file_stem()
             .and_then(|s| s.to_str())
-            .unwrap_or("memvis");
+            .unwrap_or("rtmap");
         cfg.heatmap_path = Some(format!("{}.heatmap.tsv", base));
     }
 
@@ -2596,7 +2596,7 @@ fn cmd_record(args: &mut Vec<String>) {
         die("record requires -o <file>");
     }
 
-    let (mut resolved_cfg, _proj_cfg) = memvis::config::resolve_config();
+    let (mut resolved_cfg, _proj_cfg) = rtmap::config::resolve_config();
     if let Some(ref dr) = dr_home_flag {
         resolved_cfg.drrun_path = Some(format!("{}/bin64/drrun", dr));
         resolved_cfg.dynamorio_home = Some(dr.clone());
@@ -2637,7 +2637,7 @@ fn cmd_replay(args: &mut Vec<String>) {
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || run_replay(&trace_path, elf_path.as_deref(), true, tp_owned, no_bb))
-        .expect("memvis: failed to spawn replay thread");
+        .expect("rtmap: failed to spawn replay thread");
     let _ = handle.join();
 }
 
@@ -2654,7 +2654,7 @@ fn cmd_attach(args: &mut Vec<String>) {
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || run_consumer(elf_path.as_deref(), cfg))
-        .expect("memvis: failed to spawn consumer thread");
+        .expect("rtmap: failed to spawn consumer thread");
     let _ = handle.join();
 }
 
@@ -2674,7 +2674,7 @@ fn cmd_replay_compat(args: &mut Vec<String>) {
     let handle = thread::Builder::new()
         .stack_size(64 * 1024 * 1024)
         .spawn(move || run_replay(&replay_path, elf_path.as_deref(), true, tp_owned, no_bb))
-        .expect("memvis: failed to spawn replay thread");
+        .expect("rtmap: failed to spawn replay thread");
     let _ = handle.join();
 }
 
@@ -2688,7 +2688,7 @@ fn cmd_run_with_record(args: &mut Vec<String>, record_path: String) {
     let mut cfg = parse_common_flags(args);
     cfg.record_path = Some(record_path);
 
-    let (mut resolved_cfg, _proj_cfg) = memvis::config::resolve_config();
+    let (mut resolved_cfg, _proj_cfg) = rtmap::config::resolve_config();
     if let Some(ref dr) = dr_home_flag {
         resolved_cfg.drrun_path = Some(format!("{}/bin64/drrun", dr));
         resolved_cfg.dynamorio_home = Some(dr.clone());
@@ -2707,7 +2707,7 @@ fn cmd_run_with_record(args: &mut Vec<String>, record_path: String) {
 }
 
 fn cmd_setup(_args: &mut Vec<String>) {
-    eprintln!("memvis {} — setup", VERSION);
+    eprintln!("rtmap {} — setup", VERSION);
     eprintln!();
 
     // step 1: find DynamoRIO
@@ -2722,7 +2722,7 @@ fn cmd_setup(_args: &mut Vec<String>) {
             eprintln!("  DYNAMORIO_HOME is set but bin64/drrun not found at: {}", p.display());
             None
         }
-    } else if let Some(discovered) = memvis::config::discover_dynamorio() {
+    } else if let Some(discovered) = rtmap::config::discover_dynamorio() {
         eprintln!("[1/3] DynamoRIO");
         eprintln!("  Auto-discovered: {}", discovered.display());
         Some(discovered)
@@ -2734,12 +2734,12 @@ fn cmd_setup(_args: &mut Vec<String>) {
         eprintln!("    wget https://github.com/DynamoRIO/dynamorio/releases/download/release_11.0.0/DynamoRIO-Linux-11.0.19548.tar.gz");
         eprintln!("    tar xzf DynamoRIO-Linux-*.tar.gz -C ~/");
         eprintln!();
-        eprintln!("  Then re-run: memvis setup");
+        eprintln!("  Then re-run: rtmap setup");
         None
     };
 
     // step 2: find tracer
-    let temp_cfg = memvis::config::Config {
+    let temp_cfg = rtmap::config::Config {
         dynamorio_home: dr_home.as_ref().map(|p| p.to_string_lossy().to_string()),
         ..Default::default()
     };
@@ -2759,7 +2759,7 @@ fn cmd_setup(_args: &mut Vec<String>) {
                 eprintln!("    cmake .. -DDynamoRIO_DIR={}/cmake", dr.display());
                 eprintln!("    make");
                 eprintln!();
-                eprintln!("  Then re-run: memvis setup");
+                eprintln!("  Then re-run: rtmap setup");
             } else {
                 eprintln!("  Install DynamoRIO first (step 1), then build the tracer.");
             }
@@ -2767,11 +2767,11 @@ fn cmd_setup(_args: &mut Vec<String>) {
     }
 
     // step 3: write config
-    let cfg_dir = memvis::config::global_config_dir();
+    let cfg_dir = rtmap::config::global_config_dir();
     let cfg_path = cfg_dir.join("config");
     let dr_str = dr_home.as_ref().map(|p| p.to_string_lossy().to_string());
     let tracer_str = tracer.as_ref().map(|p| p.to_string_lossy().to_string());
-    let content = memvis::config::generate_global_config(
+    let content = rtmap::config::generate_global_config(
         dr_str.as_deref(),
         tracer_str.as_deref(),
     );
@@ -2790,9 +2790,9 @@ fn cmd_setup(_args: &mut Vec<String>) {
 
     if dr_home.is_some() && tracer.is_some() {
         eprintln!("Done. You can now run:");
-        eprintln!("  memvis ./your_binary");
+        eprintln!("  rtmap ./your_binary");
     } else {
-        eprintln!("Setup incomplete — resolve the issues above and re-run 'memvis setup'.");
+        eprintln!("Setup incomplete — resolve the issues above and re-run 'rtmap setup'.");
         std::process::exit(1);
     }
 }
@@ -2801,11 +2801,11 @@ fn cmd_init(args: &mut Vec<String>) {
     let target = match args.first() {
         Some(t) => t.clone(),
         None => {
-            eprintln!("memvis: error: 'init' requires a target binary path.");
+            eprintln!("rtmap: error: 'init' requires a target binary path.");
             eprintln!();
-            eprintln!("  Usage: memvis init ./my_server");
+            eprintln!("  Usage: rtmap init ./my_server");
             eprintln!();
-            eprintln!("  This creates a .memvis project file with a target profile,");
+            eprintln!("  This creates a .rtmap project file with a target profile,");
             eprintln!("  including an auto-detected tripwire symbol if possible.");
             std::process::exit(1);
         }
@@ -2813,7 +2813,7 @@ fn cmd_init(args: &mut Vec<String>) {
 
     let target_path = std::path::Path::new(&target);
     if !target_path.exists() {
-        eprintln!("memvis: error: target '{}' does not exist.", target);
+        eprintln!("rtmap: error: target '{}' does not exist.", target);
         eprintln!("  Provide a path to the binary you want to instrument.");
         std::process::exit(1);
     }
@@ -2823,7 +2823,7 @@ fn cmd_init(args: &mut Vec<String>) {
         .and_then(|f| f.to_str())
         .unwrap_or(&target);
 
-    eprintln!("memvis init — creating .memvis profile for '{}'", target_name);
+    eprintln!("rtmap init — creating .rtmap profile for '{}'", target_name);
     eprintln!();
 
     // tripwire auto detection via symbol name 
@@ -2831,14 +2831,14 @@ fn cmd_init(args: &mut Vec<String>) {
 
     match &tripwire {
         Some(sym) => eprintln!("  Tripwire auto-detected: {}", sym),
-        None => eprintln!("  No tripwire auto-detected (you can set one manually in .memvis)"),
+        None => eprintln!("  No tripwire auto-detected (you can set one manually in .rtmap)"),
     }
 
-    let memvis_path = std::path::Path::new(".memvis");
-    if memvis_path.exists() {
+    let rtmap_path = std::path::Path::new(".rtmap");
+    if rtmap_path.exists() {
         eprintln!();
-        eprintln!("  .memvis already exists. Appending profile for '{}'.", target_name);
-        let existing = std::fs::read_to_string(memvis_path).unwrap_or_default();
+        eprintln!("  .rtmap already exists. Appending profile for '{}'.", target_name);
+        let existing = std::fs::read_to_string(rtmap_path).unwrap_or_default();
         let profile_key = format!("target.{}.tripwire", target_name);
         if existing.contains(&profile_key) {
             eprintln!("  Profile for '{}' already present — skipping.", target_name);
@@ -2852,26 +2852,26 @@ fn cmd_init(args: &mut Vec<String>) {
         append.push_str(&format!("# target.{}.args = \n", target_name));
         if let Err(e) = std::fs::OpenOptions::new()
             .append(true)
-            .open(memvis_path)
+            .open(rtmap_path)
             .and_then(|mut f| {
                 use std::io::Write;
                 f.write_all(append.as_bytes())
             })
         {
-            eprintln!("  Failed to append to .memvis: {}", e);
+            eprintln!("  Failed to append to .rtmap: {}", e);
             std::process::exit(1);
         }
     } else {
-        let content = memvis::config::generate_project_config(target_name, tripwire.as_deref());
-        if let Err(e) = std::fs::write(memvis_path, &content) {
-            eprintln!("  Failed to write .memvis: {}", e);
+        let content = rtmap::config::generate_project_config(target_name, tripwire.as_deref());
+        if let Err(e) = std::fs::write(rtmap_path, &content) {
+            eprintln!("  Failed to write .rtmap: {}", e);
             std::process::exit(1);
         }
     }
-    eprintln!("  Wrote: .memvis");
+    eprintln!("  Wrote: .rtmap");
     eprintln!();
     eprintln!("You can now run:");
-    eprintln!("  memvis {}", target_name);
+    eprintln!("  rtmap {}", target_name);
 }
 
 // score ELF text symbols by event-loop likelihood: pattern weight + brevity bonus + size penalty.

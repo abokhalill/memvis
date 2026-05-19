@@ -340,11 +340,11 @@ pub fn process_event(
                                                     c.set(n);
                                                     if n <= 20 {
                                                         eprintln!(
-                                                            "memvis: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                                                            "rtmap: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
                                                             ev.value, patched.name, h_name, old_type, old_source
                                                         );
                                                     } else if n == 21 {
-                                                        eprintln!("memvis: suppressing further online TYPE_SCHISM messages");
+                                                        eprintln!("rtmap: suppressing further online TYPE_SCHISM messages");
                                                     }
                                                 });
                                             }
@@ -651,7 +651,7 @@ pub fn process_event(
                     let runtime_base = ev.addr;
                     let delta = runtime_base.wrapping_sub(info.elf_base_vaddr);
                     eprintln!(
-                        "memvis: relocation delta=0x{:x} (runtime=0x{:x} elf=0x{:x})",
+                        "rtmap: relocation delta=0x{:x} (runtime=0x{:x} elf=0x{:x})",
                         delta, runtime_base, info.elf_base_vaddr
                     );
                     *relocation_delta = Some(delta);
@@ -665,7 +665,7 @@ pub fn process_event(
             let child_pid = ev.addr as u32;
             let parent_pid = ev.value as u32;
             eprintln!(
-                "memvis: PROCESS_FORK child_pid={} parent_pid={}",
+                "rtmap: PROCESS_FORK child_pid={} parent_pid={}",
                 child_pid, parent_pid
             );
             true
@@ -708,11 +708,11 @@ pub fn populate_globals(
     addr_index.finalize();
 }
 
-/// read the tracer's sidecar module table from /dev/shm/memvis_modules_<pid>.
+/// read the tracer's sidecar module table from /dev/shm/rtmap_modules_<pid>.
 /// retries briefly since the tracer may still be writing it.
 /// returns vec of (runtime_base, full_path). cleans up the sidecar after reading.
 fn read_module_table(pid: u32) -> Vec<(u64, String)> {
-    let path = format!("/dev/shm/memvis_modules_{}", pid);
+    let path = format!("/dev/shm/rtmap_modules_{}", pid);
     let content = match std::fs::read_to_string(&path) {
         Ok(c) if !c.is_empty() => c,
         _ => return Vec::new(),
@@ -726,7 +726,7 @@ fn read_module_table(pid: u32) -> Vec<(u64, String)> {
 }
 
 pub fn cleanup_module_table(pid: u32) {
-    let path = format!("/dev/shm/memvis_modules_{}", pid);
+    let path = format!("/dev/shm/rtmap_modules_{}", pid);
     let _ = std::fs::remove_file(&path);
 }
 
@@ -803,7 +803,7 @@ pub fn populate_lib_globals(
         }
 
         eprintln!(
-            "memvis: lib dwarf: {} — {} globals, {} functions at delta=0x{:x}",
+            "rtmap: lib dwarf: {} — {} globals, {} functions at delta=0x{:x}",
             lib_basename, lg.globals.len(), lg.functions.len(), delta
         );
     }
@@ -1042,11 +1042,11 @@ impl WarmScanner {
                     self.stats.schisms += 1;
                     if self.stats.schisms <= 10 {
                         eprintln!(
-                            "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                            "rtmap: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
                             target_addr, pointee_ti.name, source_name, old_type, old_source
                         );
                     } else if self.stats.schisms == 11 {
-                        eprintln!("memvis: suppressing further TYPE_SCHISM messages (dense global layout)");
+                        eprintln!("rtmap: suppressing further TYPE_SCHISM messages (dense global layout)");
                     }
                     if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
                         let fake_proj = crate::world::TypeProjection {
@@ -1191,7 +1191,7 @@ pub fn warm_scan(
         match &stamp_res {
             StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } => {
                 eprintln!(
-                    "memvis: TYPE_SCHISM (legacy warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                    "rtmap: TYPE_SCHISM (legacy warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
                     target_addr, pointee_ti.name, source_name, old_type, old_source
                 );
                 if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
@@ -1568,44 +1568,44 @@ mod tests {
 
     #[test]
     fn test_abi_event_kind_parity() {
-        // these must match memvis_bridge.h MEMVIS_EVENT_* defines exactly.
+        // these must match rtmap_bridge.h RTMAP_EVENT_* defines exactly.
         // any drift here is a silent data corruption bug.
-        assert_eq!(EVENT_WRITE, 0, "EVENT_WRITE != MEMVIS_EVENT_WRITE");
-        assert_eq!(EVENT_READ, 1, "EVENT_READ != MEMVIS_EVENT_READ");
-        assert_eq!(EVENT_CALL, 2, "EVENT_CALL != MEMVIS_EVENT_CALL");
-        assert_eq!(EVENT_RETURN, 3, "EVENT_RETURN != MEMVIS_EVENT_RETURN");
+        assert_eq!(EVENT_WRITE, 0, "EVENT_WRITE != RTMAP_EVENT_WRITE");
+        assert_eq!(EVENT_READ, 1, "EVENT_READ != RTMAP_EVENT_READ");
+        assert_eq!(EVENT_CALL, 2, "EVENT_CALL != RTMAP_EVENT_CALL");
+        assert_eq!(EVENT_RETURN, 3, "EVENT_RETURN != RTMAP_EVENT_RETURN");
         assert_eq!(
             EVENT_REG_SNAPSHOT, 5,
-            "EVENT_REG_SNAPSHOT != MEMVIS_EVENT_REG_SNAPSHOT"
+            "EVENT_REG_SNAPSHOT != RTMAP_EVENT_REG_SNAPSHOT"
         );
         assert_eq!(
             EVENT_CACHE_MISS, 6,
-            "EVENT_CACHE_MISS != MEMVIS_EVENT_CACHE_MISS"
+            "EVENT_CACHE_MISS != RTMAP_EVENT_CACHE_MISS"
         );
         assert_eq!(
             EVENT_MODULE_LOAD, 7,
-            "EVENT_MODULE_LOAD != MEMVIS_EVENT_MODULE_LOAD"
+            "EVENT_MODULE_LOAD != RTMAP_EVENT_MODULE_LOAD"
         );
-        assert_eq!(EVENT_ALLOC, 9, "EVENT_ALLOC != MEMVIS_EVENT_ALLOC");
-        assert_eq!(EVENT_FREE, 10, "EVENT_FREE != MEMVIS_EVENT_FREE");
+        assert_eq!(EVENT_ALLOC, 9, "EVENT_ALLOC != RTMAP_EVENT_ALLOC");
+        assert_eq!(EVENT_FREE, 10, "EVENT_FREE != RTMAP_EVENT_FREE");
         assert_eq!(
             EVENT_BB_ENTRY, 11,
-            "EVENT_BB_ENTRY != MEMVIS_EVENT_BB_ENTRY"
+            "EVENT_BB_ENTRY != RTMAP_EVENT_BB_ENTRY"
         );
-        assert_eq!(EVENT_RELOAD, 12, "EVENT_RELOAD != MEMVIS_EVENT_RELOAD");
+        assert_eq!(EVENT_RELOAD, 12, "EVENT_RELOAD != RTMAP_EVENT_RELOAD");
         assert_eq!(
             EVENT_PROCESS_FORK, 13,
-            "EVENT_PROCESS_FORK != MEMVIS_EVENT_PROCESS_FORK"
+            "EVENT_PROCESS_FORK != RTMAP_EVENT_PROCESS_FORK"
         );
     }
 
     #[test]
     fn test_abi_event_struct_size() {
-        // Event must be 32 bytes to match memvis_event_v3_t
+        // Event must be 32 bytes to match rtmap_event_v3_t
         assert_eq!(
             std::mem::size_of::<Event>(),
             32,
-            "Event struct size drift — ABI mismatch with memvis_event_v3_t"
+            "Event struct size drift — ABI mismatch with rtmap_event_v3_t"
         );
     }
 
@@ -1650,7 +1650,7 @@ mod tests {
     fn make_synthetic_mem() -> (std::fs::File, dwarf::DwarfInfo) {
         use std::collections::BTreeMap;
         use std::os::unix::fs::FileExt;
-        let path = &format!("/tmp/memvis_test_synth_mem_{:?}", std::thread::current().id());
+        let path = &format!("/tmp/rtmap_test_synth_mem_{:?}", std::thread::current().id());
         let f = std::fs::File::create(path).unwrap();
         let mut buf = vec![0u8; 0x4000];
         buf[0x1000..0x1008].copy_from_slice(&0x2000u64.to_le_bytes());

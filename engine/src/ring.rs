@@ -7,9 +7,9 @@ use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::{mem, ptr};
 
 pub const CACHE_LINE: usize = 64;
-pub const MEMVIS_MAGIC: u64 = 0x4D454D56495342;
-pub const MEMVIS_CTL_MAGIC: u64 = 0x4D56435430303032;
-pub const MEMVIS_PROTO_VERSION: u32 = 3;
+pub const RTMAP_MAGIC: u64 = 0x4D454D56495342;
+pub const RTMAP_CTL_MAGIC: u64 = 0x4D56435430303032;
+pub const RTMAP_PROTO_VERSION: u32 = 3;
 pub const MAX_THREADS: usize = 256;
 pub const RING_NAME_LEN: usize = 48;
 
@@ -29,7 +29,7 @@ macro_rules! field_offset {
     }};
 }
 
-pub fn memvis_abi_hash() -> u32 {
+pub fn rtmap_abi_hash() -> u32 {
     let mut h = 0x811c9dc5u32;
     fnv_feed(&mut h, mem::size_of::<Event>() as u32);
     fnv_feed(&mut h, field_offset!(Event, addr));
@@ -40,7 +40,7 @@ pub fn memvis_abi_hash() -> u32 {
     fnv_feed(&mut h, field_offset!(RingHeader, head));
     fnv_feed(&mut h, field_offset!(RingHeader, tail));
     fnv_feed(&mut h, field_offset!(RingHeader, status));
-    fnv_feed(&mut h, 128); // sizeof(memvis_scratch_pad_t)
+    fnv_feed(&mut h, 128); // sizeof(rtmap_scratch_pad_t)
     fnv_feed(&mut h, 28);   // nesting_level
     fnv_feed(&mut h, 32);   // stat_reentrant_drops
     fnv_feed(&mut h, 40);   // stat_truncated_writes
@@ -252,13 +252,13 @@ pub struct ThreadRing {
 impl ThreadRing {
     fn from_shm(shm: MappedShm, thread_id: u16) -> Option<Self> {
         let hdr = unsafe { &*(shm.ptr as *const RingHeader) };
-        if hdr.magic != MEMVIS_MAGIC {
+        if hdr.magic != RTMAP_MAGIC {
             return None;
         }
-        if hdr.proto_version != MEMVIS_PROTO_VERSION {
+        if hdr.proto_version != RTMAP_PROTO_VERSION {
             eprintln!(
-                "memvis: ring proto mismatch: expected {}, got {}",
-                MEMVIS_PROTO_VERSION, hdr.proto_version
+                "rtmap: ring proto mismatch: expected {}, got {}",
+                RTMAP_PROTO_VERSION, hdr.proto_version
             );
             return None;
         }
@@ -366,27 +366,27 @@ impl RingOrchestrator {
 
     fn attach_ctl_shm(&mut self, shm: MappedShm) -> bool {
         let hdr = unsafe { &*(shm.ptr as *const CtlHeader) };
-        if hdr.magic != MEMVIS_CTL_MAGIC {
+        if hdr.magic != RTMAP_CTL_MAGIC {
             return false;
         }
-        if hdr.proto_version != MEMVIS_PROTO_VERSION {
+        if hdr.proto_version != RTMAP_PROTO_VERSION {
             eprintln!(
-                "memvis: ctl proto mismatch: expected {}, got {}",
-                MEMVIS_PROTO_VERSION, hdr.proto_version
+                "rtmap: ctl proto mismatch: expected {}, got {}",
+                RTMAP_PROTO_VERSION, hdr.proto_version
             );
             return false;
         }
-        let expected_hash = memvis_abi_hash();
+        let expected_hash = rtmap_abi_hash();
         if hdr.build_hash != expected_hash {
             eprintln!(
-                "memvis: ABI MISMATCH: tracer hash=0x{:08x}, engine hash=0x{:08x}",
+                "rtmap: ABI MISMATCH: tracer hash=0x{:08x}, engine hash=0x{:08x}",
                 hdr.build_hash, expected_hash
             );
-            eprintln!("memvis: rebuild both tracer and engine from the same memvis_bridge.h");
+            eprintln!("rtmap: rebuild both tracer and engine from the same rtmap_bridge.h");
             return false;
         }
         eprintln!(
-            "memvis: ctl attached (proto={}, abi_hash=0x{:08x}, target_pid={}, parent_pid={})",
+            "rtmap: ctl attached (proto={}, abi_hash=0x{:08x}, target_pid={}, parent_pid={})",
             hdr.proto_version, hdr.build_hash, hdr.target_pid, hdr.parent_pid
         );
         self.ctl = Some(shm);
@@ -397,23 +397,23 @@ impl RingOrchestrator {
         if self.ctl.is_some() {
             return true;
         }
-        if let Some(shm) = MappedShm::open(b"/memvis_ctl\0") {
+        if let Some(shm) = MappedShm::open(b"/rtmap_ctl\0") {
             return self.attach_ctl_shm(shm);
         }
         false
     }
 
-    /// prefer the pid-scoped ctl (/memvis_ctl_<pid>) which receives live
+    /// prefer the pid-scoped ctl (/rtmap_ctl_<pid>) which receives live
     /// thread registrations, falling back to the legacy name
     pub fn try_attach_ctl_for_pid(&mut self, pid: u32) -> bool {
         if self.ctl.is_some() {
             return true;
         }
-        let pid_name = format!("/memvis_ctl_{}\0", pid);
+        let pid_name = format!("/rtmap_ctl_{}\0", pid);
         if let Some(shm) = MappedShm::open(pid_name.as_bytes()) {
             return self.attach_ctl_shm(shm);
         }
-        if let Some(shm) = MappedShm::open(b"/memvis_ctl\0") {
+        if let Some(shm) = MappedShm::open(b"/rtmap_ctl\0") {
             return self.attach_ctl_shm(shm);
         }
         false
@@ -424,7 +424,7 @@ impl RingOrchestrator {
         if self.ctl.is_some() {
             return true;
         }
-        let name = format!("/memvis_ctl_{}\0", pid);
+        let name = format!("/rtmap_ctl_{}\0", pid);
         if let Some(shm) = MappedShm::open(name.as_bytes()) {
             return self.attach_ctl_shm(shm);
         }
@@ -497,7 +497,7 @@ impl RingOrchestrator {
             if let Some(shm) = MappedShm::open(&shm_name) {
                 if let Some(ring) = ThreadRing::from_shm(shm, entry.thread_id) {
                     eprintln!(
-                        "memvis: discovered ring for thread {} ({})",
+                        "rtmap: discovered ring for thread {} ({})",
                         entry.thread_id,
                         std::str::from_utf8(&name_bytes[..name_len]).unwrap_or("?")
                     );
@@ -543,7 +543,7 @@ impl RingOrchestrator {
                         if let Some(shm) = MappedShm::open(&shm_name) {
                             if let Some(ring) = ThreadRing::from_shm(shm, tid) {
                                 eprintln!(
-                                    "memvis: discovered reclaimed ring for thread {} ({})",
+                                    "rtmap: discovered reclaimed ring for thread {} ({})",
                                     tid,
                                     std::str::from_utf8(&name_bytes[..name_len]).unwrap_or("?")
                                 );
@@ -634,7 +634,7 @@ impl RingOrchestrator {
                 let h = hdr.head.load(Ordering::Acquire);
                 let t = hdr.tail.load(Ordering::Relaxed);
                 if h == t {
-                    eprintln!("memvis: ring {} terminal, retired", self.rings[i].thread_id);
+                    eprintln!("rtmap: ring {} terminal, retired", self.rings[i].thread_id);
                     self.rings[i].alive = false;
                 }
             }

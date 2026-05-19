@@ -1,18 +1,18 @@
 // SPDX-License-Identifier: Apache-2.0
-// memvis-diff: Replay two .bin recordings, diff ASLR-invariant topology at checkpoints.
+// rtmap-diff: Replay two .bin recordings, diff ASLR-invariant topology at checkpoints.
 
 use std::collections::{BTreeMap, BTreeSet, HashMap, VecDeque};
 use std::io::{self, Write};
 use std::path::Path;
 use std::process;
 
-use memvis::dwarf::{self, DwarfInfo};
-use memvis::heap_graph::{HeapGraph, HeapOracle};
-use memvis::index::{AddressIndex, FrameId};
-use memvis::reconciler;
-use memvis::record::EventPlayer;
-use memvis::shadow_regs::ShadowRegisterFile;
-use memvis::world::{HazardKind, ShadowStack, WorldState};
+use rtmap::dwarf::{self, DwarfInfo};
+use rtmap::heap_graph::{HeapGraph, HeapOracle};
+use rtmap::index::{AddressIndex, FrameId};
+use rtmap::reconciler;
+use rtmap::record::EventPlayer;
+use rtmap::shadow_regs::ShadowRegisterFile;
+use rtmap::world::{HazardKind, ShadowStack, WorldState};
 
 struct Args {
     baseline: String,
@@ -54,7 +54,7 @@ fn parse_args() -> Args {
                 output = Some(args[i].clone());
             }
             "--help" | "-h" => {
-                eprintln!("memvis-diff: compare two recorded traces");
+                eprintln!("rtmap-diff: compare two recorded traces");
                 eprintln!("  --baseline/-a <file>  baseline recording (.bin)");
                 eprintln!("  --subject/-b <file>   subject recording (.bin)");
                 eprintln!("  --dwarf/-d <file>     ELF binary with debug info");
@@ -63,7 +63,7 @@ fn parse_args() -> Args {
                 process::exit(0);
             }
             other => {
-                eprintln!("memvis-diff: unknown argument: {}", other);
+                eprintln!("rtmap-diff: unknown argument: {}", other);
                 process::exit(1);
             }
         }
@@ -72,11 +72,11 @@ fn parse_args() -> Args {
 
     Args {
         baseline: baseline.unwrap_or_else(|| {
-            eprintln!("memvis-diff: --baseline required");
+            eprintln!("rtmap-diff: --baseline required");
             process::exit(1);
         }),
         subject: subject.unwrap_or_else(|| {
-            eprintln!("memvis-diff: --subject required");
+            eprintln!("rtmap-diff: --subject required");
             process::exit(1);
         }),
         dwarf_path,
@@ -235,7 +235,7 @@ fn replay_to_checkpoints(
     let mut shadow_regs: HashMap<u16, ShadowRegisterFile> = HashMap::new();
     let mut heap_graph = HeapGraph::new();
     let mut heap_oracle = HeapOracle::new();
-    let mut topo: Option<memvis::topology::TopologyStream> = None;
+    let mut topo: Option<rtmap::topology::TopologyStream> = None;
 
     if let Some(ref info) = dwarf_info {
         reconciler::populate_globals(info, 0, &mut addr_index, &mut world);
@@ -248,7 +248,7 @@ fn replay_to_checkpoints(
     let mut batch = Vec::with_capacity(4096);
     let mut need_finalize = false;
 
-    let orch = memvis::ring::RingOrchestrator::new_offline();
+    let orch = rtmap::ring::RingOrchestrator::new_offline();
 
     loop {
         batch.clear();
@@ -568,7 +568,7 @@ fn print_summary(diffs: &[CheckpointDiff]) {
     let diverged = total - identical;
 
     eprintln!("\n══════════════════════════════════════════════════");
-    eprintln!("  memvis-diff: {} checkpoints compared", total);
+    eprintln!("  rtmap-diff: {} checkpoints compared", total);
     eprintln!("  identical: {}  diverged: {}", identical, diverged);
 
     if diverged == 0 {
@@ -664,7 +664,7 @@ fn main() {
     let args = parse_args();
 
     eprintln!(
-        "memvis-diff: baseline={} subject={}",
+        "rtmap-diff: baseline={} subject={}",
         args.baseline, args.subject
     );
     eprintln!(
@@ -679,7 +679,7 @@ fn main() {
         .and_then(|p| match dwarf::parse_elf(p) {
             Ok(info) => Some(info),
             Err(e) => {
-                eprintln!("memvis-diff: DWARF parse failed: {}", e);
+                eprintln!("rtmap-diff: DWARF parse failed: {}", e);
                 None
             }
         });
@@ -689,7 +689,7 @@ fn main() {
     {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("memvis-diff: failed to replay baseline: {}", e);
+            eprintln!("rtmap-diff: failed to replay baseline: {}", e);
             process::exit(1);
         }
     };
@@ -698,7 +698,7 @@ fn main() {
     let checkpoints_b = match replay_to_checkpoints(&args.subject, &mut dwarf_info, args.interval) {
         Ok(c) => c,
         Err(e) => {
-            eprintln!("memvis-diff: failed to replay subject: {}", e);
+            eprintln!("rtmap-diff: failed to replay subject: {}", e);
             process::exit(1);
         }
     };

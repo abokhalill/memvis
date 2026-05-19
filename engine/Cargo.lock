@@ -285,18 +285,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8ca58f447f06ed17d5fc4043ce1b10dd205e060fb3ce5b979b8ed8e59ff3f79"
 
 [[package]]
-name = "memvis"
-version = "0.2.0"
-dependencies = [
- "arrayvec",
- "crossterm",
- "gimli",
- "libc",
- "object",
- "ratatui",
-]
-
-[[package]]
 name = "mio"
 version = "1.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -392,6 +380,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ed2bf2547551a7053d6fdfafda3f938979645c44812fbfcda098faae3f1a362d"
 dependencies = [
  "bitflags",
+]
+
+[[package]]
+name = "rtmap"
+version = "0.2.0"
+dependencies = [
+ "arrayvec",
+ "crossterm",
+ "gimli",
+ "libc",
+ "object",
+ "ratatui",
 ]
 
 [[package]]
