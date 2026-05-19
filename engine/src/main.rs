@@ -698,7 +698,7 @@ fn run(mut orch: RingOrchestrator, mut dwarf_info: Option<DwarfInfo>, cfg: RunCo
                     if scanner.stats.queue_cap_hits > 0 {
                         eprintln!(
                             "memvis: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
-                            scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP_VALUE
+                            scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP
                         );
                     }
                     last_reseed_total = total;
@@ -1268,7 +1268,7 @@ fn run_headless(
                 if scanner.stats.queue_cap_hits > 0 {
                     eprintln!(
                         "memvis: warm-scan WARNING: {} BFS nodes dropped (queue cap {})",
-                        scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP_VALUE
+                        scanner.stats.queue_cap_hits, reconciler::WARM_SCAN_QUEUE_CAP
                     );
                 }
                 last_reseed_total = *total;

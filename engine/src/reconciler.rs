@@ -885,9 +885,8 @@ pub struct WarmScanStats {
     pub queue_cap_hits: u64,
 }
 
-// hard BFS limit; prevents runaway on dense overlapping globals (nginx: 416 globals, ~931 container_of entries)
-const WARM_SCAN_QUEUE_CAP: usize = 50_000;
-pub const WARM_SCAN_QUEUE_CAP_VALUE: usize = WARM_SCAN_QUEUE_CAP;
+// hard BFS limit; prevents runaway on dense overlapping globals
+pub const WARM_SCAN_QUEUE_CAP: usize = 50_000;
 
 pub struct WarmScanner {
     mem: File,
