@@ -319,8 +319,9 @@ pub fn process_event(
                                         ev.seq32() as u64,
                                     );
                                     match &stamp_res {
-                                        StampResult::Schism { old_type, old_source, old_stamp_seq } => {
-                                            // close prior epoch before the new type takes over
+                                        StampResult::Schism { old_type, old_source, old_stamp_seq }
+                                        | StampResult::PoolReuse { old_type, old_source, old_stamp_seq } => {
+                                            let is_reuse = matches!(stamp_res, StampResult::PoolReuse { .. });
                                             if let Some(alloc_size) = world.heap_allocs.alloc_size(ev.value) {
                                                 let fake_proj = crate::world::TypeProjection {
                                                     base_addr: ev.value,
@@ -330,21 +331,23 @@ pub fn process_event(
                                                 };
                                                 world.type_epochs.close_epoch(ev.value, alloc_size, &fake_proj, ev.seq32() as u64, EpochClose::Schism);
                                             }
-                                            thread_local! {
-                                                static ONLINE_SCHISM_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
-                                            }
-                                            ONLINE_SCHISM_COUNT.with(|c| {
-                                                let n = c.get() + 1;
-                                                c.set(n);
-                                                if n <= 20 {
-                                                    eprintln!(
-                                                        "memvis: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
-                                                        ev.value, patched.name, h_name, old_type, old_source
-                                                    );
-                                                } else if n == 21 {
-                                                    eprintln!("memvis: suppressing further online TYPE_SCHISM messages");
+                                            if !is_reuse {
+                                                thread_local! {
+                                                    static ONLINE_SCHISM_COUNT: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
                                                 }
-                                            });
+                                                ONLINE_SCHISM_COUNT.with(|c| {
+                                                    let n = c.get() + 1;
+                                                    c.set(n);
+                                                    if n <= 20 {
+                                                        eprintln!(
+                                                            "memvis: TYPE_SCHISM at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                                                            ev.value, patched.name, h_name, old_type, old_source
+                                                        );
+                                                    } else if n == 21 {
+                                                        eprintln!("memvis: suppressing further online TYPE_SCHISM messages");
+                                                    }
+                                                });
+                                            }
                                             if let Some(ref mut ts) = topo {
                                                 ts.emit_type_schism(
                                                     ev.seq32() as u64,
@@ -354,12 +357,13 @@ pub fn process_event(
                                                     old_source,
                                                     &h_name,
                                                 );
-                                                ts.emit_type_epoch_close(ev.seq32() as u64, ev.value, old_type, old_source, *old_stamp_seq, ev.seq32() as u64, "schism");
+                                                let close_reason = if is_reuse { "pool_reuse" } else { "schism" };
+                                                ts.emit_type_epoch_close(ev.seq32() as u64, ev.value, old_type, old_source, *old_stamp_seq, ev.seq32() as u64, close_reason);
                                             }
                                         }
                                         _ => {}
                                     }
-                                    if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
+                                    if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. } | StampResult::PoolReuse { .. }) {
                                         orch.bloom_insert(ev.value);
                                         world.stm.replay_deferred(
                                             ev.value, patched.byte_size,
@@ -557,7 +561,7 @@ pub fn process_event(
                     let mut stamp_ti = info.type_registry.get(&ti.name).cloned().unwrap_or(ti);
                     info.patch_shallow_fields(&mut stamp_ti);
                     let stamp_res = world.stm.stamp_type(ptr, &stamp_ti, &source, ev.seq32() as u64);
-                    if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
+                    if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. } | StampResult::PoolReuse { .. }) {
                         orch.bloom_insert(ptr);
                         world.stm.replay_deferred(
                             ptr, stamp_ti.byte_size,
@@ -1034,31 +1038,39 @@ impl WarmScanner {
             let stamp_res = world
                 .stm
                 .stamp_type(target_addr, &pointee_ti, &source_name, 0);
-            if let StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } = stamp_res {
-                self.stats.schisms += 1;
-                if self.stats.schisms <= 10 {
-                    eprintln!(
-                        "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
-                        target_addr, pointee_ti.name, source_name, old_type, old_source
-                    );
-                } else if self.stats.schisms == 11 {
-                    eprintln!("memvis: suppressing further TYPE_SCHISM messages (dense global layout)");
+            match &stamp_res {
+                StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } => {
+                    self.stats.schisms += 1;
+                    if self.stats.schisms <= 10 {
+                        eprintln!(
+                            "memvis: TYPE_SCHISM (warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                            target_addr, pointee_ti.name, source_name, old_type, old_source
+                        );
+                    } else if self.stats.schisms == 11 {
+                        eprintln!("memvis: suppressing further TYPE_SCHISM messages (dense global layout)");
+                    }
+                    if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
+                        let fake_proj = crate::world::TypeProjection {
+                            base_addr: target_addr,
+                            type_info: TypeInfo { name: old_type.clone(), byte_size: alloc_size, fields: vec![], is_pointer: false, is_volatile: false, is_atomic: false, shallow: false },
+                            source_name: old_source.clone(),
+                            stamp_seq: *old_stamp_seq,
+                        };
+                        world.type_epochs.close_epoch(target_addr, alloc_size, &fake_proj, 0, EpochClose::Schism);
+                    }
+                    if let Some(ref mut ts) = topo {
+                        ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
+                        ts.emit_type_epoch_close(0, target_addr, old_type, old_source, *old_stamp_seq, 0, "schism");
+                    }
                 }
-                if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
-                    let fake_proj = crate::world::TypeProjection {
-                        base_addr: target_addr,
-                        type_info: TypeInfo { name: old_type.clone(), byte_size: alloc_size, fields: vec![], is_pointer: false, is_volatile: false, is_atomic: false, shallow: false },
-                        source_name: old_source.clone(),
-                        stamp_seq: old_stamp_seq,
-                    };
-                    world.type_epochs.close_epoch(target_addr, alloc_size, &fake_proj, 0, EpochClose::Schism);
+                StampResult::PoolReuse { ref old_type, ref old_source, old_stamp_seq } => {
+                    if let Some(ref mut ts) = topo {
+                        ts.emit_type_epoch_close(0, target_addr, old_type, old_source, *old_stamp_seq, 0, "pool_reuse");
+                    }
                 }
-                if let Some(ref mut ts) = topo {
-                    ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
-                    ts.emit_type_epoch_close(0, target_addr, old_type, old_source, old_stamp_seq, 0, "schism");
-                }
+                _ => {}
             }
-            if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
+            if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. } | StampResult::PoolReuse { .. }) {
                 self.stats.stamps_applied += 1;
                 stamps_this_step += 1;
                 world.stm.replay_deferred(
@@ -1177,26 +1189,34 @@ pub fn warm_scan(
         let stamp_res = world
             .stm
             .stamp_type(target_addr, &pointee_ti, &source_name, 0);
-        if let StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } = stamp_res {
-            eprintln!(
-                "memvis: TYPE_SCHISM (legacy warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
-                target_addr, pointee_ti.name, source_name, old_type, old_source
-            );
-            if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
-                let fake_proj = crate::world::TypeProjection {
-                    base_addr: target_addr,
-                    type_info: TypeInfo { name: old_type.clone(), byte_size: alloc_size, fields: vec![], is_pointer: false, is_volatile: false, is_atomic: false, shallow: false },
-                    source_name: old_source.clone(),
-                    stamp_seq: old_stamp_seq,
-                };
-                world.type_epochs.close_epoch(target_addr, alloc_size, &fake_proj, 0, EpochClose::Schism);
+        match &stamp_res {
+            StampResult::Schism { ref old_type, ref old_source, old_stamp_seq } => {
+                eprintln!(
+                    "memvis: TYPE_SCHISM (legacy warm-scan) at 0x{:x}: {} (via {}) overwrites {} (via {})",
+                    target_addr, pointee_ti.name, source_name, old_type, old_source
+                );
+                if let Some(alloc_size) = world.heap_allocs.alloc_size(target_addr) {
+                    let fake_proj = crate::world::TypeProjection {
+                        base_addr: target_addr,
+                        type_info: TypeInfo { name: old_type.clone(), byte_size: alloc_size, fields: vec![], is_pointer: false, is_volatile: false, is_atomic: false, shallow: false },
+                        source_name: old_source.clone(),
+                        stamp_seq: *old_stamp_seq,
+                    };
+                    world.type_epochs.close_epoch(target_addr, alloc_size, &fake_proj, 0, EpochClose::Schism);
+                }
+                if let Some(ref mut ts) = topo {
+                    ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
+                    ts.emit_type_epoch_close(0, target_addr, old_type, old_source, *old_stamp_seq, 0, "schism");
+                }
             }
-            if let Some(ref mut ts) = topo {
-                ts.emit_type_schism(0, target_addr, old_type, &pointee_ti.name, old_source, &source_name);
-                ts.emit_type_epoch_close(0, target_addr, old_type, old_source, old_stamp_seq, 0, "schism");
+            StampResult::PoolReuse { ref old_type, ref old_source, old_stamp_seq } => {
+                if let Some(ref mut ts) = topo {
+                    ts.emit_type_epoch_close(0, target_addr, old_type, old_source, *old_stamp_seq, 0, "pool_reuse");
+                }
             }
+            _ => {}
         }
-        if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. }) {
+        if matches!(stamp_res, StampResult::Stamped | StampResult::Schism { .. } | StampResult::PoolReuse { .. }) {
             stats.stamps_applied += 1;
             world.stm.replay_deferred(
                 target_addr, pointee_ti.byte_size,

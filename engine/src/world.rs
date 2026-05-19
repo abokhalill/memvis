@@ -457,6 +457,12 @@ pub enum StampResult {
         old_source: String,
         old_stamp_seq: u64,
     },
+    /// oscillating types at the same address; pool/arena reuse, not confusion
+    PoolReuse {
+        old_type: String,
+        old_source: String,
+        old_stamp_seq: u64,
+    },
     /// stamp rejected (null addr or zero-size type)
     Rejected,
 }
@@ -480,7 +486,10 @@ pub struct ShadowTypeMap {
     // that allocation is known to hold *T values (e.g. dict.ht_table -> dictEntry*[]).
     indirect: HashMap<u64, TypeInfo>,
     deferred: VecDeque<DeferredWrite>,
+    // per-address schism count; ≥2 → pool/arena reuse
+    addr_schisms: HashMap<u64, u16>,
     pub schism_count: u64,
+    pub pool_reuse_count: u64,
     pub indirect_stamps: u64,
     pub indirect_registrations: u64,
     pub deferred_replays: u64,
@@ -492,7 +501,9 @@ impl Default for ShadowTypeMap {
             map: BTreeMap::new(),
             indirect: HashMap::with_capacity(64),
             deferred: VecDeque::with_capacity(256),
+            addr_schisms: HashMap::new(),
             schism_count: 0,
+            pool_reuse_count: 0,
             indirect_stamps: 0,
             indirect_registrations: 0,
             deferred_replays: 0,
@@ -525,11 +536,21 @@ impl ShadowTypeMap {
             if existing.stamp_seq > seq {
                 return StampResult::Rejected;
             }
-            self.schism_count += 1;
-            let schism = StampResult::Schism {
-                old_type: existing.type_info.name.clone(),
-                old_source: existing.source_name.clone(),
-                old_stamp_seq: existing.stamp_seq,
+            let addr_hits = self.addr_schisms.entry(target_addr).or_insert(0);
+            *addr_hits = addr_hits.saturating_add(1);
+            let is_reuse = *addr_hits >= 2;
+            if is_reuse {
+                self.pool_reuse_count += 1;
+            } else {
+                self.schism_count += 1;
+            }
+            let old_type = existing.type_info.name.clone();
+            let old_source = existing.source_name.clone();
+            let old_stamp_seq = existing.stamp_seq;
+            let result = if is_reuse {
+                StampResult::PoolReuse { old_type, old_source, old_stamp_seq }
+            } else {
+                StampResult::Schism { old_type, old_source, old_stamp_seq }
             };
             let proj = TypeProjection {
                 base_addr: target_addr,
@@ -538,7 +559,7 @@ impl ShadowTypeMap {
                 stamp_seq: seq,
             };
             self.map.insert(target_addr, proj);
-            schism
+            result
         } else {
             let proj = TypeProjection {
                 base_addr: target_addr,
@@ -638,7 +659,7 @@ impl ShadowTypeMap {
         // the written pointer value is *T; stamp it as T.
         if let Some(element_ti) = self.indirect_lookup(write_addr, alloc_tracker) {
             let res = self.stamp_type(write_value, &element_ti, "<indirect>", seq);
-            if matches!(res, StampResult::Stamped | StampResult::Schism { .. }) {
+            if matches!(res, StampResult::Stamped | StampResult::Schism { .. } | StampResult::PoolReuse { .. }) {
                 self.indirect_stamps += 1;
                 return true;
             }
